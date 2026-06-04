@@ -112,52 +112,58 @@ unlock:
 	@rm -f "$(LOCKFILE)" && echo "Lock removed" || echo "No lock"
 
 # Help
+# Help colors
+HELP_C_CYAN   := \033[36m
+HELP_C_GREEN  := \033[32m
+HELP_C_YELLOW := \033[33m
+HELP_C_RESET  := \033[0m
+
 help:
-	@echo "Loctree Build System"
-	@echo ""
-	@echo "Core Commands:"
-	@echo "  make precheck     - Pre-push validation (fmt+clippy+check) - RUN FIRST!"
-	@echo "  make build        - Build all (installs protobuf if needed)"
-	@echo "  make build-core   - Build only loctree (no protobuf needed)"
-	@echo "  make install      - Install loct, loctree & loctree-mcp"
-	@echo "  make test         - Run all tests"
-	@echo "  make check        - Full quality gate (fmt+clippy+check+semgrep)"
-	@echo "  make fmt          - Format all code"
-	@echo "  make clean        - Clean build artifacts"
-	@echo "  make smoke-release-macos-arm64 - Verify macOS arm64 release portability"
-	@echo ""
-	@echo "Version Management:"
-	@echo "  make version-show       - Show all crate versions"
-	@echo "  make version-check      - Check publish readiness (dry-run)"
-	@echo "  make version SCOPE=X TYPE=Y  - Bump version"
-	@echo "    SCOPE: loctree, report, mcp, lsp, all (default: all)"
-	@echo "    TYPE:  patch (default), minor, major"
-	@echo "    TAG=1, PUSH=1, FORCE=1, PUBLISH=1 - Additional options"
-	@echo "  Examples:"
-	@echo "    make version                       - Bump all crates (patch)"
-	@echo "    make version SCOPE=loctree         - Bump loctree only"
-	@echo "    make version SCOPE=mcp TYPE=minor  - Minor bump loctree-mcp"
-	@echo ""
-	@echo "Publishing:"
-	@echo "  make publish                         - Publish current version to crates.io"
-	@echo "  make publish BUMP=true               - Bump patch + publish"
-	@echo "  make publish BUMP=true VERSION=minor - Bump minor + publish"
-	@echo "    Cascade: report-leptos -> loctree -> loctree-mcp"
-	@echo "    Requires: CARGO_REGISTRY_TOKEN env var"
-	@echo ""
-	@echo "MCP Build & Install:"
-	@echo "  make mcp-build         - Build loctree-mcp"
-	@echo "  make mcp-install       - Install loctree-mcp"
-	@echo "  make mcp-test          - Test loctree-mcp via stdio"
-	@echo ""
-	@echo "AI CLI Integration:"
-	@echo "  make git-hooks         - Install git pre-push validation hook"
-	@echo "  make ai-hooks          - Interactive hook installer (Claude/Codex/Gemini)"
-	@echo "  make ai-hooks-claude   - Install Claude Code hooks"
-	@echo ""
-	@echo "Quick start:"
-	@echo "  make install           - Install loct + loctree-mcp"
-	@echo "  make smoke-release-macos-arm64 - Check macOS arm64 release binary portability"
+	@printf '\n$(HELP_C_CYAN)%s$(HELP_C_RESET)\n' 'Loctree Build System'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'CORE COMMANDS'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'precheck' '- Pre-push validation (fmt+clippy+check) - RUN FIRST!'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build' '- Build all (installs protobuf if needed)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'build-core' '- Build only loctree (no protobuf needed)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install loct, loctree & loctree-mcp'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'test' '- Run all tests'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'check' '- Full quality gate (fmt+clippy+check+semgrep)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'fmt' '- Format all code'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'clean' '- Clean build artifacts'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'smoke-release-macos-arm64' 'Verify macOS arm64 release portability'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'VERSION MANAGEMENT'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-show' '- Show all crate versions'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version-check' '- Check publish readiness (dry-run)'
+	@printf '%s\n' '  make version SCOPE=X TYPE=Y  - Bump version'
+	@printf '%s\n' '    SCOPE: loctree, report, mcp, lsp, all (default: all)'
+	@printf '%s\n' '    TYPE:  patch (default), minor, major'
+	@printf '%s\n' '    TAG=1, PUSH=1, FORCE=1, PUBLISH=1 - Additional options'
+	@printf '%s\n' '  Examples:'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'version' '- Bump all crates (patch)'
+	@printf '%s\n' '    make version SCOPE=loctree         - Bump loctree only'
+	@printf '%s\n' '    make version SCOPE=mcp TYPE=minor  - Minor bump loctree-mcp'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'PUBLISHING'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'publish' '- Publish current version to crates.io'
+	@printf '%s\n' '  make publish BUMP=true               - Bump patch + publish'
+	@printf '%s\n' '  make publish BUMP=true VERSION=minor - Bump minor + publish'
+	@printf '%s\n' '    Cascade: report-leptos -> loctree -> loctree-mcp'
+	@printf '%s\n' '    Requires: CARGO_REGISTRY_TOKEN env var'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'MCP BUILD & INSTALL'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'mcp-build' '- Build loctree-mcp'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'mcp-install' '- Install loctree-mcp'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'mcp-test' '- Test loctree-mcp via stdio'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'AI CLI INTEGRATION'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'git-hooks' '- Install git pre-push validation hook'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'ai-hooks' '- Interactive hook installer (Claude/Codex/Gemini)'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'ai-hooks-claude' '- Install Claude Code hooks'
+	@printf '\n'
+	@printf '  $(HELP_C_YELLOW)%s$(HELP_C_RESET)\n' 'QUICK START'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install loct + loctree-mcp'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'smoke-release-macos-arm64' 'Check macOS arm64 release binary portability'
 
 # ============================================================================
 # Version Management
@@ -242,18 +248,18 @@ publish:
 
 # Build loctree-mcp
 mcp-build:
-	@echo "Building loctree-mcp..."
+	@printf '%s\n' 'Building loctree-mcp...'
 	cargo build --release -p loctree-mcp
-	@echo "Done. Binary in target/release/"
+	@printf '%s\n' 'Done. Binary in target/release/'
 
 # Install loctree-mcp (alias - use 'make install' instead)
 mcp-install:
 	cargo install --path loctree-mcp --force
-	@echo "Installed: loctree-mcp → $(CARGO_BIN)"
+	@printf '%s\n' 'Installed: loctree-mcp → $(CARGO_BIN)'
 
 # Test loctree-mcp via stdio
 mcp-test:
-	@echo "Testing loctree-mcp..."
+	@printf '%s\n' 'Testing loctree-mcp...'
 	@echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"make-test","version":"1.0"}}}' \
 		| $(CARGO_BIN)/loctree-mcp 2>/dev/null | head -1 || echo "Test failed"
 
@@ -302,8 +308,8 @@ ai-hooks-all:
 
 # Install git hooks (pre-commit fmt + pre-push validation)
 git-hooks:
-	@echo "Installing git hooks..."
+	@printf '%s\n' 'Installing git hooks...'
 	@ln -sf ../../tools/hooks/pre-commit .git/hooks/pre-commit
 	@ln -sf ../../tools/hooks/pre-push .git/hooks/pre-push
 	@chmod +x tools/hooks/pre-commit tools/hooks/pre-push
-	@echo "✓ pre-commit + pre-push hooks installed"
+	@printf '%s\n' '✓ pre-commit + pre-push hooks installed'
