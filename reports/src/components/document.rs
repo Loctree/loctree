@@ -3,14 +3,18 @@
 //! Implements the App Shell layout with Sidebar and Main Content areas.
 
 use super::{
-    ICON_ARROWS_CLOCKWISE, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_FLASK, ICON_GHOST, ICON_GRAPH,
-    ICON_LIGHTNING, ICON_PACKAGE, ICON_PLUG, ICON_SQUARES_FOUR, ICON_TREE_STRUCTURE, ICON_TWINS,
-    ICON_USERS, Icon, ReportSectionView,
+    ICON_ARROWS_CLOCKWISE, ICON_BOOK_OPEN, ICON_CLIPBOARD_LIST, ICON_COPY, ICON_FLASK, ICON_GHOST,
+    ICON_GRAPH, ICON_LIGHTNING, ICON_PACKAGE, ICON_PLUG, ICON_SQUARES_FOUR, ICON_TOOLBOX,
+    ICON_TREE_STRUCTURE, ICON_TWINS, ICON_USERS, Icon, ReportSectionView,
 };
 use crate::JsAssets;
 use crate::styles::{CSP, REPORT_CSS};
 use crate::types::ReportSection;
 use leptos::prelude::*;
+
+/// Crate version, sourced at compile time from Cargo metadata so generated
+/// reports never lie about which renderer produced them.
+pub(crate) const REPORT_RENDERER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // Inline data URI for the loctree logo (ensures logo renders offline in reports)
 const LOGO_DATA_URI: &str = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzYwIiBoZWlnaHQ9IjM2MCIgdmlld0JveD0iMCAwIDM2MCAzNjAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgcm9sZT0iaW1nIiBhcmlhLWxhYmVsbGVkYnk9InRpdGxlIGRlc2MiPgogIDx0aXRsZSBpZD0idGl0bGUiPkxvY3RyZWUgTG9nbzwvdGl0bGU+CiAgPGRlc2MgaWQ9ImRlc2MiPk1pbmltYWxpc3Qgbm9kZSB0cmVlIC0gZHluYW1pYyBhbmQgc2xpZ2h0bHkgdW5zZXR0bGluZzwvZGVzYz4KCiAgPGRlZnM+CiAgICA8c3R5bGU+CiAgICAgIC5ub2RlIHsgZmlsbDogI2UwZTBlMDsgfQogICAgICAuc3RlbSB7IHN0cm9rZTogI2UwZTBlMDsgc3Ryb2tlLXdpZHRoOiAxMDsgc3Ryb2tlLWxpbmVjYXA6IHJvdW5kOyB9CiAgICA8L3N0eWxlPgogIDwvZGVmcz4KCiAgPCEtLSBSb3cgMSAtIDMgbm9kZXMgKHRvcCwgc3ltbWV0cmljLCB0aWdodGVuZWQgMjBweCkgLS0+CiAgPGNpcmNsZSBjbGFzcz0ibm9kZSIgY3g9Ijc1IiBjeT0iNTAiIHI9IjE2Ii8+CiAgPGNpcmNsZSBjbGFzcz0ibm9kZSIgY3g9IjE4MCIgY3k9IjUwIiByPSIxNiIvPgogIDxjaXJjbGUgY2xhc3M9Im5vZGUiIGN4PSIyODUiIGN5PSI1MCIgcj0iMTYiLz4KCiAgPCEtLSBSb3cgMiAtIDEgbm9kZSAodW5zZXR0bGluZ2x5IG9mZi1jZW50ZXIgdG8gbGVmdCkgLS0+CiAgPGNpcmNsZSBjbGFzcz0ibm9kZSIgY3g9IjE0MCIgY3k9IjEyMCIgcj0iMTYiLz4KCiAgPCEtLSBSb3cgMyAtIDMgbm9kZXMgKHN5bW1ldHJpYywgdGlnaHRlbmVkIDIwcHgpIC0tPgogIDxjaXJjbGUgY2xhc3M9Im5vZGUiIGN4PSI3NSIgY3k9IjE5MCIgcj0iMTYiLz4KICA8Y2lyY2xlIGNsYXNzPSJub2RlIiBjeD0iMTgwIiBjeT0iMTkwIiByPSIxNiIvPgogIDxjaXJjbGUgY2xhc3M9Im5vZGUiIGN4PSIyODUiIGN5PSIxOTAiIHI9IjE2Ii8+CgogIDwhLS0gU3RlbSAodmVydGljYWwsIHNoaWZ0ZWQgcmlnaHQsIHRoaWNrZXIpIC0tPgogIDxsaW5lIGNsYXNzPSJzdGVtIiB4MT0iMjEwIiB5MT0iMjIwIiB4Mj0iMjEwIiB5Mj0iMjc1Ii8+CgogIDwhLS0gUm9vdCBub2RlIGF0IGJvdHRvbSAtLT4KICA8Y2lyY2xlIGNsYXNzPSJub2RlIiBjeD0iMjA1IiBjeT0iMzEwIiByPSIxNiIvPgo8L3N2Zz4K";
@@ -60,6 +64,14 @@ pub fn ReportDocument(
                                 <Icon path=ICON_SQUARES_FOUR class="icon-sm" />
                                 "Overview"
                             </button>
+                            <button class="nav-item" data-tab="atlas">
+                                <Icon path=ICON_BOOK_OPEN class="icon-sm" />
+                                "Atlas"
+                            </button>
+                            <button class="nav-item" data-tab="tools">
+                                <Icon path=ICON_TOOLBOX class="icon-sm" />
+                                "Tools"
+                            </button>
                             <button class="nav-item" data-tab="audit">
                                 <Icon path=ICON_CLIPBOARD_LIST class="icon-sm" />
                                 "Audit"
@@ -100,6 +112,10 @@ pub fn ReportDocument(
                                 <Icon path=ICON_USERS class="icon-sm" />
                                 "Crowds"
                             </button>
+                            <button class="nav-item" data-tab="hotspots">
+                                <Icon path=ICON_GRAPH class="icon-sm" />
+                                "Hotspots"
+                            </button>
                             <button class="nav-item" data-tab="cycles">
                                 <Icon path=ICON_ARROWS_CLOCKWISE class="icon-sm" />
                                 "Cycles"
@@ -136,15 +152,15 @@ pub fn ReportDocument(
                                 <span id="test-toggle-text">"Hide Tests"</span>
                             </button>
                             <div style="margin-top: 8px; font-size: 11px;">
-                                "loctree v0.8.17"
+                                {"loctree v0.13.0".to_string()}
                                 <br />
-                                <span style="color:var(--theme-text-tertiary)">"Snapshot"</span>
+                                <span style="color:var(--theme-text-tertiary)">"Generated artifact"</span>
                             </div>
                         </div>
                     </aside>
 
                     <main class="app-main">
-                        {sections.into_iter().enumerate().map(|(idx, section)| {
+                        {sections.iter().cloned().enumerate().map(|(idx, section)| {
                             let view_id = format!("section-view-{}", idx);
                             let active = idx == 0;
                             view! {
@@ -155,12 +171,107 @@ pub fn ReportDocument(
                                 />
                             }
                         }).collect::<Vec<_>>()}
+
+                        <ReportEvidenceFooter sections=sections.clone() />
                     </main>
                 </div>
 
                 <GraphScripts js_assets=js_assets />
             </body>
         </html>
+    }
+}
+
+/// Evidence/share footer rendered at the bottom of the document.
+///
+/// Communicates provenance for non-Rust readers and reviewers attaching the
+/// artifact to a ticket or sales thread: renderer version, generated time,
+/// source project root, git ref when available, and a reproduction command.
+#[component]
+fn ReportEvidenceFooter(sections: Vec<ReportSection>) -> impl IntoView {
+    let primary = sections.first().cloned();
+    let renderer = REPORT_RENDERER_VERSION;
+
+    let (root, generated_at, schema, git_ref) = match primary.as_ref() {
+        Some(s) => (
+            s.root.clone(),
+            s.generated_at.clone().unwrap_or_default(),
+            match (s.schema_name.clone(), s.schema_version.clone()) {
+                (Some(n), Some(v)) => format!("{}@{}", n, v),
+                (Some(n), None) => n,
+                _ => String::new(),
+            },
+            match (s.git_branch.clone(), s.git_commit.clone()) {
+                (Some(b), Some(c)) => format!("{}@{}", b, c),
+                (Some(b), None) => b,
+                _ => String::new(),
+            },
+        ),
+        None => (String::new(), String::new(), String::new(), String::new()),
+    };
+
+    let repro = if root.is_empty() {
+        "loct report --output report.html".to_string()
+    } else {
+        format!(
+            "loct report --output report.html  # cwd: {}",
+            shorten_for_repro(&root)
+        )
+    };
+
+    view! {
+        <footer class="report-evidence-footer" role="contentinfo" aria-label="Generated report provenance">
+            <p class="evidence-eyebrow">"Generated Loctree Report — provenance"</p>
+            <div class="evidence-grid">
+                <div class="evidence-item">
+                    <span class="evidence-label">"Renderer"</span>
+                    <span class="evidence-value">{format!("loctree-suite v{}", renderer)}</span>
+                </div>
+                <div class="evidence-item">
+                    <span class="evidence-label">"Source project"</span>
+                    <span class="evidence-value report-path-wrap">{if root.is_empty() { "(unspecified)".to_string() } else { root.clone() }}</span>
+                </div>
+                {(!generated_at.is_empty()).then(|| view! {
+                    <div class="evidence-item">
+                        <span class="evidence-label">"Generated at"</span>
+                        <span class="evidence-value">{generated_at.clone()}</span>
+                    </div>
+                })}
+                {(!git_ref.is_empty()).then(|| view! {
+                    <div class="evidence-item">
+                        <span class="evidence-label">"Git"</span>
+                        <span class="evidence-value">{git_ref.clone()}</span>
+                    </div>
+                })}
+                {(!schema.is_empty()).then(|| view! {
+                    <div class="evidence-item">
+                        <span class="evidence-label">"Schema"</span>
+                        <span class="evidence-value">{schema.clone()}</span>
+                    </div>
+                })}
+            </div>
+            <p class="evidence-fineprint">"Reproduce this artifact:"</p>
+            <pre class="evidence-repro" aria-label="Reproduction command">{repro}</pre>
+            <p class="evidence-fineprint">
+                "This is a generated Loctree report — analyzer-derived static evidence, "
+                "safe to attach to a ticket or open from disk. No SaaS state, no entitlement data, "
+                "no checkout. See "
+                <a href="https://loct.io/cloud" style="color:var(--theme-text-secondary);text-decoration:underline">"loct.io/cloud"</a>
+                " for hosted Loctree."
+            </p>
+        </footer>
+    }
+}
+
+fn shorten_for_repro(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() <= 4 {
+        path.to_string()
+    } else {
+        let tail: Vec<&str> = parts.iter().rev().take(3).copied().collect();
+        let mut joined: Vec<&str> = tail.into_iter().rev().collect();
+        joined.insert(0, "…");
+        joined.join("/")
     }
 }
 

@@ -67,6 +67,11 @@ pub fn AiInsightsPanel(insights: Vec<AiInsight>) -> impl IntoView {
             <Icon path=ICON_ROBOT />
             "AI Insights"
         </h3>
+        <p class="insights-hint">
+            "Tip: click "
+            <code>"Copy as Prompt"</code>
+            " on any insight for a ready-to-paste agent brief."
+        </p>
         <ul class="insight-list">
             {insights.into_iter().map(|insight| {
                 let color = match insight.severity.as_str() {
@@ -74,6 +79,7 @@ pub fn AiInsightsPanel(insights: Vec<AiInsight>) -> impl IntoView {
                     "medium" => "#e67e22", // Orange
                     _ => "#3498db",        // Blue
                 };
+                let prompt = build_insight_prompt(&insight);
                 view! {
                     <li class="insight-item">
                         <div class="insight-icon">
@@ -84,6 +90,15 @@ pub fn AiInsightsPanel(insights: Vec<AiInsight>) -> impl IntoView {
                                 {insight.title}
                             </strong>
                             <p>{insight.message}</p>
+                            <div class="insight-actions">
+                                <button
+                                    class="copy-btn"
+                                    data-copy=prompt
+                                    title="Copy a ready-to-paste agent prompt for this insight"
+                                >
+                                    "Copy as Prompt"
+                                </button>
+                            </div>
                         </div>
                     </li>
                 }
@@ -91,4 +106,28 @@ pub fn AiInsightsPanel(insights: Vec<AiInsight>) -> impl IntoView {
         </ul>
     }
     .into_any()
+}
+
+/// Build a ready-to-paste agent prompt from an insight.
+///
+/// The shape is intentionally generic — any agent (Claude, Codex, Gemini,
+/// Junie) can act on it: severity + title + message + concrete asks.
+fn build_insight_prompt(insight: &AiInsight) -> String {
+    format!(
+        "Loctree found a [{severity}] issue: {title}\n\
+         \n\
+         Details:\n\
+         {message}\n\
+         \n\
+         Please:\n\
+         1. Analyze the root cause (use `loct slice <file>` and `loct impact <file>` if file paths are referenced).\n\
+         2. Propose a concrete fix with affected file paths and the smallest viable change.\n\
+         3. List verification steps (tests, gates, smoke checks) that prove the fix works.\n\
+         \n\
+         If the issue is not actionable, explain why and suggest a suppression rule\n\
+         (`loct suppress ...`) instead.",
+        severity = insight.severity,
+        title = insight.title,
+        message = insight.message,
+    )
 }

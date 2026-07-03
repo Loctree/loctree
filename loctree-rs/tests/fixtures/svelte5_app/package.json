@@ -1,0 +1,8 @@
+{
+  "name": "loctree-svelte5-fixture",
+  "type": "module",
+  "dependencies": {
+    "@sveltejs/kit": "^2.0.0",
+    "svelte": "^5.0.0"
+  }
+}

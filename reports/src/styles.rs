@@ -30,57 +30,114 @@ pub const CSP: &str = "default-src 'self' file: data: blob:; script-src 'self' '
 /// Complete CSS for the report.
 pub const REPORT_CSS: &str = r#"
 /* ============================================
-   loctree Report — Vista Galaxy Black Steel
+   Loctree Report — editorial dark, evidence-first
+   Aligned with loctree-com /cloud styling discipline:
+     warm ink/bone palette, two-color accent system
+     (amber narrative, teal interaction), mono-cap
+     eyebrows, display-serif titles, semantic status
+     tokens. See loctree-com/styles/tokens.css for
+     the source-of-truth tokens this mirrors.
    ============================================ */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&display=swap');
 
 /* ============================================
-   Theme: Light Mode (Default)
+   Brand primitives + semantic role tokens
+   (mirrors loctree-com/styles/tokens.css)
    ============================================ */
 :root {
-    /* Light Theme Tokens */
-    --theme-bg-deep: #f5f7fa;
-    --theme-bg-surface: #ffffff;
-    --theme-bg-surface-elevated: #fafbfc;
+    /* Brand primitives (warm dark editorial) */
+    --report-ink:      #0e0e0e;
+    --report-ink2:     #161616;
+    --report-ink3:     #1e1e1e;
+    --report-bone:        #f5f1e7;
+    --report-bone-dim:    rgba(245, 241, 231, 0.86);
+    --report-bone-mute:   rgba(245, 241, 231, 0.64);
+    --report-bone-faint:  rgba(245, 241, 231, 0.20);
 
-    --theme-text-primary: #1a1f26;
-    --theme-text-secondary: #4a5568;
-    --theme-text-tertiary: #718096;
+    /* Two-color editorial accent system */
+    --report-amber: #c99a3b;  /* narrative accent — hero stat, evidence emphasis */
+    --report-teal:  #3d7a72;  /* interaction accent — hover/focus/state */
 
-    --theme-accent: #3182ce;
-    --theme-accent-rgb: 49, 130, 206;
+    /* Semantic status tokens — never reuse for branding */
+    --report-status-success: var(--report-teal);
+    --report-status-warning: var(--report-amber);
+    --report-status-info:    var(--report-bone-dim);
+    --report-status-danger:  #b86a5c;
 
-    --theme-border: rgba(0, 0, 0, 0.1);
-    --theme-border-strong: rgba(0, 0, 0, 0.15);
-    
-    --theme-hover: rgba(0, 0, 0, 0.04);
-    --theme-hover-strong: rgba(0, 0, 0, 0.08);
+    /* Typography roles */
+    --report-font-display: 'Instrument Serif', Georgia, ui-serif, serif;
+    --report-font-body:    'Inter', system-ui, -apple-system, sans-serif;
+    --report-font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace;
 
-    /* Scrollbar (Light) */
-    --theme-scrollbar: rgba(0, 0, 0, 0.15);
-    --theme-scrollbar-hover: rgba(0, 0, 0, 0.25);
-    /* Fallbacks for theme-aware scrollbars */
-    --scrollbar-bg: var(--theme-scrollbar, rgba(0, 0, 0, 0.15));
-    --scrollbar-bg-hover: var(--theme-scrollbar-hover, rgba(0, 0, 0, 0.25));
+    /* Typography scale */
+    --report-type-mono-cap: 0.75rem;
+    --report-type-meta:     0.875rem;
+    --report-type-body:     clamp(1rem, 0.35vw + 0.94rem, 1.125rem);
+    --report-type-h3:       clamp(1.25rem, 1.6vw, 1.5rem);
+    --report-type-h2:       clamp(1.875rem, 4vw, 2.625rem);
+    --report-type-h1:       clamp(2.25rem, 6vw, 3.75rem);
 
-    /* Gradients (Light) */
-    --gradient-nav: linear-gradient(135deg, rgba(255,255,255,0.98) 0%, rgba(245,247,250,0.95) 100%);
-    --gradient-sidebar: linear-gradient(180deg, rgba(250,251,252,0.98) 0%, rgba(245,247,250,0.95) 100%);
-    --gradient-main: linear-gradient(180deg, rgba(250,251,252,0.95) 0%, rgba(245,247,250,0.9) 100%);
+    --report-tracking-tight: -0.02em;
+    --report-tracking-wider: 0.08em;
+    --report-tracking-widest: 0.16em;
+
+    --report-lh-tight: 1.15;
+    --report-lh-default: 1.55;
+
+    /* Spacing scale (4px base) */
+    --report-space-1:  0.25rem;
+    --report-space-2:  0.5rem;
+    --report-space-3:  0.75rem;
+    --report-space-4:  1rem;
+    --report-space-5:  1.25rem;
+    --report-space-6:  1.5rem;
+    --report-space-8:  2rem;
+    --report-space-10: 2.5rem;
+
+    /* Existing app-shell still references --theme-* tokens.
+       Map them to the new editorial palette so the whole UI
+       inherits the warm dark default at zero refactor risk. */
+    --theme-bg-deep:           var(--report-ink);
+    --theme-bg-surface:        var(--report-ink2);
+    --theme-bg-surface-elevated: var(--report-ink3);
+
+    --theme-text-primary:      var(--report-bone);
+    --theme-text-secondary:    var(--report-bone-dim);
+    --theme-text-tertiary:     var(--report-bone-mute);
+
+    --theme-accent:     var(--report-teal);
+    --theme-accent-rgb: 61, 122, 114;
+
+    --theme-border:        var(--report-bone-faint);
+    --theme-border-strong: rgba(245, 241, 231, 0.30);
+
+    --theme-hover:         rgba(245, 241, 231, 0.04);
+    --theme-hover-strong:  rgba(245, 241, 231, 0.07);
+
+    /* Scrollbar (warm dark) */
+    --theme-scrollbar:        rgba(245, 241, 231, 0.12);
+    --theme-scrollbar-hover:  rgba(245, 241, 231, 0.22);
+    --scrollbar-bg:           var(--theme-scrollbar);
+    --scrollbar-bg-hover:     var(--theme-scrollbar-hover);
+
+    /* Gradients (editorial) */
+    --gradient-nav:     linear-gradient(135deg, rgba(14,14,14,0.92) 0%, rgba(22,22,22,0.92) 100%);
+    --gradient-sidebar: linear-gradient(180deg, rgba(14,14,14,0.95) 0%, rgba(22,22,22,0.92) 100%);
+    --gradient-main:    linear-gradient(180deg, rgba(14,14,14,0.94) 0%, rgba(22,22,22,0.90) 55%, rgba(30,30,30,0.86) 100%);
 
     /* Dimensions */
-    --radius-lg: 20px;
-    --radius-md: 12px;
+    --radius-lg: 14px;
+    --radius-md: 10px;
     --radius-sm: 6px;
-    
+
     --sidebar-width: 280px;
     --header-height: 68px;
-    
-    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
-    
-    color-scheme: light dark;
+
+    --font-sans: var(--report-font-body);
+    --font-mono: var(--report-font-mono);
+
+    color-scheme: dark light;
 }
 
 /* Tooltip safety layer */
@@ -89,63 +146,73 @@ pub const REPORT_CSS: &str = r#"
 }
 
 /* ============================================
-   Theme: Dark Mode (Vista Galaxy Black Steel)
+   Theme: Dark Mode (default — editorial dark)
+   The :root above already maps theme-* to the warm
+   editorial palette. .dark stays as an explicit
+   re-declaration so the JS toggle still has a
+   selector to land on (and so the values are
+   discoverable in DevTools).
    ============================================ */
 .dark,
 html.dark {
-    --theme-bg-deep: #0a0a0e;
-    --theme-bg-surface: #14171c;
-    --theme-bg-surface-elevated: #191d22;
+    --theme-bg-deep:           var(--report-ink);
+    --theme-bg-surface:        var(--report-ink2);
+    --theme-bg-surface-elevated: var(--report-ink3);
 
-    --theme-text-primary: #e5ecf5;
-    --theme-text-secondary: #b2c0d4;
-    --theme-text-tertiary: #8897ad;
+    --theme-text-primary:      var(--report-bone);
+    --theme-text-secondary:    var(--report-bone-dim);
+    --theme-text-tertiary:     var(--report-bone-mute);
 
-    --theme-accent: #a3b8c7;
-    --theme-accent-rgb: 163, 184, 199;
+    --theme-accent:     var(--report-teal);
+    --theme-accent-rgb: 61, 122, 114;
 
-    --theme-border: rgba(114, 124, 139, 0.18);
-    --theme-border-strong: rgba(114, 124, 139, 0.28);
-    
-    --theme-hover: rgba(255, 255, 255, 0.03);
-    --theme-hover-strong: rgba(255, 255, 255, 0.06);
+    --theme-border:        var(--report-bone-faint);
+    --theme-border-strong: rgba(245, 241, 231, 0.30);
 
-    /* Scrollbar (Dark) */
-    --theme-scrollbar: rgba(255, 255, 255, 0.15);
-    --theme-scrollbar-hover: rgba(255, 255, 255, 0.25);
-    --scrollbar-bg: var(--theme-scrollbar, rgba(255, 255, 255, 0.15));
-    --scrollbar-bg-hover: var(--theme-scrollbar-hover, rgba(255, 255, 255, 0.25));
+    --theme-hover:         rgba(245, 241, 231, 0.04);
+    --theme-hover-strong:  rgba(245, 241, 231, 0.07);
 
-    /* Gradients (Dark) */
-    --gradient-nav: linear-gradient(135deg, rgba(10,10,14,0.95) 0%, rgba(32,36,44,0.85) 40%, rgba(120,132,144,0.15) 100%);
-    --gradient-sidebar: linear-gradient(180deg, rgba(12,12,16,0.95) 0%, rgba(24,28,34,0.9) 100%);
-    --gradient-main: linear-gradient(180deg, rgba(12,12,16,0.95) 0%, rgba(16,18,22,0.9) 55%, rgba(22,24,30,0.85) 100%);
+    --theme-scrollbar:        rgba(245, 241, 231, 0.12);
+    --theme-scrollbar-hover:  rgba(245, 241, 231, 0.22);
+    --scrollbar-bg:           var(--theme-scrollbar);
+    --scrollbar-bg-hover:     var(--theme-scrollbar-hover);
+
+    --gradient-nav:     linear-gradient(135deg, rgba(14,14,14,0.92) 0%, rgba(22,22,22,0.92) 100%);
+    --gradient-sidebar: linear-gradient(180deg, rgba(14,14,14,0.95) 0%, rgba(22,22,22,0.92) 100%);
+    --gradient-main:    linear-gradient(180deg, rgba(14,14,14,0.94) 0%, rgba(22,22,22,0.90) 55%, rgba(30,30,30,0.86) 100%);
 }
 
-/* Auto Dark Mode based on system preference */
-@media (prefers-color-scheme: dark) {
-    :root:not(.light) {
-        --theme-bg-deep: #0a0a0e;
-        --theme-bg-surface: #14171c;
-        --theme-bg-surface-elevated: #191d22;
+/* ============================================
+   Theme: Light Mode — opt-in only via .light
+   (warm off-white surface, ink text)
+   ============================================ */
+.light,
+html.light {
+    --theme-bg-deep:           #fbfbf8;
+    --theme-bg-surface:        #ffffff;
+    --theme-bg-surface-elevated: #f5f3ee;
 
-        --theme-text-primary: #e5ecf5;
-        --theme-text-secondary: #b2c0d4;
-        --theme-text-tertiary: #8897ad;
+    --theme-text-primary:      #050504;
+    --theme-text-secondary:    rgba(5, 5, 4, 0.86);
+    --theme-text-tertiary:     rgba(5, 5, 4, 0.60);
 
-        --theme-accent: #a3b8c7;
-        --theme-accent-rgb: 163, 184, 199;
+    --theme-accent:     #2d5a55;  /* darker teal for AA contrast on light */
+    --theme-accent-rgb: 45, 90, 85;
 
-        --theme-border: rgba(114, 124, 139, 0.18);
-        --theme-border-strong: rgba(114, 124, 139, 0.28);
-        
-        --theme-hover: rgba(255, 255, 255, 0.03);
-        --theme-hover-strong: rgba(255, 255, 255, 0.06);
+    --theme-border:        rgba(5, 5, 4, 0.12);
+    --theme-border-strong: rgba(5, 5, 4, 0.20);
 
-        --gradient-nav: linear-gradient(135deg, rgba(10,10,14,0.95) 0%, rgba(32,36,44,0.85) 40%, rgba(120,132,144,0.15) 100%);
-        --gradient-sidebar: linear-gradient(180deg, rgba(12,12,16,0.95) 0%, rgba(24,28,34,0.9) 100%);
-        --gradient-main: linear-gradient(180deg, rgba(12,12,16,0.95) 0%, rgba(16,18,22,0.9) 55%, rgba(22,24,30,0.85) 100%);
-    }
+    --theme-hover:         rgba(5, 5, 4, 0.04);
+    --theme-hover-strong:  rgba(5, 5, 4, 0.08);
+
+    --theme-scrollbar:        rgba(5, 5, 4, 0.18);
+    --theme-scrollbar-hover:  rgba(5, 5, 4, 0.30);
+    --scrollbar-bg:           var(--theme-scrollbar);
+    --scrollbar-bg-hover:     var(--theme-scrollbar-hover);
+
+    --gradient-nav:     linear-gradient(135deg, rgba(255,255,255,0.96) 0%, rgba(251,251,248,0.96) 100%);
+    --gradient-sidebar: linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(251,251,248,0.92) 100%);
+    --gradient-main:    linear-gradient(180deg, rgba(255,255,255,0.95) 0%, rgba(251,251,248,0.90) 100%);
 }
 
 /* Reset & Base */
@@ -342,25 +409,42 @@ html.dark .theme-icon-dark { display: block; }
     min-width: 0; /* Prevent flex overflow */
 }
 
-/* Sticky Header */
+/* Sticky Header — editorial hero rhythm.
+   Auto-grows to accommodate the identity badge, eyebrow,
+   display title and provenance row introduced by the
+   loctree-com styling discipline pass. */
 .app-header {
-    height: var(--header-height);
+    min-height: var(--header-height);
     flex-shrink: 0;
     background: var(--gradient-nav);
     border-bottom: 1px solid var(--theme-border);
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: space-between;
-    padding: 0 32px;
+    gap: 24px;
+    padding: 18px 32px;
     backdrop-filter: blur(12px);
     z-index: 10;
 }
 
-.header-title h1 {
+.header-title {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+/* Legacy h1 retained as a fallback (some panels still emit a
+   plain h1 inside .header-title). The editorial pass renders
+   .report-section-title instead, but we keep this for safety. */
+.header-title > h1 {
     margin: 0;
     font-size: 16px;
     font-weight: 600;
     color: var(--theme-text-primary);
+}
+
+.header-stats {
+    flex-shrink: 0;
+    align-self: flex-start;
 }
 
 .header-title p,
@@ -563,20 +647,25 @@ code {
 .dist-status-badge {
     display: inline-flex;
     align-items: center;
+    gap: 6px;
     padding: 4px 10px;
     border-radius: 999px;
+    font-family: var(--report-font-mono);
     font-size: 11px;
     font-weight: 600;
+    letter-spacing: var(--report-tracking-wider);
+    text-transform: uppercase;
+    border: 1px solid currentColor;
 }
 
 .dist-status-fully-shaken {
-    background: rgba(231, 76, 60, 0.12);
-    color: #d64545;
+    color: var(--report-status-danger);
+    background: rgba(184, 106, 92, 0.10);
 }
 
 .dist-status-partially-shaken {
-    background: rgba(243, 156, 18, 0.14);
-    color: #b9770e;
+    color: var(--report-status-warning);
+    background: rgba(201, 154, 59, 0.10);
 }
 
 /* ============================================
@@ -630,18 +719,21 @@ code {
 }
 
 .action-plan-panel .risk-high {
-    background: rgba(192, 57, 43, 0.12);
-    color: #c0392b;
+    background: rgba(184, 106, 92, 0.12);
+    color: var(--report-status-danger);
+    border: 1px solid currentColor;
 }
 
 .action-plan-panel .risk-medium {
-    background: rgba(230, 126, 34, 0.12);
-    color: #e67e22;
+    background: rgba(201, 154, 59, 0.12);
+    color: var(--report-status-warning);
+    border: 1px solid currentColor;
 }
 
 .action-plan-panel .risk-low {
-    background: rgba(39, 174, 96, 0.12);
-    color: #27ae60;
+    background: rgba(61, 122, 114, 0.12);
+    color: var(--report-status-success);
+    border: 1px solid currentColor;
 }
 
 .action-plan-panel .action-why,
@@ -711,7 +803,7 @@ code {
 }
 
 .text-warning {
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .text-muted {
@@ -1269,11 +1361,11 @@ code {
 
 /* Bridge row status colors */
 .bridge-table tr.status-ok .status-cell {
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 .bridge-table tr.status-missing .status-cell {
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .bridge-table tr.status-unused .status-cell {
@@ -1281,7 +1373,7 @@ code {
 }
 
 .bridge-table tr.status-unregistered .status-cell {
-    color: #c0392b;
+    color: var(--report-status-danger);
 }
 
 .bridge-table tr.status-missing {
@@ -1310,7 +1402,7 @@ code {
 
 /* Text success color */
 .text-success {
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 /* ============================================
@@ -1777,19 +1869,19 @@ input[type="range"]::-webkit-slider-thumb {
 .issue-critical {
     background: rgba(192, 57, 43, 0.1);
     border-color: rgba(192, 57, 43, 0.3);
-    color: #c0392b;
+    color: var(--report-status-danger);
 }
 
 .issue-warning {
     background: rgba(230, 126, 34, 0.1);
     border-color: rgba(230, 126, 34, 0.3);
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .issue-info {
     background: rgba(49, 130, 206, 0.1);
     border-color: rgba(49, 130, 206, 0.3);
-    color: #3182ce;
+    color: var(--theme-accent);
 }
 
 .crowd-members {
@@ -1888,19 +1980,19 @@ input[type="range"]::-webkit-slider-thumb {
 
 .confidence-badge.confidence-very-high {
     background: rgba(192, 57, 43, 0.15);
-    color: #c0392b;
+    color: var(--report-status-danger);
     border: 1px solid rgba(192, 57, 43, 0.3);
 }
 
 .confidence-badge.confidence-high {
     background: rgba(230, 126, 34, 0.15);
-    color: #e67e22;
+    color: var(--report-status-warning);
     border: 1px solid rgba(230, 126, 34, 0.3);
 }
 
 .confidence-badge.confidence-medium {
     background: rgba(49, 130, 206, 0.15);
-    color: #3182ce;
+    color: var(--theme-accent);
     border: 1px solid rgba(49, 130, 206, 0.3);
 }
 
@@ -1943,19 +2035,19 @@ input[type="range"]::-webkit-slider-thumb {
 
 .count-badge-success {
     background: rgba(39, 174, 96, 0.15);
-    color: #27ae60;
+    color: var(--report-status-success);
     border: 1px solid rgba(39, 174, 96, 0.3);
 }
 
 .count-badge-warning {
     background: rgba(230, 126, 34, 0.15);
-    color: #e67e22;
+    color: var(--report-status-warning);
     border: 1px solid rgba(230, 126, 34, 0.3);
 }
 
 .count-badge-critical {
     background: rgba(192, 57, 43, 0.15);
-    color: #c0392b;
+    color: var(--report-status-danger);
     border: 1px solid rgba(192, 57, 43, 0.3);
 }
 
@@ -1969,7 +2061,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .cycles-empty p {
-    color: #27ae60;
+    color: var(--report-status-success);
     font-size: 13px;
     margin: 0;
 }
@@ -2032,11 +2124,11 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .cycle-item-strict {
-    border-left: 3px solid #c0392b;
+    border-left: 3px solid var(--report-status-danger);
 }
 
 .cycle-item-lazy {
-    border-left: 3px solid #e67e22;
+    border-left: 3px solid var(--report-status-warning);
 }
 
 .cycle-number {
@@ -2105,7 +2197,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .stat-ok {
     background: rgba(39, 174, 96, 0.15);
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 .stat-missing {
@@ -2120,7 +2212,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .stat-unreg {
     background: rgba(230, 126, 34, 0.15);
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .pipelines-filters {
@@ -2227,7 +2319,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .pipeline-card.status-ok {
-    border-left: 3px solid #27ae60;
+    border-left: 3px solid var(--report-status-success);
 }
 
 .pipeline-card.status-missing {
@@ -2239,7 +2331,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .pipeline-card.status-unreg {
-    border-left: 3px solid #e67e22;
+    border-left: 3px solid var(--report-status-warning);
 }
 
 .card-header {
@@ -2281,7 +2373,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .status-badge.status-ok {
     background: rgba(39, 174, 96, 0.15);
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 .status-badge.status-missing {
@@ -2296,7 +2388,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .status-badge.status-unreg {
     background: rgba(230, 126, 34, 0.15);
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .expand-icon {
@@ -2458,7 +2550,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .card-details .warning {
-    color: #e67e22;
+    color: var(--report-status-warning);
     font-size: 12px;
 }
 
@@ -2511,7 +2603,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .split-item.status-ok {
-    border-left: 3px solid #27ae60;
+    border-left: 3px solid var(--report-status-success);
 }
 
 .split-item.status-missing {
@@ -2593,7 +2685,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .split-item-status.status-ok {
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 .split-item-status.status-missing {
@@ -2605,11 +2697,11 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .split-item-status.status-unreg {
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .split-item.status-unreg {
-    border-left: 3px solid #e67e22;
+    border-left: 3px solid var(--report-status-warning);
 }
 
 .split-item-placeholder {
@@ -2793,19 +2885,19 @@ input[type="range"]::-webkit-slider-thumb {
 .health-badge.critical {
     background: rgba(192, 57, 43, 0.1);
     border-color: rgba(192, 57, 43, 0.5);
-    color: #c0392b;
+    color: var(--report-status-danger);
 }
 
 .health-badge.warning {
     background: rgba(230, 126, 34, 0.1);
     border-color: rgba(230, 126, 34, 0.5);
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .health-badge.good {
     background: rgba(39, 174, 96, 0.1);
     border-color: rgba(39, 174, 96, 0.5);
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 .health-value {
@@ -2868,17 +2960,17 @@ input[type="range"]::-webkit-slider-thumb {
 
 .audit-critical .audit-icon {
     background: rgba(192, 57, 43, 0.2);
-    color: #c0392b;
+    color: var(--report-status-danger);
 }
 
 .audit-warning .audit-icon {
     background: rgba(230, 126, 34, 0.2);
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 .audit-quick-wins .audit-icon {
     background: rgba(39, 174, 96, 0.2);
-    color: #27ae60;
+    color: var(--report-status-success);
 }
 
 .audit-section-desc {
@@ -2998,7 +3090,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .audit-category-test {
-    color: #e67e22;
+    color: var(--report-status-warning);
 }
 
 /* Empty state */
@@ -3012,7 +3104,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .audit-empty p {
     margin: 0;
-    color: #27ae60;
+    color: var(--report-status-success);
     font-size: 14px;
 }
 
@@ -3039,7 +3131,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 /* ============================================
    Refactor Plan Panel
-   Vibecrafted with AI Agents by VetCoders (c)2026 VetCoders
+   𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders ⓒ 2025-2026 VetCoders
    ============================================ */
 
 .refactor-plan-panel {
@@ -3107,7 +3199,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .risk-badge.risk-low {
     background: rgba(34, 197, 94, 0.15);
-    color: #22c55e;
+    color: var(--report-status-success);
 }
 
 .risk-badge.risk-medium {
@@ -3117,7 +3209,7 @@ input[type="range"]::-webkit-slider-thumb {
 
 .risk-badge.risk-high {
     background: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
+    color: var(--report-status-danger);
 }
 
 /* Layer Distribution */
@@ -3246,7 +3338,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .phase-card.risk-low {
-    border-left: 4px solid #22c55e;
+    border-left: 4px solid var(--report-status-success);
 }
 
 .phase-card.risk-medium {
@@ -3254,7 +3346,7 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .phase-card.risk-high {
-    border-left: 4px solid #ef4444;
+    border-left: 4px solid var(--report-status-danger);
 }
 
 .phase-header {
@@ -3472,6 +3564,681 @@ input[type="range"]::-webkit-slider-thumb {
     .graph-controls {
         margin-left: 0;
         justify-content: center;
+    }
+}
+
+/* ============================================
+   Editorial polish layer
+   New shared classes that follow loctree-com
+   /cloud discipline. Existing components keep
+   their current styling — these classes add
+   coherent hero/eyebrow/title/footer treatments
+   for the report shell.
+   ============================================ */
+
+/* Mono-cap eyebrow (section labels, hero kickers, meta) */
+.report-eyebrow {
+    font-family: var(--report-font-mono);
+    font-size: var(--report-type-mono-cap);
+    text-transform: uppercase;
+    letter-spacing: var(--report-tracking-widest);
+    color: var(--theme-text-tertiary);
+    font-weight: 500;
+    line-height: var(--report-lh-tight);
+    margin: 0 0 var(--report-space-3);
+}
+
+/* Display-serif title (hero, section header) */
+.report-title-display {
+    font-family: var(--report-font-display);
+    font-weight: 400;
+    font-style: normal;
+    line-height: var(--report-lh-tight);
+    letter-spacing: var(--report-tracking-tight);
+    color: var(--theme-text-primary);
+    margin: 0;
+}
+
+.report-title-display.size-h1 { font-size: var(--report-type-h1); }
+.report-title-display.size-h2 { font-size: var(--report-type-h2); }
+.report-title-display.size-h3 { font-size: var(--report-type-h3); font-family: var(--report-font-body); font-weight: 600; }
+
+/* Section header rhythm — eyebrow + display title + supporting body */
+.report-section-header {
+    margin-bottom: var(--report-space-6);
+}
+
+.report-section-header .report-section-body {
+    font-family: var(--report-font-body);
+    font-size: var(--report-type-body);
+    line-height: var(--report-lh-default);
+    color: var(--theme-text-secondary);
+    margin: var(--report-space-3) 0 0;
+    max-width: 70ch;
+}
+
+/* Sticky header (in-report) — fortified hero wrapper */
+.report-sticky-hero {
+    display: flex;
+    flex-direction: column;
+    gap: var(--report-space-1);
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.report-sticky-hero .report-eyebrow {
+    margin-bottom: 0;
+}
+
+.report-sticky-hero .report-section-title {
+    font-family: var(--report-font-display);
+    font-size: clamp(1.25rem, 1.6vw, 1.75rem);
+    font-weight: 400;
+    line-height: var(--report-lh-tight);
+    letter-spacing: var(--report-tracking-tight);
+    color: var(--theme-text-primary);
+    margin: 0;
+}
+
+.report-sticky-hero .report-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--report-space-1) var(--report-space-3);
+    margin-top: 4px;
+    font-family: var(--report-font-mono);
+    font-size: 11px;
+    color: var(--theme-text-tertiary);
+}
+
+.report-meta-row .report-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 360px;
+}
+
+.report-meta-row .report-meta-label {
+    text-transform: uppercase;
+    letter-spacing: var(--report-tracking-wider);
+    color: var(--theme-text-tertiary);
+    opacity: 0.65;
+}
+
+.report-meta-row .report-meta-value {
+    color: var(--theme-text-secondary);
+}
+
+/* Long-path treatment — wraps without breaking the layout */
+.report-path-wrap {
+    font-family: var(--report-font-mono);
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    color: var(--theme-text-tertiary);
+}
+
+/* Status semantic helpers (use these instead of raw hex) */
+.report-status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: currentColor;
+    margin-right: 6px;
+    vertical-align: 1px;
+}
+
+.report-status-success { color: var(--report-status-success); }
+.report-status-warning { color: var(--report-status-warning); }
+.report-status-info    { color: var(--report-status-info); }
+.report-status-danger  { color: var(--report-status-danger); }
+
+/* Severity badge — semantic + label-based, never color-only */
+.report-severity-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-family: var(--report-font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: var(--report-tracking-wider);
+    text-transform: uppercase;
+    border: 1px solid currentColor;
+    background: rgba(0, 0, 0, 0);
+}
+
+/* Generated artifact share/evidence footer */
+.report-evidence-footer {
+    margin: 48px auto 24px;
+    padding: 24px 32px;
+    max-width: 1100px;
+    background: var(--theme-bg-surface);
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-md);
+    color: var(--theme-text-secondary);
+    font-size: 13px;
+    line-height: var(--report-lh-default);
+}
+
+.report-evidence-footer .evidence-eyebrow {
+    font-family: var(--report-font-mono);
+    font-size: var(--report-type-mono-cap);
+    text-transform: uppercase;
+    letter-spacing: var(--report-tracking-widest);
+    color: var(--theme-text-tertiary);
+    margin: 0 0 var(--report-space-3);
+}
+
+.report-evidence-footer .evidence-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px 24px;
+    margin-bottom: 16px;
+}
+
+.report-evidence-footer .evidence-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.report-evidence-footer .evidence-label {
+    font-family: var(--report-font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: var(--report-tracking-wider);
+    color: var(--theme-text-tertiary);
+}
+
+.report-evidence-footer .evidence-value {
+    font-family: var(--report-font-mono);
+    font-size: 12px;
+    color: var(--theme-text-primary);
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+.report-evidence-footer .evidence-repro {
+    margin-top: 8px;
+    padding: 12px 14px;
+    background: var(--theme-bg-deep);
+    border: 1px dashed var(--theme-border);
+    border-radius: var(--radius-sm);
+    font-family: var(--report-font-mono);
+    font-size: 12px;
+    color: var(--theme-text-primary);
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-wrap: anywhere;
+}
+
+.report-evidence-footer .evidence-fineprint {
+    margin: 12px 0 0;
+    font-size: 12px;
+    color: var(--theme-text-tertiary);
+}
+
+/* Identity badge — "GENERATED LOCTREE REPORT" */
+.report-identity-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    border: 1px solid var(--theme-border-strong);
+    border-radius: 999px;
+    font-family: var(--report-font-mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: var(--report-tracking-widest);
+    color: var(--theme-text-tertiary);
+    background: var(--theme-hover);
+}
+
+.report-identity-badge::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--report-amber);
+    box-shadow: 0 0 0 2px rgba(201, 154, 59, 0.18);
+}
+
+/* Empty / fallback state for graph and large surfaces */
+.report-fallback-empty {
+    padding: 32px;
+    border: 1px dashed var(--theme-border);
+    border-radius: var(--radius-md);
+    background: var(--theme-bg-surface);
+    color: var(--theme-text-secondary);
+    font-size: 13px;
+    line-height: var(--report-lh-default);
+    text-align: center;
+}
+
+.report-fallback-empty strong {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--theme-text-primary);
+}
+
+/* Accessible focus ring — works for buttons, nav, links */
+:where(button, a, [role="button"], .nav-item, .tab-btn, .copy-btn, .theme-toggle):focus-visible {
+    outline: 2px solid var(--report-teal);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+}
+
+/* Reduced-motion: kill micro-interactions */
+@media (prefers-reduced-motion: reduce) {
+    .nav-item,
+    .tab-btn,
+    .copy-btn,
+    .theme-toggle,
+    .test-toggle-btn {
+        transition: none;
+    }
+}
+
+/* Narrow viewport / print fallback for the in-report header */
+@media (max-width: 900px) {
+    .report-sticky-hero .report-meta-row {
+        font-size: 10px;
+    }
+
+    .report-evidence-footer {
+        margin-left: 12px;
+        margin-right: 12px;
+        padding: 18px 20px;
+    }
+}
+
+/* =============================================================================
+ * W2-C: Atlas + Tools sidebar views
+ * Added by prompt W2-C_report-sidebar (Wave 2C).
+ * Mirrors the panel/card chrome of cycles + audit so the new sidebar tabs
+ * feel native to the existing report.
+ * ============================================================================= */
+
+/* Atlas view ---------------------------------------------------------------- */
+.atlas-view .atlas-header h3 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 12px 0;
+    font-size: 18px;
+}
+
+.atlas-message {
+    color: var(--theme-text-secondary);
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 0 0 16px 0;
+    max-width: 70ch;
+}
+
+.atlas-paths {
+    display: grid;
+    gap: 8px;
+    background: var(--theme-bg-surface-elevated);
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-md);
+    padding: 12px 14px;
+    margin-bottom: 20px;
+}
+
+.atlas-path-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 12px;
+}
+
+.atlas-path-label {
+    flex: 0 0 90px;
+    color: var(--theme-text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.atlas-path {
+    flex: 1 1 auto;
+    font-family: var(--font-mono);
+    color: var(--theme-text-primary);
+    background: var(--theme-bg-deep);
+    padding: 4px 8px;
+    border-radius: var(--radius-sm);
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.atlas-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+}
+
+.atlas-card {
+    background: var(--theme-bg-surface);
+    border: 1px solid var(--theme-border);
+    border-left: 3px solid var(--theme-accent);
+    border-radius: var(--radius-md);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.atlas-card:hover {
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+    transform: translateY(-1px);
+}
+
+.atlas-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.atlas-card-step {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--theme-text-tertiary);
+}
+
+.atlas-card-id {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--theme-accent);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: rgba(var(--theme-accent-rgb), 0.12);
+    padding: 2px 8px;
+    border-radius: 8px;
+}
+
+.atlas-card-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--theme-text-primary);
+}
+
+.atlas-card-why,
+.atlas-card-saves {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--theme-text-secondary);
+}
+
+.atlas-card-label {
+    color: var(--theme-text-tertiary);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-right: 4px;
+}
+
+.atlas-card-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 4px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--theme-border);
+}
+
+.atlas-card-file {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--theme-text-secondary);
+    word-break: break-all;
+}
+
+.atlas-card-lines {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--theme-text-primary);
+    white-space: nowrap;
+}
+
+.atlas-card-lines.muted {
+    color: var(--theme-text-tertiary);
+    font-style: italic;
+}
+
+.atlas-card-lines.muted code {
+    font-style: normal;
+    background: var(--theme-bg-deep);
+    padding: 1px 4px;
+    border-radius: 3px;
+}
+
+.atlas-footer {
+    margin-top: 8px;
+}
+
+.atlas-footer-fineprint {
+    font-size: 12px;
+    color: var(--theme-text-tertiary);
+    margin: 0;
+    line-height: 1.55;
+}
+
+.atlas-footer-fineprint code {
+    background: var(--theme-bg-deep);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+}
+
+/* Tools view ---------------------------------------------------------------- */
+.tools-view .tools-header h3 {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 0 12px 0;
+    font-size: 18px;
+}
+
+.tools-intro {
+    color: var(--theme-text-secondary);
+    font-size: 13px;
+    line-height: 1.55;
+    margin: 0 0 20px 0;
+    max-width: 80ch;
+}
+
+.tools-intro code {
+    background: var(--theme-bg-deep);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--theme-text-primary);
+}
+
+.tools-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+}
+
+.tools-card {
+    background: var(--theme-bg-surface);
+    border: 1px solid var(--theme-border);
+    border-radius: var(--radius-md);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    transition: box-shadow 0.18s ease, transform 0.18s ease;
+}
+
+.tools-card:hover {
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.10);
+    transform: translateY(-1px);
+}
+
+.tools-card-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.tools-card-section {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 2px 8px;
+    border-radius: 8px;
+    background: var(--theme-bg-surface-elevated);
+    color: var(--theme-text-tertiary);
+    border: 1px solid var(--theme-border);
+}
+
+.tools-card-section-start {
+    background: rgba(var(--theme-accent-rgb), 0.14);
+    color: var(--theme-accent);
+    border-color: rgba(var(--theme-accent-rgb), 0.30);
+}
+
+.tools-card-section-map {
+    background: rgba(52, 152, 219, 0.14);
+    color: #2e86c1;
+    border-color: rgba(52, 152, 219, 0.30);
+}
+
+.tools-card-section-silencer {
+    background: rgba(230, 126, 34, 0.14);
+    color: var(--report-status-warning);
+    border-color: rgba(230, 126, 34, 0.30);
+}
+
+.tools-card-section-polarize {
+    background: rgba(155, 89, 182, 0.14);
+    color: #8e44ad;
+    border-color: rgba(155, 89, 182, 0.30);
+}
+
+.tools-card-name {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--theme-text-primary);
+}
+
+.tools-card-signature {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--theme-text-secondary);
+    background: var(--theme-bg-deep);
+    padding: 2px 8px;
+    border-radius: var(--radius-sm);
+    flex-basis: 100%;
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+.tools-card-desc {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--theme-text-secondary);
+}
+
+.tools-card-example {
+    margin: 0;
+    font-size: 12px;
+}
+
+.tools-card-example > summary {
+    cursor: pointer;
+    color: var(--theme-text-tertiary);
+    font-weight: 600;
+    padding: 4px 0;
+    user-select: none;
+}
+
+.tools-card-example > summary:hover {
+    color: var(--theme-accent);
+}
+
+.tools-card-example-pre {
+    margin: 8px 0 6px 0;
+    padding: 10px 12px;
+    background: var(--theme-bg-deep);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--theme-text-primary);
+    overflow-x: auto;
+    white-space: pre;
+}
+
+.tools-card-doc {
+    align-self: flex-start;
+    font-size: 12px;
+    color: var(--theme-accent);
+    text-decoration: none;
+    padding: 4px 0;
+    font-weight: 600;
+}
+
+.tools-card-doc:hover {
+    text-decoration: underline;
+}
+
+.tools-footer {
+    margin-top: 8px;
+}
+
+.tools-footer-fineprint {
+    font-size: 12px;
+    color: var(--theme-text-tertiary);
+    margin: 0;
+    line-height: 1.55;
+}
+
+.tools-footer-fineprint code {
+    background: var(--theme-bg-deep);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+}
+
+@media (max-width: 900px) {
+    .atlas-path-row {
+        flex-wrap: wrap;
+    }
+    .atlas-path-label {
+        flex-basis: 100%;
+    }
+    .tools-cards-grid,
+    .atlas-cards-grid {
+        grid-template-columns: 1fr;
     }
 }
 "#;

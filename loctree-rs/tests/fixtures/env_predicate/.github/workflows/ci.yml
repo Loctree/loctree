@@ -1,0 +1,11 @@
+name: CI
+on: [push]
+jobs:
+  vars:
+    runs-on: ubuntu-latest
+    steps:
+      - name: derive base ref
+        run: |
+          BASE_REF="main"
+          echo "ref=$BASE_REF" >> "$GITHUB_ENV"
+          echo "runner: $RUNNER_OS ci=$CI"

@@ -1,0 +1,97 @@
+# Loctree Tauri idiom catalog (default).
+# Override via <workspace>/.loctree/idioms/tauri.toml.
+# Source of truth: Cut 3B T3 Layer 3 Tauri runtime semantics.
+
+[[idiom]]
+name = "#[tauri::command]"
+classifier = "DispatchHandler"
+runtime_role = "PublicEntrypoint"
+language = "rust"
+aliases = ["#[command]", "tauri_command"]
+reasoning = "Rust function exposed to the Tauri invoke runtime."
+
+[[idiom]]
+name = "generate_handler!"
+classifier = "DispatchHandler"
+runtime_role = "PublicEntrypoint"
+language = "rust"
+aliases = ["tauri::generate_handler!"]
+reasoning = "Tauri macro registering backend command handlers into the runtime dispatch table."
+
+[[idiom]]
+name = "invoke_handler"
+classifier = "DispatchHandler"
+runtime_role = "PublicEntrypoint"
+language = "rust"
+reasoning = "Builder method wiring Tauri command handlers into the app runtime."
+
+[[idiom]]
+name = "invoke"
+classifier = "DispatchHandler"
+runtime_role = "UserFacing"
+language = "typescript"
+aliases = ["safeInvoke", "invokeCommand"]
+reasoning = "Frontend call into a backend Tauri command."
+
+[[idiom]]
+name = "invoke"
+classifier = "DispatchHandler"
+runtime_role = "UserFacing"
+language = "javascript"
+aliases = ["safeInvoke", "invokeCommand"]
+reasoning = "Frontend JavaScript call into a backend Tauri command."
+
+[[idiom]]
+name = "plugin:"
+classifier = "DispatchHandler"
+runtime_role = "PublicEntrypoint"
+language = "typescript"
+reasoning = "Tauri plugin command namespace pattern, e.g. plugin:window|set_icon."
+
+[[idiom]]
+name = "emit"
+classifier = "DispatchHandler"
+runtime_role = "UserFacing"
+language = "typescript"
+aliases = ["appWindow.emit", "window.emit"]
+reasoning = "Frontend Tauri event emission."
+
+[[idiom]]
+name = "listen"
+classifier = "DispatchHandler"
+runtime_role = "UserFacing"
+language = "typescript"
+aliases = ["appWindow.listen", "window.listen"]
+reasoning = "Frontend Tauri event listener registration."
+
+[[idiom]]
+name = "emit"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "rust"
+aliases = ["emit_all", "Manager::emit"]
+reasoning = "Rust-side Tauri event emission through Manager/AppHandle/Window."
+
+[[idiom]]
+name = "listen"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "rust"
+aliases = ["listen_global"]
+reasoning = "Rust-side Tauri event listener registration."
+
+[[idiom]]
+name = "State"
+classifier = "SourceLibraryApi"
+runtime_role = "EnvInput"
+language = "rust"
+aliases = ["tauri::State"]
+reasoning = "Tauri managed state injection into command handlers."
+
+[[idiom]]
+name = "AppHandle"
+classifier = "SourceLibraryApi"
+runtime_role = "LibraryHelper"
+language = "rust"
+aliases = ["tauri::AppHandle"]
+reasoning = "Tauri application handle used by commands and event bridges."

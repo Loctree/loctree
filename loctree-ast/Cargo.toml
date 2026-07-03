@@ -1,0 +1,20 @@
+[package]
+name = "loctree-ast"
+version.workspace = true
+edition.workspace = true
+description = "Tree-sitter AST substrate for Loctree live and structural query paths"
+license.workspace = true
+publish = false
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "loctree_ast"
+path = "src/lib.rs"
+
+[dependencies]
+tree-sitter = "0.25.10"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+thiserror = { workspace = true }

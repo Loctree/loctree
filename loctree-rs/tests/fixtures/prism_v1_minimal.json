@@ -1,0 +1,111 @@
+{
+  "schema_version": "loctree.prism.v1.1",
+  "project_root": "/synthetic/repo",
+  "tasks": [
+    "auth flow",
+    "auth core"
+  ],
+  "total_score": 8,
+  "band": "5..8: local note or Loctree tag",
+  "axes": [
+    {
+      "axis": "spread",
+      "score": 2,
+      "evidence": [
+        "surface kinds: code, runtime, tests"
+      ]
+    },
+    {
+      "axis": "runtime_centrality",
+      "score": 1,
+      "evidence": [
+        "runtime signals: 3; central files: 0"
+      ]
+    },
+    {
+      "axis": "authority_diversity",
+      "score": 1,
+      "evidence": [
+        "authority labels: loctree_derived, repo_verified"
+      ]
+    },
+    {
+      "axis": "drift_risk",
+      "score": 2,
+      "evidence": [
+        "average pairwise file overlap: 0.333",
+        "low lexical memory entries: 0",
+        "stale or dirty cache signal: false"
+      ]
+    },
+    {
+      "axis": "closure_evidence",
+      "score": 2,
+      "evidence": [
+        "verification gates: 1",
+        "likely tests: 2"
+      ]
+    }
+  ],
+  "task_summaries": [
+    {
+      "task": "auth flow",
+      "file_count": 2,
+      "runtime_signal_count": 2,
+      "memory_entry_count": 0,
+      "low_lexical_memory_count": 0,
+      "surface_kinds": [
+        "code",
+        "runtime"
+      ],
+      "authority_labels": [
+        "repo_verified"
+      ],
+      "top_files": [
+        "src/auth/login.rs",
+        "src/auth/session.rs"
+      ],
+      "verification_gates": [
+        "cargo test"
+      ],
+      "likely_tests": [
+        "tests/auth_flow.rs"
+      ],
+      "cache_scope": "clean",
+      "stale_snapshot": false,
+      "dirty_worktree": false
+    },
+    {
+      "task": "auth core",
+      "file_count": 2,
+      "runtime_signal_count": 1,
+      "memory_entry_count": 0,
+      "low_lexical_memory_count": 0,
+      "surface_kinds": [
+        "code",
+        "tests"
+      ],
+      "authority_labels": [
+        "loctree_derived"
+      ],
+      "top_files": [
+        "src/auth/session.rs",
+        "tests/auth_core.rs"
+      ],
+      "verification_gates": [],
+      "likely_tests": [
+        "tests/auth_core.rs"
+      ],
+      "cache_scope": "clean",
+      "stale_snapshot": false,
+      "dirty_worktree": false
+    }
+  ],
+  "overlap": {
+    "union_files": 3,
+    "shared_files_all_tasks": 1,
+    "average_pairwise_jaccard": 0.333
+  },
+  "recommendation": "Capture a local note or tag before implementation continues.",
+  "band_action": "memo"
+}

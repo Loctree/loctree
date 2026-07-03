@@ -6,7 +6,7 @@
 //!
 //! This crate provides a type-safe, component-based approach to generating
 //! beautiful HTML reports using [Leptos](https://leptos.dev/) server-side rendering.
-//! Originally built for [loctree](https://github.com/Loctree/loctree-ast) codebase
+//! Originally built for [loctree](https://github.com/Loctree/Loctree) codebase
 //! analysis, it can be used independently for any static report generation needs.
 //!
 //! ## Features
@@ -61,7 +61,7 @@
 //!
 //! ---
 //!
-//! Developed with 💀 by The Loctree Team (c)2025
+//! Developed with 💀 by The Loctree Team ⓒ 2025-2026
 
 #![doc(html_root_url = "https://docs.rs/report-leptos/0.1.0")]
 #![warn(missing_docs)]
@@ -194,6 +194,15 @@ mod tests {
     }
 
     #[test]
+    fn renders_sidebar_version_once() {
+        let html = render_report(&[], &JsAssets::default(), false);
+        let version = env!("CARGO_PKG_VERSION");
+
+        assert!(html.contains(&format!("loctree v{version}")));
+        assert!(!html.contains(&format!("loctree v{version}{version}")));
+    }
+
+    #[test]
     fn graph_data_to_dot_format() {
         use types::{GraphData, GraphNode};
 
@@ -316,6 +325,188 @@ mod tests {
         assert!(html.contains("Context Anchors"));
         assert!(html.contains("src/lib.rs"));
         assert!(html.contains("loct slice src/lib.rs"));
+    }
+
+    #[test]
+    fn renders_hotspots_panel() {
+        use types::HotspotFile;
+
+        let section = ReportSection {
+            root: "test-root".into(),
+            files_analyzed: 1,
+            hotspots: vec![HotspotFile {
+                file: "src/shared/state.rs".into(),
+                importers: 17,
+                category: "CORE".into(),
+                slice_cmd: "loct slice src/shared/state.rs".into(),
+            }],
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        assert!(html.contains("Hotspots"));
+        assert!(html.contains("Import Hotspots"));
+        assert!(html.contains("src/shared/state.rs"));
+        assert!(html.contains("17"));
+        assert!(html.contains("loct slice src/shared/state.rs"));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Editorial styling discipline (plan 24) — assert the polished surface.
+    // These tests guard the loctree-com /cloud styling alignment so future
+    // refactors do not silently regress the public artifact's identity.
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn renders_editorial_identity_badge() {
+        let section = ReportSection {
+            root: "demo-project".into(),
+            files_analyzed: 1,
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        assert!(
+            html.contains("Generated Loctree Report"),
+            "identity badge should communicate provenance, not 'buy now'"
+        );
+        assert!(html.contains("report-identity-badge"));
+        assert!(
+            !html.contains("Checkout"),
+            "no SaaS checkout copy in artifact"
+        );
+        assert!(
+            !html.contains("Buy now"),
+            "no SaaS purchase CTA in artifact"
+        );
+    }
+
+    #[test]
+    fn renders_editorial_section_hero_pattern() {
+        let section = ReportSection {
+            root: "demo-project".into(),
+            files_analyzed: 1,
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        // eyebrow / display title / meta-row hierarchy
+        assert!(html.contains("report-eyebrow"));
+        assert!(html.contains("report-section-title"));
+        assert!(html.contains("report-sticky-hero"));
+    }
+
+    #[test]
+    fn renders_evidence_footer_with_provenance() {
+        let section = ReportSection {
+            root: "/very/deep/nested/path/to/some-project".into(),
+            files_analyzed: 7,
+            git_branch: Some("main".into()),
+            git_commit: Some("abc1234".into()),
+            generated_at: Some("2026-05-15T05:10:00Z".into()),
+            schema_name: Some("loctree".into()),
+            schema_version: Some("0.10.2".into()),
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        assert!(html.contains("report-evidence-footer"));
+        assert!(html.contains("Generated Loctree Report — provenance"));
+        assert!(html.contains("Renderer"));
+        assert!(html.contains("Source project"));
+        assert!(html.contains("Reproduce this artifact"));
+        assert!(html.contains("loct report --output report.html"));
+        assert!(html.contains(env!("CARGO_PKG_VERSION")));
+        assert!(html.contains("main@abc1234"));
+        assert!(html.contains("loctree@0.10.2"));
+        // Cross-link to /cloud is editorial fineprint, not a CTA
+        assert!(html.contains("loct.io/cloud"));
+    }
+
+    #[test]
+    fn evidence_footer_handles_missing_provenance_gracefully() {
+        let section = ReportSection {
+            root: String::new(),
+            files_analyzed: 0,
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        // Footer renders with safe defaults
+        assert!(html.contains("report-evidence-footer"));
+        assert!(html.contains("(unspecified)"));
+        // Repro command still present without cwd suffix
+        assert!(html.contains("loct report --output report.html"));
+        // No stray empty git/schema chips
+        assert!(!html.contains("Generated at</span>"));
+    }
+
+    #[test]
+    fn editorial_token_layer_present_in_styles() {
+        // Style sheet ships the warm editorial token primitives that mirror
+        // loctree-com/styles/tokens.css. If these names disappear the
+        // discipline is broken.
+        assert!(styles::REPORT_CSS.contains("--report-bone"));
+        assert!(styles::REPORT_CSS.contains("--report-amber"));
+        assert!(styles::REPORT_CSS.contains("--report-teal"));
+        assert!(styles::REPORT_CSS.contains("--report-status-success"));
+        assert!(styles::REPORT_CSS.contains("--report-status-warning"));
+        assert!(styles::REPORT_CSS.contains("--report-status-danger"));
+        assert!(styles::REPORT_CSS.contains(".report-eyebrow"));
+        assert!(styles::REPORT_CSS.contains(".report-section-title"));
+        assert!(styles::REPORT_CSS.contains(".report-evidence-footer"));
+        assert!(styles::REPORT_CSS.contains(".report-identity-badge"));
+        assert!(styles::REPORT_CSS.contains(".report-fallback-empty"));
+    }
+
+    #[test]
+    fn no_loctree_com_secrets_in_artifact() {
+        // Belt-and-suspenders: even though we never thread loctree-com data
+        // into the renderer, sweep the rendered HTML for forbidden surfaces.
+        let section = ReportSection {
+            root: "demo-project".into(),
+            files_analyzed: 1,
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        // Polar product IDs (UUID-like) and stripe-style identifiers
+        assert!(!html.contains("polar_"), "no Polar product IDs allowed");
+        assert!(
+            !html.contains("price_"),
+            "no Polar/Stripe price IDs allowed"
+        );
+        assert!(
+            !html.contains("/api/checkout"),
+            "no SaaS checkout endpoints"
+        );
+        assert!(
+            !html.contains("Add Cloud Sync"),
+            "no SaaS purchase CTAs in static artifact"
+        );
+    }
+
+    #[test]
+    fn renders_long_paths_without_collapsing_layout() {
+        let long = "/home/example/very/very/very/long/path/to/some/deeply/nested/source/project/with/a/lot/of/components".to_string();
+        let section = ReportSection {
+            root: long.clone(),
+            files_analyzed: 1,
+            ..Default::default()
+        };
+        let assets = JsAssets::default();
+        let html = render_report(&[section], &assets, false);
+
+        // Long path is rendered, but with the wrap class so it cannot blow
+        // out the sticky header or evidence footer.
+        assert!(html.contains(&long));
+        assert!(html.contains("report-path-wrap"));
     }
 
     #[test]

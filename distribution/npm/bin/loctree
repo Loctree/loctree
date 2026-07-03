@@ -1,6 +1,0 @@
-#!/usr/bin/env node
-
-// This is a simple wrapper that delegates to the main index.js
-// The bin field in package.json points here for the CLI command
-
-require('../index.js');

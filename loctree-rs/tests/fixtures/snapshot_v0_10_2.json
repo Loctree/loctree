@@ -1,0 +1,32 @@
+{
+  "metadata": {
+    "schema_version": "0.10.2",
+    "generated_at": "2026-05-13T00:00:00Z",
+    "roots": ["."],
+    "languages": ["rs"],
+    "file_count": 1,
+    "total_loc": 1,
+    "scan_duration_ms": 1
+  },
+  "files": [
+    {
+      "path": "src/lib.rs",
+      "loc": 1,
+      "language": "rs",
+      "kind": "code",
+      "exports": [
+        {
+          "name": "hello",
+          "kind": "function",
+          "export_type": "named",
+          "line": 1
+        }
+      ]
+    }
+  ],
+  "edges": [],
+  "export_index": {},
+  "command_bridges": [],
+  "event_bridges": [],
+  "barrels": []
+}

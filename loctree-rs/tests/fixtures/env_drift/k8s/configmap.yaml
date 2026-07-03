@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vista-config
+  namespace: production
+data:
+  DATABASE_URL: postgres://other-host@db.svc:5432/vista
+  LOG_LEVEL: info
+  FEATURE_FLAGS: '{"x":true}'

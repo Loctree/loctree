@@ -186,6 +186,19 @@ pub struct HubFile {
     pub slice_cmd: String,
 }
 
+/// High fan-in file surfaced by the import hotspot analyzer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HotspotFile {
+    /// Relative path of the file.
+    pub file: String,
+    /// Number of files importing this file.
+    pub importers: usize,
+    /// Hotspot category, e.g. CORE, SHARED, or PERIPHERAL.
+    pub category: String,
+    /// Suggested command to inspect this hotspot.
+    pub slice_cmd: String,
+}
+
 /// Directory or file node used by the report tree view.
 ///
 /// Contains relative path, aggregated LOC, and children.
@@ -648,7 +661,7 @@ pub struct RankedDup {
     pub reason: String,
 }
 
-/// Match reason for crowd membership (mirrors loctree_rs::analyzer::crowd::MatchReason).
+/// Match reason for crowd membership (mirrors loctree-rs::analyzer::crowd::MatchReason).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MatchReason {
@@ -669,7 +682,7 @@ pub enum MatchReason {
     },
 }
 
-/// Issue detected in a crowd (mirrors loctree_rs::analyzer::crowd::CrowdIssue).
+/// Issue detected in a crowd (mirrors loctree-rs::analyzer::crowd::CrowdIssue).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CrowdIssue {
@@ -1277,6 +1290,12 @@ pub struct ReportSection {
     /// Schema version for artifact payload
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
+    /// Loctree CLI/library version that produced this report.
+    ///
+    /// Populated from `env!("CARGO_PKG_VERSION")` at the analyzer boundary so
+    /// the rendered artifact carries the same provenance as JSON/MCP outputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loctree_version: Option<String>,
     /// Frontend commands missing backend handlers
     pub missing_handlers: Vec<CommandGap>,
     /// Backend handlers not registered in generate_handler![]
@@ -1309,6 +1328,9 @@ pub struct ReportSection {
     /// High-connectivity context anchors
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hub_files: Vec<HubFile>,
+    /// Import fan-in hotspots from the analyzer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hotspots: Vec<HotspotFile>,
     /// Crowd analysis results (naming collision detection)
     #[serde(default)]
     pub crowds: Vec<Crowd>,
@@ -1330,4 +1352,41 @@ pub struct ReportSection {
     /// Refactor plan data (architectural reorganization suggestions)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refactor_plan: Option<RefactorPlanData>,
+    /// Context Atlas pointer (when `loct auto` materialized navigable cards
+    /// under `<artifacts_dir>/context-atlas/`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_atlas: Option<ContextAtlasInfo>,
+}
+
+/// Lightweight pointer to a materialized Context Atlas surface.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContextAtlasInfo {
+    /// Absolute path to the materialized atlas directory.
+    pub atlas_dir: String,
+    /// Absolute path to the human-readable manifest (`manifest.md`).
+    pub manifest: String,
+    /// Absolute path to the machine-readable manifest (`manifest.json`).
+    pub manifest_json: String,
+    /// Absolute path to the recommended first card (`00-core-map.md`).
+    pub recommended_start: String,
+    /// One-line summary suitable for top-of-report rendering.
+    pub message: String,
+    /// Atlas card pointers for the recommended reading path.
+    #[serde(default)]
+    pub cards: Vec<ContextAtlasCardInfo>,
+}
+
+/// Metadata for a single Context Atlas card.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContextAtlasCardInfo {
+    /// Card identifier (e.g. `"core"`, `"structural"`, `"runtime"`).
+    pub id: String,
+    /// Human-readable title (e.g. `"Core Map"`).
+    pub title: String,
+    /// Card filename inside the atlas dir (e.g. `"00-core-map.md"`).
+    pub path: String,
+    /// Line count of the rendered card.
+    pub lines: usize,
+    /// One-line "why read this card" hint.
+    pub why: String,
 }

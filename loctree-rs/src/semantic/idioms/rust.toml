@@ -1,0 +1,182 @@
+# Loctree Rust idiom catalog (default).
+# Override via <workspace>/.loctree/idioms/rust.toml.
+# Source of truth: docs/semantic-spec.md "Rust idiom catalog" (Cut 3B T2).
+# 23 entries — keep in sync with the spec doc.
+
+# ---- Lifecycle / entrypoint idioms -----------------------------------------
+
+[[idiom]]
+name = "main"
+classifier = "PrimaryEntrypoint"
+runtime_role = "PrimaryEntrypoint"
+language = "rust"
+reasoning = "Binary crate entrypoint; reachable via cargo run / compiled binary execution, not via static call."
+
+[[idiom]]
+name = "new"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Idiomatic Rust constructor convention; called via Type::new(...) across the ecosystem."
+
+[[idiom]]
+name = "default"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Default trait method; reached via Default::default() and #[derive(Default)] expansion."
+
+[[idiom]]
+name = "build"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Builder pattern terminal method; conventionally consumes Self into the built type."
+
+# ---- Conversion trait methods ----------------------------------------------
+
+[[idiom]]
+name = "from"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "From trait method; reached via T::from(x) and the .into() blanket impl."
+
+[[idiom]]
+name = "try_from"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "TryFrom trait method; reached via T::try_from(x) and the .try_into() blanket impl."
+
+[[idiom]]
+name = "into"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Into trait method; reached via .into() conversions and the From blanket impl."
+
+[[idiom]]
+name = "to_string"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Display blanket impl method; reached via .to_string() and format!() macro."
+
+[[idiom]]
+name = "as_ref"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "AsRef trait method; reached via std::convert::AsRef bounds throughout std and ecosystem."
+
+[[idiom]]
+name = "as_mut"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "AsMut trait method; reached via std::convert::AsMut bounds."
+
+# ---- Standard trait method names (Display/Debug/Drop/Clone/etc.) -----------
+
+[[idiom]]
+name = "fmt"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Display/Debug trait method; reached via format!/println!/eprintln!/write! macros and Debug derive."
+
+[[idiom]]
+name = "drop"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Drop trait method; reached implicitly when a value goes out of scope; cannot be called directly."
+
+[[idiom]]
+name = "clone"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Clone trait method; reached via .clone() calls and #[derive(Clone)] expansion."
+
+[[idiom]]
+name = "next"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Iterator trait method; reached implicitly through for-loops and iterator adapters."
+
+[[idiom]]
+name = "into_iter"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "IntoIterator trait method; reached implicitly through for-loops over collections."
+
+[[idiom]]
+name = "size_hint"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Iterator trait method called by collect() to pre-allocate capacity."
+
+[[idiom]]
+name = "deref"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Deref trait method; reached via auto-deref coercions inserted by the compiler."
+
+[[idiom]]
+name = "deref_mut"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "DerefMut trait method; reached via auto-deref-mut coercions inserted by the compiler."
+
+# ---- Equality / ordering / hashing -----------------------------------------
+
+[[idiom]]
+name = "eq"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "PartialEq trait method; reached via == operator and assert_eq! macro."
+
+[[idiom]]
+name = "cmp"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Ord trait method; reached via .sort() and BTreeMap/BTreeSet operations."
+
+[[idiom]]
+name = "partial_cmp"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "PartialOrd trait method; reached via comparison operators (<, >, <=, >=)."
+
+[[idiom]]
+name = "hash"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Hash trait method; reached implicitly via HashMap / HashSet operations and #[derive(Hash)]."
+
+# ---- Serde / serialization conventions -------------------------------------
+
+[[idiom]]
+name = "serialize"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Serde Serialize trait method; reached via serde_json::to_string and #[derive(Serialize)] expansion."
+
+[[idiom]]
+name = "deserialize"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "rust"
+reasoning = "Serde Deserialize trait method; reached via serde_json::from_str and #[derive(Deserialize)] expansion."

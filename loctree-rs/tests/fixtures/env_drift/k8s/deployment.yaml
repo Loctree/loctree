@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vista-api
+  namespace: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vista-api
+  template:
+    metadata:
+      labels:
+        app: vista-api
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/vista/api:latest
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: vista-credentials
+                  key: DATABASE_URL
+          envFrom:
+            - configMapRef:
+                name: vista-config

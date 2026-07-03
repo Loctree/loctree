@@ -1,0 +1,7 @@
+{
+  "name": "loctree-astro-fixture",
+  "type": "module",
+  "dependencies": {
+    "astro": "^5.0.0"
+  }
+}
