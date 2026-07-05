@@ -52,25 +52,45 @@ fn hub_ranking_uses_unique_direct_importers_not_raw_edges() {
 
 #[test]
 fn cli_mcp_and_health_surfaces_use_the_canonical_metric_source() {
+    // In-crate surfaces stay compile-time (always shipped with this crate).
     let pack = include_str!("../src/pack.rs");
     let context_scope = include_str!("../src/cli/dispatch/handlers/context/scope.rs");
-    let health = include_str!("../../loctree-lsp/src/health.rs");
-    let mcp = include_str!("../../loctree-mcp/src/main.rs");
 
     assert!(pack.contains("importer_counts_direct(snapshot)"));
     assert!(pack.contains("top_hubs_by_importers_direct(snapshot, limit)"));
     assert!(context_scope.contains("top_hubs_by_importers_direct_filtered"));
-    assert!(health.contains("importer_counts_direct(snapshot)"));
-    assert!(health.contains("top_hubs_by_importers_direct(snapshot"));
-    assert!(mcp.contains("repository_metrics(&snapshot)"));
-    assert!(mcp.contains("top_hubs_by_importers_direct(&snapshot, 5)"));
 
-    for (surface, source) in [
-        ("pack", pack),
-        ("context_scope", context_scope),
-        ("health", health),
-        ("mcp", mcp),
-    ] {
+    // Sibling-crate surfaces are read at runtime: the engine release mirror
+    // ships loctree-rs without loctree-lsp/loctree-mcp, and a compile-time
+    // include_str! would break the whole test target there. Absent file ⇒
+    // that surface is not part of this checkout ⇒ nothing to assert; present
+    // file MUST still honor the canonical metric source.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let health_path = manifest_dir.join("../loctree-lsp/src/health.rs");
+    let mcp_path = manifest_dir.join("../loctree-mcp/src/main.rs");
+    let health = std::fs::read_to_string(&health_path).ok();
+    let mcp = std::fs::read_to_string(&mcp_path).ok();
+
+    if let Some(health) = &health {
+        assert!(health.contains("importer_counts_direct(snapshot)"));
+        assert!(health.contains("top_hubs_by_importers_direct(snapshot"));
+    }
+    if let Some(mcp) = &mcp {
+        assert!(mcp.contains("repository_metrics(&snapshot)"));
+        assert!(mcp.contains("top_hubs_by_importers_direct(&snapshot, 5)"));
+    }
+
+    let mut surfaces = vec![
+        ("pack", pack.to_string()),
+        ("context_scope", context_scope.to_string()),
+    ];
+    if let Some(health) = health {
+        surfaces.push(("health", health));
+    }
+    if let Some(mcp) = mcp {
+        surfaces.push(("mcp", mcp));
+    }
+    for (surface, source) in surfaces {
         assert!(
             !source.contains("entry(edge.to.clone()).or_insert(0) += 1")
                 && !source.contains("entry(&edge.to).or_default() += 1"),
