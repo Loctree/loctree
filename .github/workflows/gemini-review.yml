@@ -2,6 +2,13 @@ name: '🔎 Gemini Review'
 
 on:
   workflow_call:
+    secrets:
+      APP_PRIVATE_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      GOOGLE_API_KEY:
+        required: false
     inputs:
       additional_context:
         type: 'string'
@@ -41,8 +48,25 @@ jobs:
       - name: 'Checkout repository'
         uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
 
+      - name: 'Check authentication configuration'
+        id: 'check_auth'
+        env:
+          HAS_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+          HAS_GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY != '' }}
+          HAS_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER != '' }}
+          HAS_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI != '' }}
+          HAS_USE_GCA: ${{ vars.GOOGLE_GENAI_USE_GCA != '' }}
+        run: |-
+          if [[ "${HAS_GEMINI_API_KEY}" == "true" || "${HAS_GOOGLE_API_KEY}" == "true" || "${HAS_WIF_PROVIDER}" == "true" || "${HAS_USE_VERTEXAI}" == "true" || "${HAS_USE_GCA}" == "true" ]]; then
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::No Gemini authentication configured. Set one of: GEMINI_API_KEY secret, GOOGLE_API_KEY secret, or configure the GCP_WIF_PROVIDER, GOOGLE_GENAI_USE_VERTEXAI, or GOOGLE_GENAI_USE_GCA variables."
+          fi
+
       - name: 'Run Gemini pull request review'
-        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        if: '${{ steps.check_auth.outputs.configured == ''true'' }}'
+        uses: 'google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489' # ratchet:exclude
         id: 'gemini_pr_review'
         env:
           GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
@@ -51,6 +75,7 @@ jobs:
           PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           REPOSITORY: '${{ github.repository }}'
           ADDITIONAL_CONTEXT: '${{ inputs.additional_context }}'
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
           gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
@@ -65,6 +90,7 @@ jobs:
           use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
           upload_artifacts: '${{ vars.UPLOAD_ARTIFACTS }}'
           workflow_name: 'gemini-review'
+          github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
           settings: |-
             {
               "model": {
@@ -84,13 +110,12 @@ jobs:
                     "--rm",
                     "-e",
                     "GITHUB_PERSONAL_ACCESS_TOKEN",
-                    "ghcr.io/github/github-mcp-server:v0.18.0"
+                    "ghcr.io/github/github-mcp-server:v0.27.0"
                   ],
                   "includeTools": [
                     "add_comment_to_pending_review",
-                    "create_pending_pull_request_review",
                     "pull_request_read",
-                    "submit_pending_pull_request_review"
+                    "pull_request_review_write"
                   ],
                   "env": {
                     "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
