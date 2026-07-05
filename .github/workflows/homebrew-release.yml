@@ -1,0 +1,147 @@
+name: Sync Homebrew Taps
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to sync into the tap repos (e.g. 0.9.0)"
+        required: true
+        type: string
+
+env:
+  CLI_RELEASE_REPO: Loctree/loct
+  MCP_RELEASE_REPO: Loctree/loctree-mcp
+  CLI_TAP_REPO: Loctree/homebrew-cli
+  MCP_TAP_REPO: Loctree/homebrew-mcp
+
+jobs:
+  sync-taps:
+    name: Sync Homebrew Formula Repos
+    runs-on: [self-hosted, Linux, X64, ops]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG_NAME: ${{ github.event.release.tag_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${RELEASE_TAG_NAME#v}"
+            VERSION="${VERSION#loctree-v}"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Download release tarballs and calculate SHA256
+        id: shas
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          sha256_file() {
+            local file="$1"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$file" | awk '{print $1}'
+              return
+            fi
+            shasum -a 256 "$file" | awk '{print $1}'
+          }
+
+          fetch() {
+            local url="$1"
+            local output="$2"
+            curl -fsSL "$url" -o "$output"
+            sha256_file "$output"
+          }
+
+          WORKDIR=$(mktemp -d)
+          trap 'rm -rf "$WORKDIR"' EXIT
+
+          CLI_DARWIN_AARCH64_URL="https://github.com/${CLI_RELEASE_REPO}/releases/download/v${VERSION}/loct-darwin-aarch64.tar.gz"
+          CLI_DARWIN_X86_64_URL="https://github.com/${CLI_RELEASE_REPO}/releases/download/v${VERSION}/loct-darwin-x86_64.tar.gz"
+          CLI_LINUX_X86_64_URL="https://github.com/${CLI_RELEASE_REPO}/releases/download/v${VERSION}/loct-linux-x86_64.tar.gz"
+          MCP_DARWIN_AARCH64_URL="https://github.com/${MCP_RELEASE_REPO}/releases/download/v${VERSION}/loctree-mcp-darwin-aarch64.tar.gz"
+          MCP_DARWIN_X86_64_URL="https://github.com/${MCP_RELEASE_REPO}/releases/download/v${VERSION}/loctree-mcp-darwin-x86_64.tar.gz"
+          MCP_LINUX_X86_64_URL="https://github.com/${MCP_RELEASE_REPO}/releases/download/v${VERSION}/loctree-mcp-linux-x86_64.tar.gz"
+
+          echo "cli_darwin_aarch64_sha=$(fetch "$CLI_DARWIN_AARCH64_URL" "$WORKDIR/loct-darwin-aarch64.tar.gz")" >> "$GITHUB_OUTPUT"
+          echo "cli_darwin_x86_64_sha=$(fetch "$CLI_DARWIN_X86_64_URL" "$WORKDIR/loct-darwin-x86_64.tar.gz")" >> "$GITHUB_OUTPUT"
+          echo "cli_linux_x86_64_sha=$(fetch "$CLI_LINUX_X86_64_URL" "$WORKDIR/loct-linux-x86_64.tar.gz")" >> "$GITHUB_OUTPUT"
+
+          echo "mcp_darwin_aarch64_sha=$(fetch "$MCP_DARWIN_AARCH64_URL" "$WORKDIR/loctree-mcp-darwin-aarch64.tar.gz")" >> "$GITHUB_OUTPUT"
+          echo "mcp_darwin_x86_64_sha=$(fetch "$MCP_DARWIN_X86_64_URL" "$WORKDIR/loctree-mcp-darwin-x86_64.tar.gz")" >> "$GITHUB_OUTPUT"
+          echo "mcp_linux_x86_64_sha=$(fetch "$MCP_LINUX_X86_64_URL" "$WORKDIR/loctree-mcp-linux-x86_64.tar.gz")" >> "$GITHUB_OUTPUT"
+
+      - name: Clone tap repos
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git clone "https://x-access-token:${HOMEBREW_GITHUB_API_TOKEN}@github.com/${CLI_TAP_REPO}.git" "$RUNNER_TEMP/homebrew-cli"
+          git clone "https://x-access-token:${HOMEBREW_GITHUB_API_TOKEN}@github.com/${MCP_TAP_REPO}.git" "$RUNNER_TEMP/homebrew-mcp"
+
+      - name: Render tap formulas
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          CLI_RELEASE_REPO: ${{ env.CLI_RELEASE_REPO }}
+          MCP_RELEASE_REPO: ${{ env.MCP_RELEASE_REPO }}
+          CLI_DARWIN_AARCH64_SHA: ${{ steps.shas.outputs.cli_darwin_aarch64_sha }}
+          CLI_DARWIN_X86_64_SHA: ${{ steps.shas.outputs.cli_darwin_x86_64_sha }}
+          CLI_LINUX_X86_64_SHA: ${{ steps.shas.outputs.cli_linux_x86_64_sha }}
+          MCP_DARWIN_AARCH64_SHA: ${{ steps.shas.outputs.mcp_darwin_aarch64_sha }}
+          MCP_DARWIN_X86_64_SHA: ${{ steps.shas.outputs.mcp_darwin_x86_64_sha }}
+          MCP_LINUX_X86_64_SHA: ${{ steps.shas.outputs.mcp_linux_x86_64_sha }}
+        run: |
+          set -euo pipefail
+
+          bash scripts/render-homebrew-formula.sh loct "$VERSION" "$RUNNER_TEMP/homebrew-cli/Formula/loct.rb"
+          bash scripts/render-homebrew-formula.sh loctree-mcp "$VERSION" "$RUNNER_TEMP/homebrew-mcp/Formula/loctree-mcp.rb"
+
+      - name: Commit and push CLI tap
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          git -C "$RUNNER_TEMP/homebrew-cli" config user.name "loctree release bot"
+          git -C "$RUNNER_TEMP/homebrew-cli" config user.email "loct@loct.io"
+          git -C "$RUNNER_TEMP/homebrew-cli" add -A
+
+          if git -C "$RUNNER_TEMP/homebrew-cli" diff --cached --quiet; then
+            echo "CLI tap already up to date"
+            exit 0
+          fi
+
+          git -C "$RUNNER_TEMP/homebrew-cli" commit -m "loct ${VERSION}"
+          git -C "$RUNNER_TEMP/homebrew-cli" push origin HEAD
+
+      - name: Commit and push MCP tap
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          git -C "$RUNNER_TEMP/homebrew-mcp" config user.name "loctree release bot"
+          git -C "$RUNNER_TEMP/homebrew-mcp" config user.email "loct@loct.io"
+          git -C "$RUNNER_TEMP/homebrew-mcp" add -A
+
+          if git -C "$RUNNER_TEMP/homebrew-mcp" diff --cached --quiet; then
+            echo "MCP tap already up to date"
+            exit 0
+          fi
+
+          git -C "$RUNNER_TEMP/homebrew-mcp" commit -m "loctree-mcp ${VERSION}"
+          git -C "$RUNNER_TEMP/homebrew-mcp" push origin HEAD

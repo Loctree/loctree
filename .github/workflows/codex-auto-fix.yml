@@ -1,0 +1,127 @@
+name: Codex Auto-Fix on Failure
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: codex-auto-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "20"
+  CODEX_TIMEOUT: 300
+
+jobs:
+  auto-fix:
+    # Only run on failure and skip dependabot/renovate branches
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      !startsWith(github.event.workflow_run.head_branch, 'dependabot/') &&
+      !startsWith(github.event.workflow_run.head_branch, 'renovate/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FAILED_WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+      FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+      FAILED_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      FAILED_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      CODEX_HOME: /home/runner/.codex
+
+    steps:
+      - name: Check prerequisites
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "${OPENAI_API_KEY}" ]]; then
+            echo "::error::OPENAI_API_KEY secret is not set. Skipping auto-fix."
+            exit 1
+          fi
+
+      - name: Checkout failing ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FAILED_HEAD_SHA }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci --prefer-offline --no-audit
+
+      - name: Prepare Codex environment
+        run: |
+          mkdir -p "${CODEX_HOME}"
+          # Python3 is pre-installed on ubuntu-latest runners
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Authenticate Codex
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: codex login --api-key "${OPENAI_API_KEY}"
+
+      - name: Run Codex to fix CI failure
+        id: codex-fix
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          timeout "${CODEX_TIMEOUT}" codex exec \
+            --full-auto \
+            --sandbox workspace-write \
+            "You are working in a Node.js monorepo with Jest tests and GitHub Actions. \
+            Read the repository, run the test suite, identify the minimal change needed \
+            to make all tests pass, implement only that change, and stop. \
+            Do not refactor unrelated code or files. Keep changes small and surgical."
+
+      - name: Verify tests pass
+        run: npm test --silent
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request with fixes
+        if: steps.changes.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "fix(ci): auto-fix failing tests via Codex"
+          branch: codex/auto-fix-${{ github.event.workflow_run.run_id }}
+          base: ${{ env.FAILED_HEAD_BRANCH }}
+          title: "fix(ci): Auto-fix failing CI via Codex"
+          body: |
+            ## 🤖 Automated CI Fix
+
+            Codex automatically generated this PR in response to a CI failure.
+
+            | Property | Value |
+            |----------|-------|
+            | Workflow | `${{ env.FAILED_WORKFLOW_NAME }}` |
+            | Failed run | ${{ env.FAILED_RUN_URL }} |
+            | Branch | `${{ env.FAILED_HEAD_BRANCH }}` |
+            | Commit | `${{ env.FAILED_HEAD_SHA }}` |
+
+            ---
+
+            ⚠️ **Please review carefully before merging.** This PR contains minimal changes intended solely to make the CI pass.
+          labels: |
+            automated
+            ci-fix
+          delete-branch: false

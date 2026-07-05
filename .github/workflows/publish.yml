@@ -1,0 +1,814 @@
+name: Publish Releases
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "loctree-v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CLI_RELEASE_REPO: Loctree/loct
+  MCP_RELEASE_REPO: Loctree/loctree-mcp
+
+jobs:
+  verify-release:
+    name: Verify Release State
+    runs-on: [self-hosted, Linux, X64, ops]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [[ "$TAG" == loctree-v* ]]; then
+            VERSION="${TAG#loctree-v}"
+          else
+            VERSION="${TAG#v}"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+          echo "Release version: $VERSION"
+
+      - name: Verify checked-in versions
+        run: |
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          WORKSPACE_VERSION=$(awk '
+            /^\[workspace.package\]$/ { in_section=1; next }
+            in_section && /^version = / { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.toml)
+          NPM_VERSION=$(node -p "require('./distribution/npm/package.json').version")
+
+          echo "Workspace version: $WORKSPACE_VERSION"
+          echo "distribution/npm version: $NPM_VERSION"
+
+          if [[ "$WORKSPACE_VERSION" != "$TAG_VERSION" ]]; then
+            echo "Cargo workspace version does not match tag: $WORKSPACE_VERSION != $TAG_VERSION" >&2
+            exit 1
+          fi
+
+          if [[ "$NPM_VERSION" != "$TAG_VERSION" ]]; then
+            echo "distribution/npm version does not match tag: $NPM_VERSION != $TAG_VERSION" >&2
+            exit 1
+          fi
+
+  publish-crates:
+    name: Publish Rust Crates
+    needs: verify-release
+    runs-on: [self-hosted, Linux, X64, ops]
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Install protoc
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y protobuf-compiler
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Release quality gate
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Publish report-leptos
+        run: |
+          cargo publish -p report-leptos 2>&1 || {
+            if cargo search report-leptos 2>/dev/null | grep -q '"${{ needs.verify-release.outputs.version }}"'; then
+              echo "report-leptos already at ${{ needs.verify-release.outputs.version }}, continuing"
+            else
+              exit 1
+            fi
+          }
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish loctree
+        run: |
+          cargo publish -p loctree 2>&1 || {
+            if cargo search loctree 2>/dev/null | grep -q '"${{ needs.verify-release.outputs.version }}"'; then
+              echo "loctree already at ${{ needs.verify-release.outputs.version }}, continuing"
+            else
+              exit 1
+            fi
+          }
+
+      - name: Wait for crates.io index
+        run: sleep 30
+
+      - name: Publish loctree-mcp
+        run: |
+          cargo publish -p loctree-mcp 2>&1 || {
+            if cargo search loctree-mcp 2>/dev/null | grep -q '"${{ needs.verify-release.outputs.version }}"'; then
+              echo "loctree-mcp already at ${{ needs.verify-release.outputs.version }}, continuing"
+            else
+              exit 1
+            fi
+          }
+
+  build-cli-linux:
+    name: Build CLI Linux Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: [self-hosted, Linux, X64, ops]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build release binaries
+        run: cargo build -p loctree --release --target x86_64-unknown-linux-gnu
+
+      - name: Package CLI Linux artifact
+        run: |
+          mkdir -p dist/linux-x86_64
+          cp target/x86_64-unknown-linux-gnu/release/loct dist/linux-x86_64/loct
+          cp target/x86_64-unknown-linux-gnu/release/loctree dist/linux-x86_64/loctree
+          chmod +x dist/linux-x86_64/loct dist/linux-x86_64/loctree
+          tar -czf loct-linux-x86_64.tar.gz -C dist/linux-x86_64 loct loctree
+
+      - name: Upload CLI Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loct-linux-x86_64
+          path: loct-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-cli-macos-arm64:
+    name: Build CLI macOS ARM64 Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: [self-hosted, macOS, ARM64, dragon]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Import macOS signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/loctree-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/loctree-build-cert.p12"
+          CA_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$CA_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$CA_PATH" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" /Library/Keychains/System.keychain /System/Library/Keychains/SystemRootCertificates.keychain login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+      - name: Build release binaries
+        run: cargo build -p loctree --release --target aarch64-apple-darwin
+
+      - name: Smoke check CLI macOS ARM64 binaries
+        run: |
+          bash distribution/macos/smoke-releaseability.sh \
+            target/aarch64-apple-darwin/release/loct \
+            target/aarch64-apple-darwin/release/loctree
+
+      - name: Package CLI macOS ARM64 artifact
+        env:
+          MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p dist/darwin-aarch64
+          cp target/aarch64-apple-darwin/release/loct dist/darwin-aarch64/loct
+          cp target/aarch64-apple-darwin/release/loctree dist/darwin-aarch64/loctree
+          chmod +x dist/darwin-aarch64/loct dist/darwin-aarch64/loctree
+          bash distribution/macos/sign-and-notarize.sh dist/darwin-aarch64 loct-darwin-aarch64-notarized.zip
+          tar -czf loct-darwin-aarch64.tar.gz -C dist/darwin-aarch64 loct loctree
+
+      - name: Upload CLI macOS ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loct-darwin-aarch64
+          path: |
+            loct-darwin-aarch64.tar.gz
+            loct-darwin-aarch64-notarized.zip
+          if-no-files-found: error
+
+  build-cli-macos-x86_64:
+    name: Build CLI macOS x86_64 Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: [self-hosted, macOS, ARM64, dragon]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Import macOS signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/loctree-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/loctree-build-cert.p12"
+          CA_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$CA_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$CA_PATH" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" /Library/Keychains/System.keychain /System/Library/Keychains/SystemRootCertificates.keychain login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+      - name: Build release binaries
+        run: cargo build -p loctree --release --target x86_64-apple-darwin
+
+      - name: Package CLI macOS x86_64 artifact
+        env:
+          MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p dist/darwin-x86_64
+          cp target/x86_64-apple-darwin/release/loct dist/darwin-x86_64/loct
+          cp target/x86_64-apple-darwin/release/loctree dist/darwin-x86_64/loctree
+          chmod +x dist/darwin-x86_64/loct dist/darwin-x86_64/loctree
+          bash distribution/macos/sign-and-notarize.sh dist/darwin-x86_64 loct-darwin-x86_64-notarized.zip
+          tar -czf loct-darwin-x86_64.tar.gz -C dist/darwin-x86_64 loct loctree
+
+      - name: Upload CLI macOS x86_64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loct-darwin-x86_64
+          path: |
+            loct-darwin-x86_64.tar.gz
+            loct-darwin-x86_64-notarized.zip
+          if-no-files-found: error
+
+  build-cli-windows:
+    name: Build CLI Windows Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binaries
+        run: cargo build -p loctree --release --target x86_64-pc-windows-msvc
+
+      - name: Package CLI Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\loct.exe dist\loct.exe
+          Copy-Item target\x86_64-pc-windows-msvc\release\loctree.exe dist\loctree.exe
+          Compress-Archive -Path dist\* -DestinationPath loct-windows-x86_64.zip -Force
+
+      - name: Upload CLI Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loct-windows-x86_64
+          path: loct-windows-x86_64.zip
+          if-no-files-found: error
+
+  build-mcp-linux:
+    name: Build MCP Linux Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: [self-hosted, Linux, X64, ops]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build release binary
+        run: cargo build -p loctree-mcp --release --target x86_64-unknown-linux-gnu
+
+      - name: Package MCP Linux artifact
+        run: |
+          mkdir -p dist/linux-x86_64
+          cp target/x86_64-unknown-linux-gnu/release/loctree-mcp dist/linux-x86_64/loctree-mcp
+          chmod +x dist/linux-x86_64/loctree-mcp
+          tar -czf loctree-mcp-linux-x86_64.tar.gz -C dist/linux-x86_64 loctree-mcp
+
+      - name: Upload MCP Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loctree-mcp-linux-x86_64
+          path: loctree-mcp-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-mcp-macos-arm64:
+    name: Build MCP macOS ARM64 Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: [self-hosted, macOS, ARM64, dragon]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Import macOS signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/loctree-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/loctree-build-cert.p12"
+          CA_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$CA_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$CA_PATH" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" /Library/Keychains/System.keychain /System/Library/Keychains/SystemRootCertificates.keychain login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+      - name: Build release binary
+        run: cargo build -p loctree-mcp --release --target aarch64-apple-darwin
+
+      - name: Smoke check MCP macOS ARM64 binary
+        run: |
+          bash distribution/macos/smoke-releaseability.sh \
+            target/aarch64-apple-darwin/release/loctree-mcp
+
+      - name: Package MCP macOS ARM64 artifact
+        env:
+          MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p dist/darwin-aarch64
+          cp target/aarch64-apple-darwin/release/loctree-mcp dist/darwin-aarch64/loctree-mcp
+          chmod +x dist/darwin-aarch64/loctree-mcp
+          bash distribution/macos/sign-and-notarize.sh dist/darwin-aarch64 loctree-mcp-darwin-aarch64-notarized.zip
+          tar -czf loctree-mcp-darwin-aarch64.tar.gz -C dist/darwin-aarch64 loctree-mcp
+
+      - name: Upload MCP macOS ARM64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loctree-mcp-darwin-aarch64
+          path: |
+            loctree-mcp-darwin-aarch64.tar.gz
+            loctree-mcp-darwin-aarch64-notarized.zip
+          if-no-files-found: error
+
+  build-mcp-macos-x86_64:
+    name: Build MCP macOS x86_64 Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: [self-hosted, macOS, ARM64, dragon]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Import macOS signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/loctree-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/loctree-build-cert.p12"
+          CA_PATH="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          curl -fsSL "https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer" -o "$CA_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT_PATH" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$CA_PATH" -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" /Library/Keychains/System.keychain /System/Library/Keychains/SystemRootCertificates.keychain login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+      - name: Build release binary
+        run: cargo build -p loctree-mcp --release --target x86_64-apple-darwin
+
+      - name: Package MCP macOS x86_64 artifact
+        env:
+          MACOS_DEVELOPER_ID_APPLICATION: ${{ secrets.MACOS_DEVELOPER_ID_APPLICATION }}
+          APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          mkdir -p dist/darwin-x86_64
+          cp target/x86_64-apple-darwin/release/loctree-mcp dist/darwin-x86_64/loctree-mcp
+          chmod +x dist/darwin-x86_64/loctree-mcp
+          bash distribution/macos/sign-and-notarize.sh dist/darwin-x86_64 loctree-mcp-darwin-x86_64-notarized.zip
+          tar -czf loctree-mcp-darwin-x86_64.tar.gz -C dist/darwin-x86_64 loctree-mcp
+
+      - name: Upload MCP macOS x86_64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loctree-mcp-darwin-x86_64
+          path: |
+            loctree-mcp-darwin-x86_64.tar.gz
+            loctree-mcp-darwin-x86_64-notarized.zip
+          if-no-files-found: error
+
+  build-mcp-windows:
+    name: Build MCP Windows Artifact
+    needs: [verify-release, publish-crates]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build -p loctree-mcp --release --target x86_64-pc-windows-msvc
+
+      - name: Package MCP Windows artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\loctree-mcp.exe dist\loctree-mcp.exe
+          Compress-Archive -Path dist\* -DestinationPath loctree-mcp-windows-x86_64.zip -Force
+
+      - name: Upload MCP Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loctree-mcp-windows-x86_64
+          path: loctree-mcp-windows-x86_64.zip
+          if-no-files-found: error
+
+  publish-thin-releases:
+    name: Publish Thin Repo Releases
+    needs:
+      - verify-release
+      - build-cli-linux
+      - build-cli-macos-arm64
+      - build-cli-macos-x86_64
+      - build-cli-windows
+      - build-mcp-linux
+      - build-mcp-macos-arm64
+      - build-mcp-macos-x86_64
+      - build-mcp-windows
+    runs-on: [self-hosted, Linux, X64, ops]
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show packaged assets
+        run: ls -lah release-assets
+
+      - name: Publish CLI thin release
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPO: ${{ env.CLI_RELEASE_REPO }}
+          TARGET_TAG: v${{ needs.verify-release.outputs.version }}
+          TARGET_VERSION: ${{ needs.verify-release.outputs.version }}
+          RELEASE_NAME: loct v${{ needs.verify-release.outputs.version }}
+          ASSET_PREFIX: loct-
+          ASSET_DIR: release-assets
+          RELEASE_BODY: |
+            Thin release channel for the Loctree CLI.
+
+            Source of truth: `Loctree/loctree-ast`
+            Install:
+            - `brew install loctree/cli/loct`
+            - `cargo install --locked loctree`
+            - `npm install -g loctree` (macOS arm64/x64, Linux x64 glibc, Windows x64)
+        with:
+          github-token: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const [owner, repo] = process.env.TARGET_REPO.split("/");
+            const tag = process.env.TARGET_TAG;
+            const releaseName = process.env.RELEASE_NAME;
+            const releaseBody = process.env.RELEASE_BODY;
+            const assetDir = process.env.ASSET_DIR;
+            const assetPrefix = process.env.ASSET_PREFIX;
+            const files = fs.readdirSync(assetDir).filter((name) => name.startsWith(assetPrefix)).sort();
+
+            if (!files.length) {
+              core.setFailed(`No assets found in ${assetDir} with prefix ${assetPrefix}`);
+              return;
+            }
+
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: release.data.id,
+                tag_name: tag,
+                name: releaseName,
+                body: releaseBody,
+                draft: false,
+                prerelease: false,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              release = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: releaseName,
+                body: releaseBody,
+                draft: false,
+                prerelease: false,
+              });
+            }
+
+            const releaseId = release.data.id;
+            const existingAssets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner,
+              repo,
+              release_id: releaseId,
+              per_page: 100,
+            });
+
+            for (const fileName of files) {
+              const existing = existingAssets.find((asset) => asset.name === fileName);
+              if (existing) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: existing.id,
+                });
+              }
+
+              const data = fs.readFileSync(path.join(assetDir, fileName));
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: releaseId,
+                name: fileName,
+                data,
+                headers: {
+                  "content-type": "application/octet-stream",
+                  "content-length": data.length,
+                },
+              });
+            }
+
+      - name: Publish MCP thin release
+        uses: actions/github-script@v7
+        env:
+          TARGET_REPO: ${{ env.MCP_RELEASE_REPO }}
+          TARGET_TAG: v${{ needs.verify-release.outputs.version }}
+          TARGET_VERSION: ${{ needs.verify-release.outputs.version }}
+          RELEASE_NAME: loctree-mcp v${{ needs.verify-release.outputs.version }}
+          ASSET_PREFIX: loctree-mcp-
+          ASSET_DIR: release-assets
+          RELEASE_BODY: |
+            Thin release channel for the Loctree MCP server.
+
+            Source of truth: `Loctree/loctree-ast`
+            Install:
+            - `brew install loctree/mcp/loctree-mcp`
+            - `cargo install --locked loctree-mcp`
+        with:
+          github-token: ${{ secrets.HOMEBREW_GITHUB_API_TOKEN }}
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const [owner, repo] = process.env.TARGET_REPO.split("/");
+            const tag = process.env.TARGET_TAG;
+            const releaseName = process.env.RELEASE_NAME;
+            const releaseBody = process.env.RELEASE_BODY;
+            const assetDir = process.env.ASSET_DIR;
+            const assetPrefix = process.env.ASSET_PREFIX;
+            const files = fs.readdirSync(assetDir).filter((name) => name.startsWith(assetPrefix)).sort();
+
+            if (!files.length) {
+              core.setFailed(`No assets found in ${assetDir} with prefix ${assetPrefix}`);
+              return;
+            }
+
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              await github.rest.repos.updateRelease({
+                owner,
+                repo,
+                release_id: release.data.id,
+                tag_name: tag,
+                name: releaseName,
+                body: releaseBody,
+                draft: false,
+                prerelease: false,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              release = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: releaseName,
+                body: releaseBody,
+                draft: false,
+                prerelease: false,
+              });
+            }
+
+            const releaseId = release.data.id;
+            const existingAssets = await github.paginate(github.rest.repos.listReleaseAssets, {
+              owner,
+              repo,
+              release_id: releaseId,
+              per_page: 100,
+            });
+
+            for (const fileName of files) {
+              const existing = existingAssets.find((asset) => asset.name === fileName);
+              if (existing) {
+                await github.rest.repos.deleteReleaseAsset({
+                  owner,
+                  repo,
+                  asset_id: existing.id,
+                });
+              }
+
+              const data = fs.readFileSync(path.join(assetDir, fileName));
+              await github.rest.repos.uploadReleaseAsset({
+                owner,
+                repo,
+                release_id: releaseId,
+                name: fileName,
+                data,
+                headers: {
+                  "content-type": "application/octet-stream",
+                  "content-length": data.length,
+                },
+              });
+            }
+
+  publish-npm:
+    name: Publish npm Packages
+    needs:
+      - verify-release
+      - publish-thin-releases
+    runs-on: [self-hosted, Linux, X64, ops]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Refresh npm package versions
+        run: |
+          node distribution/npm/sync-version.mjs "${{ needs.verify-release.outputs.version }}"
+          cd distribution/npm
+          ./CREATE_PLATFORM_PACKAGES.sh "${{ needs.verify-release.outputs.version }}"
+
+      - name: Publish npm platform packages
+        working-directory: distribution/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in platform-packages/*/; do
+            (cd "$dir" && npm publish --access public)
+          done
+          sleep 20
+
+      - name: Publish main npm package
+        working-directory: distribution/npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  publish-monorepo-release:
+    name: Publish Monorepo Release
+    needs:
+      - verify-release
+      - publish-crates
+      - publish-thin-releases
+      - publish-npm
+    runs-on: [self-hosted, Linux, X64, ops]
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create monorepo release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.verify-release.outputs.tag }}
+          name: loctree ${{ needs.verify-release.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+          body: |
+            ## loctree v${{ needs.verify-release.outputs.version }}
+
+            Monorepo release for source, changelog, and installable binary assets.
+
+            User-facing binary channels:
+            - CLI assets: https://github.com/${{ env.CLI_RELEASE_REPO }}/releases/tag/v${{ needs.verify-release.outputs.version }}
+            - MCP assets: https://github.com/${{ env.MCP_RELEASE_REPO }}/releases/tag/v${{ needs.verify-release.outputs.version }}
+
+            Installation:
+
+            ```bash
+            cargo install --locked loctree loctree-mcp
+            npm install -g loctree  # CLI only; macOS arm64/x64, Linux x64 glibc, Windows x64
+            brew install loctree/cli/loct
+            brew install loctree/mcp/loctree-mcp
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

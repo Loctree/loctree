@@ -1,0 +1,43 @@
+# Semgrep Security Scanning
+# Developed with 💀 by The Loctree Team ⓒ 2025-2026 
+
+name: Semgrep
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  semgrep:
+    name: Scan
+    runs-on: [self-hosted, Linux, X64, ops]
+
+    steps:
+      - name: Allow git in GitHub Actions workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure pipx
+        run: command -v pipx >/dev/null || python3 -m pip install --user pipx
+
+      - name: Run Semgrep
+        run: pipx run semgrep scan --config auto --config p/rust --config p/typescript --sarif --output semgrep.sarif .
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Upload SARIF
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+        continue-on-error: true
