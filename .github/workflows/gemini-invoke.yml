@@ -2,6 +2,13 @@ name: '▶️ Gemini Invoke'
 
 on:
   workflow_call:
+    secrets:
+      APP_PRIVATE_KEY:
+        required: false
+      GEMINI_API_KEY:
+        required: false
+      GOOGLE_API_KEY:
+        required: false
     inputs:
       additional_context:
         type: 'string'
@@ -37,9 +44,26 @@ jobs:
           permission-issues: 'write'
           permission-pull-requests: 'write'
 
+      - name: 'Check authentication configuration'
+        id: 'check_auth'
+        env:
+          HAS_GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+          HAS_GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY != '' }}
+          HAS_WIF_PROVIDER: ${{ vars.GCP_WIF_PROVIDER != '' }}
+          HAS_USE_VERTEXAI: ${{ vars.GOOGLE_GENAI_USE_VERTEXAI != '' }}
+          HAS_USE_GCA: ${{ vars.GOOGLE_GENAI_USE_GCA != '' }}
+        run: |-
+          if [[ "${HAS_GEMINI_API_KEY}" == "true" || "${HAS_GOOGLE_API_KEY}" == "true" || "${HAS_WIF_PROVIDER}" == "true" || "${HAS_USE_VERTEXAI}" == "true" || "${HAS_USE_GCA}" == "true" ]]; then
+            echo "configured=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "configured=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::No Gemini authentication configured. Set one of: GEMINI_API_KEY secret, GOOGLE_API_KEY secret, or configure the GCP_WIF_PROVIDER, GOOGLE_GENAI_USE_VERTEXAI, or GOOGLE_GENAI_USE_GCA variables."
+          fi
+
       - name: 'Run Gemini CLI'
         id: 'run_gemini'
-        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
+        if: '${{ steps.check_auth.outputs.configured == ''true'' }}'
+        uses: 'google-github-actions/run-gemini-cli@f77273f4c914e4bf38440cf36a0369cb64a37489' # ratchet:exclude
         env:
           TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
           DESCRIPTION: '${{ github.event.pull_request.body || github.event.issue.body }}'
@@ -49,6 +73,7 @@ jobs:
           ISSUE_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
           REPOSITORY: '${{ github.repository }}'
           ADDITIONAL_CONTEXT: '${{ inputs.additional_context }}'
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
           gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'

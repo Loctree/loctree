@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<document type="com.apple.InterfaceBuilder3.Cocoa.Storyboard.XIB" version="3.0">
+  <scenes>
+    <scene sceneID="main">
+      <objects>
+        <viewController id="EditorViewController" customClass="EditorViewController">
+          <connections>
+            <outlet property="documentTextView" destination="textView" id="outlet-documentTextView"/>
+            <action selector="saveDocument:" destination="EditorViewController" id="action-saveDocument"/>
+          </connections>
+        </viewController>
+      </objects>
+    </scene>
+  </scenes>
+</document>

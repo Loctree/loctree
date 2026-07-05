@@ -119,7 +119,7 @@ fn generate_twins_data_json(analysis: &Analysis) -> String {
 Modify the analyzer to track symbol exports:
 
 ```rust
-// In loctree_rs/src/analyzer/rust.rs or similar
+// In loctree-rs/src/analyzer/rust.rs or similar
 
 pub struct SymbolLocation {
     pub file: String,
@@ -232,7 +232,7 @@ After integration, your project should look like:
 
 ```
 loctree/
-├── loctree_rs/
+├── loctree-rs/
 │   └── src/
 │       ├── analyzer/
 │       │   ├── rust.rs          # Extract symbol exports
@@ -296,9 +296,9 @@ When integrated, the report will show:
 ### Performance issues
 
 - For graphs with > 500 nodes, consider:
-  - Disabling animations (`animate: false`)
-  - Using simpler layout (`layout: { name: 'preset' }`)
-  - Reducing layout iterations (`numIter: 500`)
+    - Disabling animations (`animate: false`)
+    - Using simpler layout (`layout: { name: 'preset' }`)
+    - Reducing layout iterations (`numIter: 500`)
 
 ## Advanced Features
 
@@ -347,4 +347,4 @@ function calculateSeverity(deadParrotCount, exportCount, connectionCount) {
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The Loctree Team
+𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders ⓒ 2025-2026 The Loctree Team

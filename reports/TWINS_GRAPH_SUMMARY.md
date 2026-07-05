@@ -5,7 +5,7 @@
 A stunning interactive graph visualization for displaying "twin" symbols (functions/types with identical names exported from different files) and "dead parrots" (duplicate exports) in codebases.
 
 **Created**: December 6, 2025
-**Location**: `/Users/maciejgad/hosted/loctree/reports/src/`
+**Location**: `/home/maciejgad/hosted/loctree/reports/src/`
 **Status**: Complete and ready for integration
 
 ## Files Created
@@ -177,7 +177,7 @@ pub symbol_exports: HashMap<String, Vec<SymbolLocation>>
 
 **Open the example**:
 ```bash
-open /Users/maciejgad/hosted/loctree/reports/src/twins_graph_example.html
+open /home/maciejgad/hosted/loctree/reports/src/twins_graph_example.html
 ```
 
 This will show a fully interactive graph with realistic Rust project data.
@@ -261,7 +261,7 @@ Interactive Graph
    - Add `twins_graph.js` to HTML template
    - Include Cytoscape.js CDN
 
-2. **Add to analyzer (`loctree_rs/src/analyzer/rust.rs`)**:
+2. **Add to analyzer (`loctree-rs/src/analyzer/rust.rs`)**:
    - Track `pub` symbols in `symbol_exports` HashMap
    - Store file path + line number
 
@@ -300,7 +300,7 @@ Interactive Graph
 
 ## Credits
 
-**Created by**: M&K (c)2025 The Loctree Team
+**Created by**: M&K ⓒ 2025-2026 The Loctree Team
 **Technology**: Cytoscape.js v3.28.1
 **Inspired by**: Dead Parrot Spaghetti Protocol
 **Project**: loctree - Code relationship analyzer

@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: Apache-2.0
+// Minimal vendored SCIP schema subset for Loctree's decode-only importer.
+// Upstream schema: https://github.com/scip-code/scip/blob/main/scip.proto
+
+syntax = "proto3";
+
+package scip;
+
+message Index {
+  repeated Document documents = 2;
+  repeated SymbolInformation external_symbols = 3;
+}
+
+message Document {
+  string relative_path = 1;
+  repeated Occurrence occurrences = 2;
+  repeated SymbolInformation symbols = 3;
+  string language = 4;
+}
+
+message Occurrence {
+  repeated int32 range = 1;
+  string symbol = 2;
+  int32 symbol_roles = 3;
+  repeated Relationship relationships = 5;
+}
+
+message SymbolInformation {
+  string symbol = 1;
+  repeated Relationship relationships = 4;
+  string display_name = 5;
+  string signature_documentation = 6;
+}
+
+message Relationship {
+  string symbol = 1;
+  bool is_reference = 2;
+  bool is_implementation = 3;
+  bool is_type_definition = 4;
+  bool is_definition = 5;
+}

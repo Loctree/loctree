@@ -1,1 +1,0 @@
-export { shared } from './b'

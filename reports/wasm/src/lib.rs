@@ -6,7 +6,7 @@
 //! Uses canonical types from `report-leptos::types` and provides WASM-specific
 //! rendering with themed color support.
 //!
-//! Developed with 💀 by The Loctree Team (c)2025
+//! Developed with 💀 by The Loctree Team ⓒ 2025-2026
 
 use wasm_bindgen::prelude::*;
 

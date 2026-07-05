@@ -1,0 +1,202 @@
+# Loctree shell idiom catalog (default).
+# Override via <workspace>/.loctree/idioms/shell.toml.
+# Source of truth: docs/semantic-spec.md "Shell idiom catalog" (Cut 3A).
+# 25 entries — keep in sync with the spec doc.
+
+# ---- CLI / entrypoint idioms ------------------------------------------------
+
+[[idiom]]
+name = "usage"
+classifier = "HelpPrinter"
+runtime_role = "UserFacing"
+language = "shell"
+reasoning = "CLI help-text printer; reachable via --help or no-args invocation."
+
+[[idiom]]
+name = "die"
+classifier = "ErrorExit"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["abort", "fail"]
+reasoning = "Bail-out helper; prints message then exits non-zero."
+
+[[idiom]]
+name = "main"
+classifier = "PrimaryEntrypoint"
+runtime_role = "PrimaryEntrypoint"
+language = "shell"
+reasoning = "Script entrypoint sourced as last line; reached by shebang execution."
+
+# ---- Logger / messaging idioms ---------------------------------------------
+
+[[idiom]]
+name = "info"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_info"]
+reasoning = "Conventional info-level logger."
+
+[[idiom]]
+name = "warn"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_warn"]
+reasoning = "Conventional warning logger."
+
+[[idiom]]
+name = "error"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_error", "_err"]
+reasoning = "Conventional error logger."
+
+[[idiom]]
+name = "log"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_log"]
+reasoning = "Generic log dispatcher."
+
+# ---- Lifecycle / dispatch idioms -------------------------------------------
+
+[[idiom]]
+name = "cleanup"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+reasoning = "Trap handler / signal cleanup; reached via `trap cleanup EXIT`."
+
+[[idiom]]
+name = "trap_handler"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "shell"
+reasoning = "Reachable via `trap` builtin invocation."
+
+# ---- Existence / dependency check idioms -----------------------------------
+
+[[idiom]]
+name = "have"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_have"]
+reasoning = "command -v style existence check."
+
+[[idiom]]
+name = "exists"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_exists"]
+reasoning = "Variant of have."
+
+[[idiom]]
+name = "require"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_require"]
+reasoning = "Hard dependency check."
+
+# ---- UX helper idioms ------------------------------------------------------
+
+[[idiom]]
+name = "banner"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_banner"]
+reasoning = "Decorative output."
+
+[[idiom]]
+name = "success"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_success", "_ok"]
+reasoning = "Convention: success-state logger."
+
+[[idiom]]
+name = "confirm"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "shell"
+aliases = ["_confirm"]
+reasoning = "Interactive prompt helper."
+
+# ---- Standard env-var contracts --------------------------------------------
+
+[[idiom]]
+name = "PATH"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: command lookup paths."
+
+[[idiom]]
+name = "HOME"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: user home directory."
+
+[[idiom]]
+name = "USER"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: current user name."
+
+[[idiom]]
+name = "SHELL"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: login shell path."
+
+[[idiom]]
+name = "TERM"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: terminal type."
+
+[[idiom]]
+name = "PWD"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: current working dir."
+
+[[idiom]]
+name = "EDITOR"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: preferred editor."
+
+[[idiom]]
+name = "PAGER"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: preferred pager."
+
+[[idiom]]
+name = "LANG"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: locale."
+
+[[idiom]]
+name = "LC_ALL"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "shell"
+reasoning = "Standard env var: locale override."

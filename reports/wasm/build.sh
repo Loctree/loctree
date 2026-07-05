@@ -2,7 +2,7 @@
 # Build script for report-wasm
 # Creates WASM package and generates assets for embedding in HTML
 #
-# Developed with 💀 by The Loctree Team (c)2025 
+# Developed with 💀 by The Loctree Team ⓒ 2025-2026 
 
 set -e
 

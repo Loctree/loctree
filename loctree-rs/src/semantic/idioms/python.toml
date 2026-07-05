@@ -1,0 +1,230 @@
+# Loctree Python idiom catalog (default).
+# Override via <workspace>/.loctree/idioms/python.toml.
+# Source of truth: docs/semantic-spec.md "Python idiom catalog" (Cut 3B T1).
+#
+# Schema mirrors shell.toml / make.toml:
+#   name           — exact symbol name as it appears in `def name` / `class Name` / `name = ...`
+#   classifier     — semantic role for downstream reachability and findings
+#   runtime_role   — abstract runtime classification (UserFacing, PrimaryEntrypoint, ...)
+#   language       — must be "python" (matches Language::Python via serde lowercase)
+#   aliases        — optional list of canonical alternate names
+#   reasoning      — short justification, English (consistent with shell/make catalogs)
+#
+# Framework decorator reachability (FastAPI routes, pytest fixtures, Pydantic
+# validators, Click/Typer commands, etc.) is handled in `python.rs::analyze`,
+# NOT here, because decorators bind to *whatever* function name follows them
+# rather than to a fixed catalog of symbol names.
+
+# ---- Module / package entrypoints -----------------------------------------
+
+[[idiom]]
+name = "__init__"
+classifier = "PrimaryEntrypoint"
+runtime_role = "PrimaryEntrypoint"
+language = "python"
+reasoning = "Package init module / class constructor; reached by `import package` and instance creation."
+
+[[idiom]]
+name = "__main__"
+classifier = "PrimaryEntrypoint"
+runtime_role = "PrimaryEntrypoint"
+language = "python"
+reasoning = "Module entrypoint executed by `python -m package`; reached via interpreter invocation."
+
+[[idiom]]
+name = "main"
+classifier = "PrimaryEntrypoint"
+runtime_role = "PrimaryEntrypoint"
+language = "python"
+reasoning = "Convention entrypoint called from `if __name__ == '__main__':` blocks and `console_scripts` entry points."
+
+[[idiom]]
+name = "setup"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "python"
+reasoning = "setuptools setup() in setup.py; reached by `pip install` / `python setup.py` invocation."
+
+[[idiom]]
+name = "app"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "python"
+reasoning = "Web framework application object (FastAPI/Flask/Starlette); reached by ASGI/WSGI server lookup."
+
+[[idiom]]
+name = "router"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "python"
+reasoning = "FastAPI APIRouter or Flask Blueprint registered into `app`; reached via mount/include_router."
+
+[[idiom]]
+name = "application"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "python"
+reasoning = "Django WSGI application object in wsgi.py / asgi.py; reached by gunicorn/uvicorn lookup."
+
+# ---- Re-export / module surface contracts ---------------------------------
+
+[[idiom]]
+name = "__all__"
+classifier = "Metadata"
+runtime_role = "Metadata"
+language = "python"
+reasoning = "Module-level re-export contract; symbols listed here are public API regardless of import-edge count."
+
+# ---- pytest / unittest fixtures -------------------------------------------
+
+[[idiom]]
+name = "conftest"
+classifier = "Metadata"
+runtime_role = "PublicEntrypoint"
+language = "python"
+reasoning = "pytest configuration module loaded automatically for sibling and descendant test files; reached without an import edge."
+
+[[idiom]]
+name = "pytest_configure"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "pytest hook invoked by the runner during configuration phase."
+
+[[idiom]]
+name = "pytest_collection_modifyitems"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "pytest hook invoked by the runner during collection phase."
+
+[[idiom]]
+name = "pytest_addoption"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "pytest hook for registering custom CLI flags."
+
+[[idiom]]
+name = "setUp"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "unittest.TestCase per-test fixture invoked by the test runner."
+
+[[idiom]]
+name = "tearDown"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "unittest.TestCase per-test cleanup invoked by the test runner."
+
+[[idiom]]
+name = "setUpClass"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "unittest.TestCase class-level fixture invoked once before tests in the class."
+
+[[idiom]]
+name = "tearDownClass"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "unittest.TestCase class-level cleanup invoked once after tests in the class."
+
+# ---- Logging convention idioms --------------------------------------------
+
+[[idiom]]
+name = "info"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+aliases = ["_info"]
+reasoning = "Conventional info-level logger method on a module-level logger object."
+
+[[idiom]]
+name = "warning"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+aliases = ["warn", "_warn"]
+reasoning = "Conventional warning-level logger method (stdlib `logging.warning`)."
+
+[[idiom]]
+name = "error"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+aliases = ["_error", "_err"]
+reasoning = "Conventional error-level logger method."
+
+[[idiom]]
+name = "debug"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+aliases = ["_debug"]
+reasoning = "Conventional debug-level logger method."
+
+[[idiom]]
+name = "critical"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+aliases = ["_critical", "fatal", "_fatal"]
+reasoning = "Conventional critical/fatal-level logger method."
+
+[[idiom]]
+name = "exception"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "stdlib `logging.exception`; logs at ERROR with exception info attached."
+
+[[idiom]]
+name = "log"
+classifier = "LibraryHelper"
+runtime_role = "LibraryHelper"
+language = "python"
+aliases = ["_log"]
+reasoning = "Generic logger dispatcher (`logger.log(level, ...)`) or convention helper."
+
+# ---- Class lifecycle hooks -------------------------------------------------
+
+[[idiom]]
+name = "__init_subclass__"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "Class-creation hook invoked by Python interpreter for every subclass; framework registry pattern."
+
+[[idiom]]
+name = "__post_init__"
+classifier = "DispatchHandler"
+runtime_role = "LibraryHelper"
+language = "python"
+reasoning = "dataclasses post-init hook invoked automatically after `__init__`."
+
+# ---- Standard env-var contracts (Python-relevant subset) -------------------
+
+[[idiom]]
+name = "PYTHONPATH"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "python"
+reasoning = "Standard env var: additional module search paths."
+
+[[idiom]]
+name = "PYTHONHOME"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "python"
+reasoning = "Standard env var: alternate Python install prefix."
+
+[[idiom]]
+name = "VIRTUAL_ENV"
+classifier = "EnvVar"
+runtime_role = "EnvInput"
+language = "python"
+reasoning = "Standard env var: active virtualenv root."

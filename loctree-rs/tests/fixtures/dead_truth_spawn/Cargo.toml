@@ -1,0 +1,11 @@
+[package]
+name = "dead-truth-spawn"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "stt-bridge"
+path = "src/bin/stt_bridge.rs"

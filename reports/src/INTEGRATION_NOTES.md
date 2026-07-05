@@ -180,7 +180,7 @@ To test the visualization without full integration:
 
 1. **Open the standalone example**:
    ```bash
-   open /Users/maciejgad/hosted/loctree/reports/src/twins_graph_example.html
+   open /home/maciejgad/hosted/loctree/reports/src/twins_graph_example.html
    ```
 
 2. **Verify features**:
@@ -259,4 +259,4 @@ For questions or issues with integration:
 
 ---
 
-Vibecrafted with AI Agents by VetCoders (c)2025 The Loctree Team
+𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders ⓒ 2025-2026 The Loctree Team

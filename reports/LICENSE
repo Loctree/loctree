@@ -1,21 +1,49 @@
-MIT License
+Business Source License 1.1
+===========================
 
-Copyright (c) 2025 Loctree
+Loctree is provided under the Business Source License 1.1 (BUSL-1.1).
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+SPDX-License-Identifier: BUSL-1.1
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Canonical text of the Business Source License 1.1 is available at:
+https://mariadb.com/bsl11/
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+
+Parameters
+----------
+
+  Licensor:             Loctree Team (loct@loct.io)
+
+  Licensed Work:        Loctree
+                        - This repository (loctree-suite) and all artifacts
+                          published from it: loct, loctree-mcp, loctree-lsp,
+                          the loctree library crate, report-leptos,
+                          rmcp-common, and the loctree-landing site.
+                        - Copyright (c) 2024-2026 Loctree Team.
+
+  Additional Use Grant: You may make production use of the Licensed Work,
+                        provided that your use does not include offering the
+                        Licensed Work, or any substantial portion of its
+                        functionality, to third parties as a hosted, managed,
+                        or commercially distributed service that competes
+                        with a service offered by the Licensor.
+
+  Change Date:          2030-04-13
+                        (four years after the publication of Loctree v0.9.0).
+
+  Change License:       Apache License, Version 2.0
+
+
+For commercial licensing, hosted-service exemptions, OEM redistribution, or
+any arrangement that falls outside the Additional Use Grant above, contact:
+
+  loct@loct.io
+
+
+Notice
+------
+
+The Business Source License (this document) is not an Open Source license.
+However, the Licensed Work will, on the Change Date stated above, become
+available under the Change License, and the rights granted in the paragraph
+above will terminate.

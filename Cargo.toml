@@ -1,56 +1,41 @@
 [workspace]
 resolver = "2"
 members = [
-    "loctree_rs",
-    "loctree-mcp",
-    "rmcp-common",
+    "loctree-ast",
+    "loctree-rs",
     "reports",
-    "reports/wasm",
 ]
 
-# Removed from workspace:
-# - rust-memex: use crates.io version (0.3.2+), standalone: ~/Libraxis/rmcp-memex
-# - rmcp-mux: deprecated (dead end approach)
-# - rmcp-config-ui: moved to ~/Libraxis/rmcp-config-ui
-
 [workspace.package]
-version = "0.8.17"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.85.0"
-license = "MIT OR Apache-2.0"
+license = "BUSL-1.1"
 authors = ["Loctree <loct@loct.io>"]
 
 [workspace.dependencies]
-# Core
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-anyhow = "1.0"
-thiserror = "2.0"
-
-# CLI
+anyhow = "1"
+thiserror = "2"
 clap = { version = "4.4", features = ["derive"] }
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = "0.3"
-
-# MCP
-rmcp = { version = "0.17", features = ["server"] }
-
-# Async
+rmcp = { version = "1.7", features = ["server"] }
 futures = "0.3"
-
-# The local crates (for inter-crate dependencies)
-loctree = { path = "loctree_rs", version = "0.8.17" }
-report-leptos = { path = "reports", version = "0.8.17" }
-
-# Release profile - good defaults for all crates
-[profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-strip = true
-
-# WASM crates need size optimization - override when building with trunk/wasm-pack
-# trunk uses its own Trunk.toml for wasm-opt settings
+axum = { version = "0.8", features = ["json"] }
+tower = { version = "0.5", features = ["util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+argon2 = "0.5"
+password-hash = { version = "0.5", features = ["getrandom"] }
+subtle = "2.6"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+shellexpand = "3.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+sha2 = "0.10"
+schemars = "1"
+loctree = { path = "loctree-rs", version = "0.13.0" }
+loctree-ast = { path = "loctree-ast", version = "0.13.0" }
+report-leptos = { path = "reports", version = "0.13.0" }

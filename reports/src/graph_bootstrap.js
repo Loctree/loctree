@@ -3,6 +3,41 @@
   const formatNum = (n) => (typeof n === "number" && n.toLocaleString ? n.toLocaleString() : n || 0);
   const cyInstances = new Set();
   const darkToggles = new Set();
+
+  // Small DOM construction helper used by the toolbars below.
+  // Spec describes element shape declaratively; values are written via
+  // textContent / setAttribute, never innerHTML — so no string template
+  // ever reaches the parser. attrs: plain object. children: array of
+  // (DOM node | string | spec object). text: shorthand for a single text child.
+  const el = (tag, spec) => {
+    spec = spec || {};
+    const node = document.createElement(tag);
+    if (spec.className) node.className = spec.className;
+    if (spec.text !== undefined && spec.text !== null) node.textContent = String(spec.text);
+    if (spec.style) {
+      for (const k in spec.style) {
+        if (Object.prototype.hasOwnProperty.call(spec.style, k)) node.style[k] = spec.style[k];
+      }
+    }
+    if (spec.attrs) {
+      for (const k in spec.attrs) {
+        if (!Object.prototype.hasOwnProperty.call(spec.attrs, k)) continue;
+        const v = spec.attrs[k];
+        if (v === false || v === null || v === undefined) continue;
+        if (v === true) node.setAttribute(k, "");
+        else node.setAttribute(k, String(v));
+      }
+    }
+    if (spec.children) {
+      spec.children.forEach((child) => {
+        if (child === null || child === undefined || child === false) return;
+        if (child instanceof Node) node.appendChild(child);
+        else if (typeof child === "string") node.appendChild(document.createTextNode(child));
+        else if (typeof child === "object" && child.tag) node.appendChild(el(child.tag, child));
+      });
+    }
+    return node;
+  };
   const filterElements = (elements, opts) => {
     const text = (opts.text || "").toLowerCase();
     const minDeg = parseInt(opts.minDeg || "0", 10) || 0;
@@ -76,48 +111,110 @@
     const leftPanel = document.createElement("div");
     leftPanel.className = "graph-left-panel";
 
-    // Component filter toolbar
-    const componentBar = document.createElement("div");
-    componentBar.className = "graph-toolbar component-toolbar";
-    // nosemgrep: javascript.browser.security.insecure-document-method.insecure-document-method -- SAFETY: static HTML template with no user input
-    componentBar.innerHTML = `
-      <label>Component filter:
-        <select data-role="component-filter">
-          <option value="all">All components</option>
-          <option value="isolates">Isolates / size≤2</option>
-          <option value="size">Size ≤ slider</option>
-        </select>
-      </label>
-      <label>threshold:
-        <input type="range" min="1" max="64" value="8" data-role="component-threshold" />
-        <span data-role="component-threshold-label">8</span>
-      </label>
-      <span class="graph-controls">
-        <button data-role="component-highlight">Highlight selected</button>
-        <button data-role="component-dim">Dim others</button>
-        <button data-role="component-copy">Copy file list</button>
-        <button data-role="component-export-json">Export JSON</button>
-        <button data-role="component-export-csv">Export CSV</button>
-        <button data-role="component-show-isolates">Show isolates</button>
-      </span>
-    `;
+    // Component filter toolbar — built via DOM construction (no innerHTML)
+    const componentBar = el("div", {
+      className: "graph-toolbar component-toolbar",
+      children: [
+        el("label", {
+          children: [
+            "Component filter:",
+            el("select", {
+              attrs: { "data-role": "component-filter" },
+              children: [
+                el("option", { attrs: { value: "all" }, text: "All components" }),
+                el("option", { attrs: { value: "isolates" }, text: "Isolates / size≤2" }),
+                el("option", { attrs: { value: "size" }, text: "Size ≤ slider" }),
+              ],
+            }),
+          ],
+        }),
+        el("label", {
+          children: [
+            "threshold:",
+            el("input", {
+              attrs: {
+                type: "range",
+                min: "1",
+                max: "64",
+                value: "8",
+                "data-role": "component-threshold",
+              },
+            }),
+            el("span", { attrs: { "data-role": "component-threshold-label" }, text: "8" }),
+          ],
+        }),
+        el("span", {
+          className: "graph-controls",
+          children: [
+            el("button", { attrs: { "data-role": "component-highlight" }, text: "Highlight selected" }),
+            el("button", { attrs: { "data-role": "component-dim" }, text: "Dim others" }),
+            el("button", { attrs: { "data-role": "component-copy" }, text: "Copy file list" }),
+            el("button", { attrs: { "data-role": "component-export-json" }, text: "Export JSON" }),
+            el("button", { attrs: { "data-role": "component-export-csv" }, text: "Export CSV" }),
+            el("button", { attrs: { "data-role": "component-show-isolates" }, text: "Show isolates" }),
+          ],
+        }),
+      ],
+    });
 
-    const componentPanel = document.createElement("div");
-    componentPanel.className = "component-panel";
-    // nosemgrep: javascript.browser.security.insecure-document-method.insecure-document-method -- SAFETY: static HTML template with no user input
-    componentPanel.innerHTML = `
-      <div class="component-panel-header">
-        <div><strong>Disconnected components</strong> <span class="muted" data-role="component-summary"></span></div>
-        <div class="panel-actions">
-          <label>show size ≤ <input type="number" min="1" value="8" data-role="component-size-limit" style="width:70px" /></label>
-          <button data-role="component-reset">Reset view</button>
-        </div>
-      </div>
-      <table>
-        <thead><tr><th>id</th><th>size</th><th>sample</th><th>isolated</th><th>edges</th><th>LOC</th><th>actions</th></tr></thead>
-        <tbody data-role="component-table"></tbody>
-      </table>
-    `;
+    // Component panel — built via DOM construction (no innerHTML)
+    const componentPanel = el("div", {
+      className: "component-panel",
+      children: [
+        el("div", {
+          className: "component-panel-header",
+          children: [
+            el("div", {
+              children: [
+                el("strong", { text: "Disconnected components" }),
+                " ",
+                el("span", { className: "muted", attrs: { "data-role": "component-summary" } }),
+              ],
+            }),
+            el("div", {
+              className: "panel-actions",
+              children: [
+                el("label", {
+                  children: [
+                    "show size ≤ ",
+                    el("input", {
+                      style: { width: "70px" },
+                      attrs: {
+                        type: "number",
+                        min: "1",
+                        value: "8",
+                        "data-role": "component-size-limit",
+                      },
+                    }),
+                  ],
+                }),
+                el("button", { attrs: { "data-role": "component-reset" }, text: "Reset view" }),
+              ],
+            }),
+          ],
+        }),
+        el("table", {
+          children: [
+            el("thead", {
+              children: [
+                el("tr", {
+                  children: [
+                    el("th", { text: "id" }),
+                    el("th", { text: "size" }),
+                    el("th", { text: "sample" }),
+                    el("th", { text: "isolated" }),
+                    el("th", { text: "edges" }),
+                    el("th", { text: "LOC" }),
+                    el("th", { text: "actions" }),
+                  ],
+                }),
+              ],
+            }),
+            el("tbody", { attrs: { "data-role": "component-table" } }),
+          ],
+        }),
+      ],
+    });
 
     leftPanel.appendChild(componentBar);
     leftPanel.appendChild(componentPanel);
@@ -130,44 +227,97 @@
     const rightPanel = document.createElement("div");
     rightPanel.className = "graph-right-panel";
 
-    // Graph controls toolbar
-    const toolbar = document.createElement("div");
-    toolbar.className = "graph-toolbar";
-    // nosemgrep: javascript.browser.security.insecure-document-method.insecure-document-method -- SAFETY: static HTML template with no user input
-    toolbar.innerHTML = `
-      <label>filter:
-        <input type="text" size="18" placeholder="path substring or /regex/" data-role="filter-text" title="Filter by path. Use plain text for substring match, or /pattern/ for regex." />
-      </label>
-      <label>min degree:
-        <input type="number" min="0" value="0" style="width:60px" data-role="min-degree" />
-      </label>
-      <label>layout:
-        <select data-role="layout-select">
-          <option value="cose">cose (force)</option>
-          <option value="dagre">dagre (hierarchy)</option>
-          <option value="cose-bilkent">cose-bilkent</option>
-          <option value="concentric" selected>concentric</option>
-          <option value="breadthfirst">breadthfirst</option>
-          <option value="preset">preset (original)</option>
-        </select>
-      </label>
-      <label><input type="checkbox" data-role="toggle-labels" checked /> labels</label>
-      <label><input type="checkbox" data-role="graph-dark" /> graph dark</label>
-      <span class="graph-controls">
-        <button data-role="fit">fit</button>
-        <button data-role="relayout">relayout</button>
-        <button data-role="reset">reset</button>
-        <button data-role="fullscreen">fullscreen</button>
-        <button data-role="png">png</button>
-        <button data-role="json">json</button>
-      </span>
-      <div class="graph-legend">
-        <span><span class="legend-dot" style="background:#4f81e1"></span> file</span>
-        <span><span class="legend-dot" style="background:#888"></span> import</span>
-        <span><span class="legend-dot" style="background:#e67e22"></span> re-export</span>
-        <span><span class="legend-dot" style="background:#d1830f"></span> detached</span>
-      </div>
-    `;
+    // Graph controls toolbar — built via DOM construction (no innerHTML)
+    const layoutOption = (value, label, selected) =>
+      el("option", { attrs: { value, selected: selected ? true : false }, text: label });
+    const legendItem = (color, label) =>
+      el("span", {
+        children: [
+          el("span", { className: "legend-dot", style: { background: color } }),
+          " " + label,
+        ],
+      });
+    const toolbar = el("div", {
+      className: "graph-toolbar",
+      children: [
+        el("label", {
+          children: [
+            "filter:",
+            el("input", {
+              attrs: {
+                type: "text",
+                size: "18",
+                placeholder: "path substring or /regex/",
+                "data-role": "filter-text",
+                title: "Filter by path. Use plain text for substring match, or /pattern/ for regex.",
+              },
+            }),
+          ],
+        }),
+        el("label", {
+          children: [
+            "min degree:",
+            el("input", {
+              style: { width: "60px" },
+              attrs: {
+                type: "number",
+                min: "0",
+                value: "0",
+                "data-role": "min-degree",
+              },
+            }),
+          ],
+        }),
+        el("label", {
+          children: [
+            "layout:",
+            el("select", {
+              attrs: { "data-role": "layout-select" },
+              children: [
+                layoutOption("cose", "cose (force)", false),
+                layoutOption("dagre", "dagre (hierarchy)", false),
+                layoutOption("cose-bilkent", "cose-bilkent", false),
+                layoutOption("concentric", "concentric", true),
+                layoutOption("breadthfirst", "breadthfirst", false),
+                layoutOption("preset", "preset (original)", false),
+              ],
+            }),
+          ],
+        }),
+        el("label", {
+          children: [
+            el("input", { attrs: { type: "checkbox", "data-role": "toggle-labels", checked: true } }),
+            " labels",
+          ],
+        }),
+        el("label", {
+          children: [
+            el("input", { attrs: { type: "checkbox", "data-role": "graph-dark" } }),
+            " graph dark",
+          ],
+        }),
+        el("span", {
+          className: "graph-controls",
+          children: [
+            el("button", { attrs: { "data-role": "fit" }, text: "fit" }),
+            el("button", { attrs: { "data-role": "relayout" }, text: "relayout" }),
+            el("button", { attrs: { "data-role": "reset" }, text: "reset" }),
+            el("button", { attrs: { "data-role": "fullscreen" }, text: "fullscreen" }),
+            el("button", { attrs: { "data-role": "png" }, text: "png" }),
+            el("button", { attrs: { "data-role": "json" }, text: "json" }),
+          ],
+        }),
+        el("div", {
+          className: "graph-legend",
+          children: [
+            legendItem("#4f81e1", "file"),
+            legendItem("#888", "import"),
+            legendItem("#e67e22", "re-export"),
+            legendItem("#d1830f", "detached"),
+          ],
+        }),
+      ],
+    });
 
     // Move graph container into right panel
     container.style.height = "";  // Remove fixed height, let flex handle it

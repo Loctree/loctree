@@ -1,0 +1,72 @@
+# Loctree make idiom catalog (default).
+# Override via <workspace>/.loctree/idioms/make.toml.
+
+[[idiom]]
+name = ".PHONY"
+classifier = "Metadata"
+runtime_role = "Metadata"
+language = "makefile"
+reasoning = "GNU Make directive marking targets that are not files; targets listed after .PHONY are public entrypoints."
+
+[[idiom]]
+name = "all"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "Conventional default target invoked by bare 'make' command."
+
+[[idiom]]
+name = "install"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "Conventional install target."
+
+[[idiom]]
+name = "clean"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "Conventional clean target."
+
+[[idiom]]
+name = "test"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "Conventional test target."
+
+[[idiom]]
+name = "precheck"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "VetCoders convention: pre-push gate target."
+
+[[idiom]]
+name = "build"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "Conventional build target."
+
+[[idiom]]
+name = "release"
+classifier = "PublicEntrypoint"
+runtime_role = "PublicEntrypoint"
+language = "makefile"
+reasoning = "Conventional release target."
+
+[[idiom]]
+name = ".DEFAULT"
+classifier = "Metadata"
+runtime_role = "Metadata"
+language = "makefile"
+reasoning = "GNU Make special target for default recipe."
+
+[[idiom]]
+name = ".SUFFIXES"
+classifier = "Metadata"
+runtime_role = "Metadata"
+language = "makefile"
+reasoning = "GNU Make special target controlling suffix rules."

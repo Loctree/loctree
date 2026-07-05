@@ -1,0 +1,8 @@
+{
+  "name": "dead-truth-spawn",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "voice-daemon": "daemon/voice_daemon.js"
+  }
+}
