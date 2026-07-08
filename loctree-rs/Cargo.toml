@@ -6,8 +6,10 @@ default-run = "loctree"
 authors.workspace = true
 description = "Structural code intelligence for AI agents. Scan once, query everything."
 license.workspace = true
-publish = false
-repository = "https://github.com/Loctree/Loctree"
+repository = "https://github.com/Loctree/loctree"
+# Keep the published crate lean: integration fixtures are large and only feed
+# the in-repo e2e suite, never downstream builds.
+exclude = ["tests/fixtures"]
 homepage = "https://loct.io"
 rust-version.workspace = true
 readme = "../README.md"
