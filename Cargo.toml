@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "loctree-ast",
     "loctree-rs",
-    "reports",
 ]
 
 [workspace.package]
@@ -38,4 +37,4 @@ sha2 = "0.10"
 schemars = "1"
 loctree = { path = "loctree-rs", version = "0.13.0" }
 loctree-ast = { path = "loctree-ast", version = "0.13.0" }
-report-leptos = { path = "reports", version = "0.13.0" }
+report-leptos = "0.13.0"

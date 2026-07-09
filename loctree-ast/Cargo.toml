@@ -3,8 +3,8 @@ name = "loctree-ast"
 version.workspace = true
 edition.workspace = true
 description = "Tree-sitter AST substrate for Loctree live and structural query paths"
+repository = "https://github.com/Loctree/loctree"
 license.workspace = true
-publish = false
 authors.workspace = true
 rust-version.workspace = true
 
