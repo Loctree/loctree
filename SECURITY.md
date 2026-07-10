@@ -13,7 +13,7 @@ If you discover a security vulnerability in Loctree, please report it responsibl
 
 **Do not open a public issue.**
 
-Instead, email: **security@loctree.dev**
+Instead, email: **security@loctree.com**
 
 We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 
