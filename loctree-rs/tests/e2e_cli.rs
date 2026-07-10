@@ -6655,7 +6655,7 @@ mod occurrences_quality_cli {
     }
 
     /// `--whole-token` tightens the boundary so `backdrop` stops matching inside
-    /// hyphenated neighbors (`--vista-z-overlay-backdrop`, `backdrop-filter`),
+    /// hyphenated neighbors (`--sample-z-overlay-backdrop`, `backdrop-filter`),
     /// cutting the z-index noise — while the default boundary is unchanged.
     #[test]
     fn whole_token_cuts_hyphenated_noise() {
@@ -6673,7 +6673,7 @@ mod occurrences_quality_cli {
         assert!(
             tight_occ.iter().all(|o| {
                 let ctx = o["context"].as_str().unwrap_or("");
-                !ctx.contains("--vista-z-overlay-backdrop")
+                !ctx.contains("--sample-z-overlay-backdrop")
             }) || tight_occ.iter().all(|o| o["matched_text"] == "backdrop"),
             "whole_token must not surface a hit *inside* the hyphenated custom property"
         );
@@ -6682,9 +6682,9 @@ mod occurrences_quality_cli {
             !tight_occ.iter().any(|o| o["context"]
                 .as_str()
                 .unwrap_or("")
-                .contains("--vista-z-overlay-backdrop")
+                .contains("--sample-z-overlay-backdrop")
                 && o["occurrence_kind"] == "custom_property"),
-            "the `--vista-z-overlay-backdrop` noise hit must be gone under whole_token"
+            "the `--sample-z-overlay-backdrop` noise hit must be gone under whole_token"
         );
     }
 
@@ -6755,7 +6755,7 @@ mod occurrences_quality_cli {
         fs::create_dir_all(&subdir).unwrap();
         fs::write(
             subdir.join("styles.css"),
-            "/* backdrop */\n.backdrop { --vista-z-overlay-backdrop: 40; }\n",
+            "/* backdrop */\n.backdrop { --sample-z-overlay-backdrop: 40; }\n",
         )
         .unwrap();
         fs::write(
