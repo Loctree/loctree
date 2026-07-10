@@ -81,7 +81,7 @@ pub fn compute_warnings(
     //    so `decl.sources[0]` wins at deploy time. The runner-up gives the
     //    canonical "obvious neighbor" comparison, but the SealedSecret/
     //    SOPS/ExternalSecret specialization scans **all** lower-rank
-    //    plain-bearing sources — Vista's case had a stale SealedSecret
+    //    plain-bearing sources — example-app's case had a stale SealedSecret
     //    overriding a fresh ConfigMap several layers down, not just the
     //    immediate runner-up.
     if decl.sources.len() >= 2 {
@@ -98,7 +98,7 @@ pub fn compute_warnings(
                     });
             }
         }
-        // Vista specialization: highest is sealed/sops/external AND any
+        // example-app specialization: highest is sealed/sops/external AND any
         // lower-rank plain-bearing source is materially fresher.
         if matches!(
             high.kind,

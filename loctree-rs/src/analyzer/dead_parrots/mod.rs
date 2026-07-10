@@ -1,6 +1,6 @@
 //! Dead Parrots Module - Janitor tools for code analysis and cleanup
 //!
-//! Named after the Monty Python sketch and the Vista project's "Dead Parrot Protocol"
+//! Named after the Monty Python sketch and the example-app project's "Dead Parrot Protocol"
 //! for identifying unused/dead code that "just resting" but is actually dead.
 //!
 //! This module contains:
@@ -2346,7 +2346,7 @@ mod tests {
 
     #[test]
     fn test_react_lazy_with_subdirectory_resolved_path() {
-        // Vista pattern: lazy(() => import('./features/patient/PasswordResetModal').then(...))
+        // example-app pattern: lazy(() => import('./features/patient/PasswordResetModal').then(...))
         // Component is in a subdirectory, import uses resolved_path via ImportKind::Dynamic
         let mut importer = mock_file("src/App.tsx");
         // Add dynamic import via ImportEntry with resolved_path (like real AST produces)
@@ -2385,7 +2385,7 @@ mod tests {
 
     #[test]
     fn test_react_lazy_named_export_via_then_pattern() {
-        // Vista pattern: lazy(() => import('./X').then((m) => ({ default: m.ComponentName })))
+        // example-app pattern: lazy(() => import('./X').then((m) => ({ default: m.ComponentName })))
         // This extracts a NAMED export and re-wraps it as default for React.lazy()
         // The file has NAMED export (not default), but it's still used via dynamic import
         let mut importer = mock_file("src/App.tsx");

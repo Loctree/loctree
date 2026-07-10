@@ -4291,10 +4291,7 @@ mod management_commands {
             "report must start with DOCTYPE, got first chars: {:?}",
             &html.chars().take(40).collect::<String>()
         );
-        assert!(
-            html.contains("Loctree Report"),
-            "missing Vista report title"
-        );
+        assert!(html.contains("Loctree Report"), "missing report title");
         assert!(
             html.contains(env!("CARGO_PKG_VERSION")),
             "missing loctree binary version ({}) in rendered provenance chip",
@@ -7411,7 +7408,7 @@ mod dead_truth {
         );
     }
 
-    /// Empiria: Vista lazy-import `import('./Steps').then((m) => m.InviteTeamStep)`
+    /// Empiria: example-app lazy-import `import('./Steps').then((m) => m.InviteTeamStep)`
     /// — the named export consumed only through the dynamic-import member
     /// access must not be dead.
     #[test]

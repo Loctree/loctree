@@ -1811,7 +1811,7 @@ OPTIONS:
     --help, -h                   Show this help message
 
 FAIL-ON KINDS:
-    stale-sealed-overrides-fresh-plain   The Vista pattern: stale SealedSecret/
+    stale-sealed-overrides-fresh-plain   The example-app pattern: stale SealedSecret/
                                          SOPS overrides a fresh dotenv/configmap.
     stale-overrides-fresh                Generic: highest-precedence is older
                                          than runner-up by stale-threshold-days.
