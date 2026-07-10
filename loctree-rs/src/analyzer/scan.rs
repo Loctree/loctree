@@ -140,7 +140,7 @@ pub fn build_globset(patterns: &[String]) -> Option<GlobSet> {
 }
 
 pub fn opt_globset(globs: &[String]) -> Option<GlobSet> {
-    build_globset(globs).and_then(|g| if g.is_empty() { None } else { Some(g) })
+    build_globset(globs).filter(|g| !g.is_empty())
 }
 
 pub fn strip_excluded(files: &[String], exclude: &Option<GlobSet>) -> Vec<String> {
