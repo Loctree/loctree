@@ -15,7 +15,7 @@ Parameters
   Licensor:             Loctree Team (loct@loct.io)
 
   Licensed Work:        Loctree
-                        - This repository (loctree-suite) and all artifacts
+                        - This repository (the upstream integration repository) and all artifacts
                           published from it: loct, loctree-mcp, loctree-lsp,
                           the loctree library crate, report-leptos,
                           rmcp-common, and the loctree-landing site.
