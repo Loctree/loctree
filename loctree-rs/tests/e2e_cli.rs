@@ -7424,7 +7424,7 @@ mod dead_truth {
         );
     }
 
-    /// Empiria: CodeScribe stt-bridge — runtime entry files spawned only by
+    /// Empiria: codescribe stt-bridge — runtime entry files spawned only by
     /// string. The fixture carries BOTH a Cargo [[bin]]
     /// (`src/bin/stt_bridge.rs`) and a package.json bin
     /// (`daemon/voice_daemon.js`, spawned via `spawn('voice-daemon')`).
