@@ -5435,13 +5435,13 @@ mod env_truth {
         assert!(stdout.contains("sha256:"));
     }
 
-    /// W2-c: default report stays small even on a CodeScribe-like surface
+    /// W2-c: default report stays small even on a codescribe-like surface
     /// (the 2026-line wall regression).
     #[test]
     fn default_report_is_bounded_under_200_lines() {
         let temp = TempDir::new().unwrap();
         stage_env_drift(&temp, 30, 2);
-        // Add a CodeScribe-like pile of one-off declarations to fatten the
+        // Add a codescribe-like pile of one-off declarations to fatten the
         // would-be full dump.
         let mut extra = String::new();
         for i in 0..120 {
@@ -5665,7 +5665,7 @@ mod env_truth {
 mod occurrences_cli {
     use super::*;
 
-    /// W1-A regression — the CodeScribe `utterance_id` failure class.
+    /// W1-A regression — the codescribe `utterance_id` failure class.
     ///
     /// `loct occurrences <ident>` must find LOCAL-variable occurrences buried
     /// inside a large function — exactly the case `find`/`tagmap` missed (they
@@ -6247,7 +6247,7 @@ mod find_literal_cli {
     /// `loct find --literal <ident> --json` must return a `literal_matches`
     /// section whose occurrences are byte-for-byte the same lines `loct
     /// occurrences` surfaces — every result tagged `source: "literal"`, and the
-    /// buried-local CodeScribe lines (`let mut utterance_id`, `utterance_id += 1`)
+    /// buried-local codescribe lines (`let mut utterance_id`, `utterance_id += 1`)
     /// present. This is the W1-B acceptance: when the mode says literal, the
     /// answer is literal.
     #[test]
