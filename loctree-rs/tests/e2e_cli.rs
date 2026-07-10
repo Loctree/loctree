@@ -4289,7 +4289,7 @@ mod management_commands {
         assert!(
             html.contains("<!DOCTYPE html>"),
             "report must start with DOCTYPE, got first chars: {:?}",
-            &html.chars().take(40).collect::<String>()
+            html.chars().take(40).collect::<String>()
         );
         assert!(html.contains("Loctree Report"), "missing report title");
         assert!(
@@ -4320,7 +4320,7 @@ mod management_commands {
                 html.contains(needle),
                 "fixture-derived fact '{}' missing from HTML; first 500 chars: {:?}",
                 needle,
-                &html.chars().take(500).collect::<String>()
+                html.chars().take(500).collect::<String>()
             );
         }
 
