@@ -9,7 +9,7 @@
 //! — there are no fuzzy suggestions promoted as primary results, because a
 //! suggestion is not evidence.
 //!
-//! The CodeScribe `utterance_id` failure class is the canonical motivation: a
+//! The codescribe `utterance_id` failure class is the canonical motivation: a
 //! `let mut utterance_id` plus later `utterance_id += 1` increments living
 //! inside a 400-line function were invisible to `find`/`tagmap`. The literal
 //! scanner sees them because it does not depend on symbol extraction.
