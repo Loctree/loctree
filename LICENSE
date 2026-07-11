@@ -15,7 +15,7 @@ Parameters
   Licensor:             Libraxis AI sp. z o.o. (contact@libraxis.ai)
 
   Licensed Work:        Loctree
-                        - This repository (the upstream integration repository) and all artifacts
+                        - This repository and all artifacts
                           published from it: loct, loctree-mcp, loctree-lsp,
                           the loctree library crate, report-leptos,
                           rmcp-common, and the loctree-landing site.
