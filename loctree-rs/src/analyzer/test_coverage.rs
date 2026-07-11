@@ -238,7 +238,7 @@ fn analyze_handler_coverage(
         let frontend_calls = bridge.frontend_calls.len();
 
         // Find test imports for this handler
-        let handler_key = format!("{}::{}", backend_file, &bridge.name);
+        let handler_key = format!("{}::{}", backend_file, bridge.name);
         let test_imports: Vec<PathBuf> = symbol_coverage
             .get(&handler_key)
             .map(|set| set.iter().cloned().collect())
@@ -277,7 +277,7 @@ fn find_uncovered_exports(
 
     for file in prod_files {
         for export in &file.exports {
-            let coverage_key = format!("{}::{}", &file.path, &export.name);
+            let coverage_key = format!("{}::{}", file.path, export.name);
             let tested_by: Vec<PathBuf> = symbol_coverage
                 .get(&coverage_key)
                 .map(|set| set.iter().cloned().collect())

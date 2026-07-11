@@ -1,4 +1,4 @@
-//! Fixture reproducing the CodeScribe `utterance_id` failure class.
+//! Fixture reproducing the codescribe `utterance_id` failure class.
 //!
 //! `utterance_id` is a *local* variable initialized and incremented deep
 //! inside a large function body — plus emitted as a struct field. AST/tagmap

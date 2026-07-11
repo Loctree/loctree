@@ -1292,7 +1292,7 @@ DESCRIPTION:
     Deps:       External files imported by core (outside the directory)
     Consumers:  Files outside the directory that import core files
 
-    Perfect for understanding feature modules like 'src/features/patients/'.
+    Perfect for understanding feature modules like 'src/features/settings/'.
 
 OPTIONS:
     --consumers, -c    Include files that import from this directory (default)
@@ -1306,17 +1306,17 @@ ARGUMENTS:
     <DIRECTORY>        Path to the directory to analyze (required)
 
 EXAMPLES:
-    loct focus src/features/patients/           # Focus + deps + consumers
+    loct focus src/features/settings/           # Focus + deps + consumers
     loct focus src/components/ --no-consumers   # Dependency-only view
     loct focus lib/utils/ --depth 1             # Limit external dep depth
     loct focus src/api/ --json                  # JSON output for AI tools
 
 OUTPUT FORMAT:
-    Focus: src/features/patients/
+    Focus: src/features/settings/
 
     Core (12 files, 2,340 LOC):
-      src/features/patients/index.ts
-      src/features/patients/PatientsList.tsx
+      src/features/settings/index.ts
+      src/features/settings/SettingsList.tsx
       ...
 
     Internal edges: 18 imports within directory
@@ -1495,7 +1495,7 @@ OUTPUT FORMAT:
       ...
 
     Orphan Files (0 importers, 2):
-      src/features/patients/PatientsList.tsx (504 LOC)
+      src/features/settings/SettingsList.tsx (504 LOC)
       src/components/deprecated/OldButton.tsx (89 LOC)
 
     Shadow Exports (1):
@@ -1811,7 +1811,7 @@ OPTIONS:
     --help, -h                   Show this help message
 
 FAIL-ON KINDS:
-    stale-sealed-overrides-fresh-plain   The Vista pattern: stale SealedSecret/
+    stale-sealed-overrides-fresh-plain   The example-app pattern: stale SealedSecret/
                                          SOPS overrides a fresh dotenv/configmap.
     stale-overrides-fresh                Generic: highest-precedence is older
                                          than runner-up by stale-threshold-days.

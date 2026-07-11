@@ -516,7 +516,7 @@ fn matchers_exclude(matchers: &IgnoreMatchers, abs_path: &Path) -> bool {
 /// not loctignore-excluded. This lets callers (focus / slice) distinguish
 /// "wrong path — check it" from "right path, but parked outside the snapshot by
 /// .loctignore", instead of misleadingly telling the user to check a path that
-/// is in fact correct (loctree-feedback.md: vista `docs/` excluded by .loctignore).
+/// is in fact correct (loctree-feedback.md: example-app `docs/` excluded by .loctignore).
 pub fn loctignore_exclusion_hint(root: &Path, target: &str) -> Option<String> {
     let abs = root.join(target);
     if !abs.exists() {
@@ -1613,7 +1613,7 @@ mod tests {
 
     #[test]
     fn loctignore_exclusion_hint_distinguishes_ignored_from_wrong_path() {
-        // loctree-feedback.md (2026-06-25, vista): focus(docs)/slice fell back with
+        // loctree-feedback.md (2026-06-25, example-app): focus(docs)/slice fell back with
         // "No files found. Check the path." when docs/ EXISTS on disk but is
         // excluded by .loctignore. The hint must name .loctignore so the agent
         // does not chase a wrong-path that is actually correct.

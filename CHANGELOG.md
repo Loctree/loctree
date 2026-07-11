@@ -15,7 +15,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [0.8.16] - 2026-03-11
 
 ### Changed
-- Synced the public workspace with `loctree-suite` for `loctree_rs`, `loctree-mcp`, and `reports`.
+- Synced the public workspace with the upstream integration repository for `loctree_rs`, `loctree-mcp`, and `reports`.
 - Aligned the public root workspace contract to `0.8.16` and `rmcp 0.17` while keeping suite-only crates out of this repo.
 
 ### Fixed
@@ -55,7 +55,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Changed
 - Dependency updates: `oxc` `0.110 -> 0.113`, `rmcp` `0.12 -> 0.15`, `notify-debouncer-full` `0.6 -> 0.7`, and workspace `thiserror` alignment.
-- IDE docs updated with loctree-suite teaser banners for VSCode, Neovim, and LSP protocol pages.
+- IDE docs updated with the upstream integration repository's teaser banners for VSCode, Neovim, and LSP protocol pages.
 
 ### Removed
 - Workspace and script references to deprecated `loctree-server` and `loctree-lsp` components.
@@ -68,8 +68,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [0.8.12] - 2026-02-11
 
 ### Added
-- sync with loctree-suite v0.8.4
-- sync loctree_rs + loctree_server with loctree-suite
+- sync with the upstream integration repository v0.8.4
+- sync loctree_rs + loctree_server with the upstream integration repository
 - implement OXC-based AST parser for JS/TS
 - Add `loct` as short alias for `loctree` + clippy fixes (#39)
 
@@ -246,9 +246,9 @@ $ loct find recording_finalize_session transcription_finalize_stream session_not
 | Repo | Indexed Params |
 |------|----------------|
 | mlx-omni-server | 225 |
-| lbrx-services | 899 |
-| loctree-suite | 862 |
-| vista | 2362 |
+| example-service | 899 |
+| the upstream integration repository | 862 |
+| example-app | 2362 |
 
 ## [0.8.3] - 2026-01-05
 
@@ -732,7 +732,7 @@ This release dramatically reduces false positives in dead export detection acros
 - **Parser Debug Logging**: Added error logging when OXC parser encounters issues (visible with `--verbose`).
 
 ### Changed
-- **Vista Project Results**: Improved detection accuracy:
+- **Sample Project Results**: Improved detection accuracy:
   - Frontend commands: 170 → 254 (+49%)
   - Missing handlers: 18 → 5 (72% reduction in false positives)
   - Unused handlers: 137 → 57 (58% reduction in false positives)
@@ -1033,7 +1033,7 @@ This release dramatically reduces false positives in dead export detection acros
 - `--ignore-symbols-preset <name>` (currently `common` → `main,run,setup,test_*`) and support for `foo*` prefixes in `--ignore-symbols`.
 
 ### Changed
-- Help/README/Monika guide updated with new flags; duplicate analysis now considers prefix patterns.
+- Help/README/user guide updated with new flags; duplicate analysis now considers prefix patterns.
 
 ## [0.2.6] - 2025-11-22
 
@@ -1050,7 +1050,7 @@ This release dramatically reduces false positives in dead export detection acros
 - Default analyzer extensions now include `py`.
 
 ### Changed
-- README and Monika's guide updated with Python support.
+- README and user guide updated with Python support.
 
 ## [0.2.4] - 2025-11-22
 

@@ -217,7 +217,7 @@ OPTIONS:
                                         accounting + context labels. For secret/privacy audits where
                                         --literal cannot evaluate a pattern. Mutually exclusive with --literal.
     --whole-token                       (literal) Treat '-' as token-internal: 'backdrop' no longer matches
-                                        inside 'overlay-backdrop'/'--vista-z-overlay-backdrop' (opt-in, no default change)
+                                        inside 'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file                     (literal) Add a per-file occurrence rollup ('by_file')
     --count-only, --slim                (literal) Suppress the full occurrence list, keep counters only
     --offset <N>                        (literal) Zero-based occurrence offset for paged output
@@ -468,7 +468,7 @@ DESCRIPTION:
 OPTIONS:
     --root <PATH>        Project root to scan (default: current directory)
     --whole-token        Treat '-' as token-internal: 'backdrop' no longer matches inside
-                         'overlay-backdrop'/'--vista-z-overlay-backdrop' (opt-in, no default change)
+                         'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file      Add a per-file occurrence rollup ('by_file')
     --count-only, --slim Suppress the full occurrence list, keep counters only ('slim')
     --limit <N>          Maximum number of occurrences to return in this page
