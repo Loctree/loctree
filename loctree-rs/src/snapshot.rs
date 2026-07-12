@@ -2708,6 +2708,12 @@ pub struct AcquireOptions {
     pub full_scan: bool,
     /// Snapshot root resolution strategy (Project walks to git root; Exact pins the dir).
     pub strategy: SnapshotRootStrategy,
+    /// Override `.loctignore` for this acquisition only: build an ephemeral,
+    /// non-persisted superset snapshot that also contains files normally
+    /// excluded by `.loctignore`, each marked `ignored=true`. The persisted
+    /// project snapshot and every default command are left untouched. Does not
+    /// override `.gitignore` or heavy-directory presets.
+    pub include_ignored: bool,
 }
 
 impl Default for AcquireOptions {
@@ -2723,6 +2729,7 @@ impl Default for AcquireOptions {
             no_scan_uses_stale: false,
             full_scan: false,
             strategy: SnapshotRootStrategy::Project,
+            include_ignored: false,
         }
     }
 }
@@ -2733,6 +2740,20 @@ impl Default for AcquireOptions {
 /// narrows extensions). Every internal rescan must go through this builder
 /// so initial scan and rescan agree on the file set.
 pub fn unified_scan_args(root: &Path, verbose: bool) -> ParsedArgs {
+    unified_scan_args_with_ignore(root, verbose, false)
+}
+
+/// Same as [`unified_scan_args`], but when `include_ignored` is true the
+/// `.loctignore` patterns are kept OUT of `ignore_patterns` (so those files are
+/// gathered) and stored in `loctignore_override_patterns` instead, with
+/// `include_ignored` set so the scan can mark them `ignored=true`. Heavy-dir
+/// presets and `.gitignore` still apply. Default behavior (`include_ignored =
+/// false`) is byte-identical to before.
+pub fn unified_scan_args_with_ignore(
+    root: &Path,
+    verbose: bool,
+    include_ignored: bool,
+) -> ParsedArgs {
     let mut parsed = ParsedArgs {
         verbose,
         use_gitignore: true,
@@ -2749,9 +2770,13 @@ pub fn unified_scan_args(root: &Path, verbose: bool) -> ParsedArgs {
         verbose,
     );
     parsed.library_mode = library_mode;
-    parsed
-        .ignore_patterns
-        .extend(crate::fs_utils::load_loctreeignore(root));
+    let loctignore = crate::fs_utils::load_loctreeignore(root);
+    if include_ignored {
+        parsed.include_ignored = true;
+        parsed.loctignore_override_patterns = loctignore;
+    } else {
+        parsed.ignore_patterns.extend(loctignore);
+    }
     parsed
 }
 
@@ -2816,6 +2841,29 @@ pub fn acquire_snapshot(
 ) -> io::Result<Snapshot> {
     let snapshot_root = resolve_snapshot_root_with_strategy(roots, opts.strategy);
     let requested_roots = normalize_requested_roots_for_scope_compare(roots);
+
+    // `--include-ignored`: build an ephemeral, non-persisted superset that also
+    // contains `.loctignore`-excluded files (marked `ignored=true`). The cached
+    // project snapshot is intentionally never read or written here, so default
+    // commands keep seeing the clean universe regardless of this override read.
+    if opts.include_ignored {
+        let scan_roots = canonical_roots_for_scan_metadata(roots);
+        let universe_root = scan_roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| snapshot_root.clone());
+        let mut parsed = unified_scan_args_with_ignore(&universe_root, opts.verbose, true);
+        parsed.full_scan = true;
+        parsed.output = if opts.json {
+            OutputMode::Json
+        } else {
+            OutputMode::Human
+        };
+        // Always quiet: this is an ephemeral override READ, not a scan. Printing
+        // a "Saved to ..." summary here would be misleading (nothing is persisted)
+        // and would pollute stdout for JSON consumers.
+        return build_snapshot_for_strategy(&scan_roots, &parsed, true, opts.strategy, false);
+    }
 
     if !opts.fresh {
         match Snapshot::load(&snapshot_root) {
@@ -2993,6 +3041,22 @@ pub fn run_init_with_options_for_strategy(
     quiet_summary: bool,
     snapshot_strategy: SnapshotRootStrategy,
 ) -> io::Result<()> {
+    build_snapshot_for_strategy(root_list, parsed, quiet_summary, snapshot_strategy, true)
+        .map(|_| ())
+}
+
+/// Core scan-and-build routine shared by the persisting init path and the
+/// ephemeral `--include-ignored` override. When `persist` is true the built
+/// snapshot is saved to the project cache (the classic `run_init` behavior);
+/// when false the snapshot is returned without ever touching the cache, so an
+/// override read cannot pollute the clean project snapshot.
+pub(crate) fn build_snapshot_for_strategy(
+    root_list: &[PathBuf],
+    parsed: &ParsedArgs,
+    quiet_summary: bool,
+    snapshot_strategy: SnapshotRootStrategy,
+    persist: bool,
+) -> io::Result<Snapshot> {
     use crate::analyzer::coverage::{compute_command_gaps, normalize_cmd_name};
     use crate::analyzer::root_scan::{ScanConfig, scan_roots};
     use crate::analyzer::runner::default_analyzer_exts;
@@ -3549,8 +3613,10 @@ pub fn run_init_with_options_for_strategy(
         build_spinner.finish_clear();
     }
 
-    // Save snapshot
-    snapshot.save(&snapshot_root)?;
+    // Save snapshot (skipped for ephemeral override reads: `persist == false`).
+    if persist {
+        snapshot.save(&snapshot_root)?;
+    }
 
     // Print summary (unless quiet mode)
     if !quiet_summary {
@@ -3596,7 +3662,7 @@ pub fn run_init_with_options_for_strategy(
         );
     }
 
-    Ok(())
+    Ok(snapshot)
 }
 
 /// Run the init command: scan the project and save snapshot
@@ -5711,20 +5777,20 @@ mod cache_tests {
     #[test]
     fn snapshot_parse_owner_repo_https() {
         assert_eq!(
-            parse_owner_repo("https://github.com/polyversai/loctree.git"),
-            Some("polyversai/loctree".to_string()),
+            parse_owner_repo("https://github.com/Loctree/loctree.git"),
+            Some("Loctree/loctree".to_string()),
         );
         assert_eq!(
-            parse_owner_repo("https://github.com/polyversai/loctree"),
-            Some("polyversai/loctree".to_string()),
+            parse_owner_repo("https://github.com/Loctree/loctree"),
+            Some("Loctree/loctree".to_string()),
         );
     }
 
     #[test]
     fn snapshot_parse_owner_repo_ssh() {
         assert_eq!(
-            parse_owner_repo("git@github.com:polyversai/loctree.git"),
-            Some("polyversai/loctree".to_string()),
+            parse_owner_repo("git@github.com:Loctree/loctree.git"),
+            Some("Loctree/loctree".to_string()),
         );
         assert_eq!(
             parse_owner_repo("git@gitlab.example.com:org/sub-repo.git"),
@@ -5745,11 +5811,11 @@ mod cache_tests {
     #[test]
     fn snapshot_parse_repo_name_extracts_last_segment() {
         assert_eq!(
-            parse_repo_name("https://github.com/polyversai/loctree.git"),
+            parse_repo_name("https://github.com/Loctree/loctree.git"),
             Some("loctree".to_string()),
         );
         assert_eq!(
-            parse_repo_name("git@github.com:polyversai/loctree.git"),
+            parse_repo_name("git@github.com:Loctree/loctree.git"),
             Some("loctree".to_string()),
         );
     }
@@ -5809,7 +5875,7 @@ mod cache_tests {
             entrypoints: Vec::new(),
             entrypoint_drift: EntrypointDriftSummary::default(),
             git_repo: Some("loctree".to_string()),
-            git_owner_repo: Some("polyversai/loctree".to_string()),
+            git_owner_repo: Some("Loctree/loctree".to_string()),
             git_branch: Some("main".to_string()),
             git_commit: Some("d6ecd24".to_string()),
             git_scan_id: Some("main@d6ecd24".to_string()),
@@ -5819,7 +5885,7 @@ mod cache_tests {
         let deser: SnapshotMetadata = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(deser.git_repo, Some("loctree".to_string()));
-        assert_eq!(deser.git_owner_repo, Some("polyversai/loctree".to_string()));
+        assert_eq!(deser.git_owner_repo, Some("Loctree/loctree".to_string()));
         assert_eq!(deser.git_branch, Some("main".to_string()));
         assert_eq!(deser.git_commit, Some("d6ecd24".to_string()));
     }

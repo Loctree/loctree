@@ -313,6 +313,25 @@ fn scan_roots_sequential(cfg: ScanConfig<'_>) -> io::Result<ScanResults> {
     })
 }
 
+/// True when `path` is matched by an [`IgnoreMatchers`] set (literal-prefix
+/// path OR glob). Mirrors the `.loctignore` half of `fs_utils::should_ignore`,
+/// used only to TAG files in `--include-ignored` override mode.
+fn path_matches_ignore(matchers: &crate::fs_utils::IgnoreMatchers, path: &std::path::Path) -> bool {
+    if matchers
+        .ignore_paths
+        .iter()
+        .any(|ignored| path.starts_with(ignored))
+    {
+        return true;
+    }
+    if let Some(globs) = &matchers.ignore_globs
+        && globs.is_match(path)
+    {
+        return true;
+    }
+    false
+}
+
 /// Scan a single root directory and return results
 fn scan_single_root(
     root_path: &std::path::Path,
@@ -320,6 +339,17 @@ fn scan_single_root(
 ) -> io::Result<SingleRootResult> {
     let ignore_matchers =
         crate::fs_utils::build_ignore_matchers(&cfg.parsed.ignore_patterns, root_path);
+    // In `--include-ignored` override mode, `.loctignore` patterns are kept out
+    // of `ignore_patterns` (so those files are gathered). We build them into a
+    // separate matcher here purely to TAG each gathered file as `ignored`.
+    let loctignore_override = if cfg.parsed.include_ignored {
+        Some(crate::fs_utils::build_ignore_matchers(
+            &cfg.parsed.loctignore_override_patterns,
+            root_path,
+        ))
+    } else {
+        None
+    };
     let root_canon = root_path
         .canonicalize()
         .unwrap_or_else(|_| root_path.to_path_buf());
@@ -504,7 +534,7 @@ fn scan_single_root(
             .replace('\\', "/");
 
         // Check if we can use cached analysis (mtime + size must both match)
-        let analysis = if let Some(cache) = cfg.cached_analyses {
+        let mut analysis = if let Some(cache) = cfg.cached_analyses {
             if let Some(cached) = cache.get(&rel_path) {
                 let mtime_matches = cached.mtime > 0 && cached.mtime == current_mtime;
                 let size_matches = cached.size == current_size;
@@ -561,6 +591,13 @@ fn scan_single_root(
             }
         };
         let abs_for_match = root_canon.join(&analysis.path);
+        // Tag `.loctignore`-excluded files surfaced by `--include-ignored`.
+        // Always reset (cache reuse must not carry a stale flag): only the
+        // override matcher can set it true.
+        analysis.ignored = loctignore_override
+            .as_ref()
+            .map(|m| path_matches_ignore(m, &abs_for_match))
+            .unwrap_or(false);
         let is_excluded_for_commands = cfg
             .exclude_set
             .as_ref()

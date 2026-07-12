@@ -1669,7 +1669,8 @@ mod tests {
     #[test]
     fn pill_aicx_memory_does_not_leak_absolute_aicx_store_paths() {
         let mut pack = fixture_pack();
-        let leaky_path = "/home/polyversai/.aicx/store/Loctree/loctree-suite/2026_0525/conversations/claude/s1.md";
+        let leaky_path =
+            "/home/tester/.aicx/store/Loctree/loctree-suite/2026_0525/conversations/claude/s1.md";
         pack.memory = MemorySlice {
             entries: vec![MemoryEntry {
                 kind: "decision".to_string(),
@@ -1694,7 +1695,7 @@ mod tests {
         let input = input_with(&pack, &scope, AicxRenderStatus::EnabledWithRows);
         let md = render_pill(input);
         assert!(
-            !md.contains("/home/polyversai/.aicx/store/"),
+            !md.contains(".aicx/store/"),
             "absolute aicx-store path must NOT leak into rendered context: {md}"
         );
         assert!(

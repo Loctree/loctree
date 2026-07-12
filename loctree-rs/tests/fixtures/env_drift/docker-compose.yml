@@ -1,8 +1,8 @@
 services:
   api:
-    image: vista/api
+    image: example-app/api
     environment:
-      DATABASE_URL: postgres://compose-host:5432/vista
+      DATABASE_URL: postgres://compose-host:5432/example-app
       LOG_LEVEL: debug
     env_file:
       - ./.env

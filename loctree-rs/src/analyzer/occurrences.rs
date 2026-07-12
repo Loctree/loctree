@@ -9,7 +9,7 @@
 //! — there are no fuzzy suggestions promoted as primary results, because a
 //! suggestion is not evidence.
 //!
-//! The CodeScribe `utterance_id` failure class is the canonical motivation: a
+//! The codescribe `utterance_id` failure class is the canonical motivation: a
 //! `let mut utterance_id` plus later `utterance_id += 1` increments living
 //! inside a 400-line function were invisible to `find`/`tagmap`. The literal
 //! scanner sees them because it does not depend on symbol extraction.
@@ -411,6 +411,11 @@ pub struct LiteralOccurrence {
     /// rg-complete while still exposing twin ambiguity explicitly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub definition_candidates: Vec<SymbolAnchor>,
+    /// True when this hit lives in a file normally excluded by `.loctignore`,
+    /// surfaced only because the read ran with `--include-ignored`. Set during
+    /// snapshot enrichment; `false` on default (clean-universe) reads.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
 }
 
 /// A per-file occurrence count, emitted by the `group_by_file` rollup.
@@ -529,9 +534,9 @@ fn is_false(b: &bool) -> bool {
 ///
 /// Default (`whole_token = false`) preserves the historical behavior exactly:
 /// `[A-Za-z0-9_]` are identifier-internal, so `backdrop` still matches inside
-/// the hyphenated CSS token `--vista-z-overlay-backdrop`. Opt-in
+/// the hyphenated CSS token `--sample-z-overlay-backdrop`. Opt-in
 /// `whole_token = true` additionally treats `-` as token-internal, so the same
-/// query no longer lights up `overlay-backdrop` / `--vista-z-overlay-backdrop`
+/// query no longer lights up `overlay-backdrop` / `--sample-z-overlay-backdrop`
 /// — the z-index noise the literal layer used to drag in.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanOptions {
@@ -589,7 +594,7 @@ fn is_ident_char(c: char) -> bool {
 
 /// Boundary test under a given [`ScanOptions`]. With `whole_token`, `-` also
 /// counts as token-internal, so a query like `backdrop` no longer matches
-/// inside `overlay-backdrop` / `--vista-z-overlay-backdrop`.
+/// inside `overlay-backdrop` / `--sample-z-overlay-backdrop`.
 #[inline]
 fn is_boundary_char(c: char, whole_token: bool) -> bool {
     is_ident_char(c) || (whole_token && c == '-')
@@ -1346,6 +1351,7 @@ pub fn scan_text_with(
                 enclosing_symbol: None,
                 resolved_definition: None,
                 definition_candidates: Vec::new(),
+                ignored: false,
             });
         }
     }
@@ -1489,6 +1495,7 @@ pub fn scan_text_regex(path: &str, text: &str, re: &regex::Regex) -> Vec<Literal
                 enclosing_symbol: None,
                 resolved_definition: None,
                 definition_candidates: Vec::new(),
+                ignored: false,
             });
         }
     }
@@ -1582,11 +1589,19 @@ pub fn enrich_with_snapshot(results: &mut OccurrenceResults, snapshot: &Snapshot
         return;
     }
 
+    let ignored_files: std::collections::HashSet<&str> = snapshot
+        .files
+        .iter()
+        .filter(|f| f.ignored)
+        .map(|f| f.path.as_str())
+        .collect();
+
     let index = SnapshotOccurrenceIndex::new(snapshot, &results.query, &results.occurrences);
     for occ in &mut results.occurrences {
         occ.definition_candidates = index.definition_candidates.clone();
         occ.enclosing_symbol = index.enclosing_symbol(occ);
         occ.resolved_definition = index.resolve_occurrence(occ);
+        occ.ignored = !ignored_files.is_empty() && ignored_files.contains(occ.file.as_str());
     }
     results.file_context = file_contexts(snapshot, &results.occurrences);
     results.suggested_next = suggested_next(&results.query, &results.occurrences);
@@ -2876,7 +2891,7 @@ mod tests {
 
     #[test]
     fn whole_token_excludes_hyphenated_neighbors() {
-        let line = "  z-index: var(--vista-z-overlay-backdrop);";
+        let line = "  z-index: var(--sample-z-overlay-backdrop);";
         // Default boundary: `backdrop` leaks into the hyphenated custom property.
         assert_eq!(occurrences_in_line_with(line, "backdrop", false).len(), 1);
         // whole_token: hyphen is token-internal, so the noisy hit disappears.
@@ -2891,7 +2906,7 @@ mod tests {
 
     #[test]
     fn scan_files_with_whole_token_drops_z_index_noise() {
-        let css = ".backdrop {}\n  --vista-z-overlay-backdrop: 40;";
+        let css = ".backdrop {}\n  --sample-z-overlay-backdrop: 40;";
         let loose = scan_files_with([("a.css", css)], "backdrop", ScanOptions::default());
         let tight = scan_files_with(
             [("a.css", css)],

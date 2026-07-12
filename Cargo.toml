@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "loctree-ast",
     "loctree-rs",
+    "loctree-mcp",
+    "loctree-lsp",
 ]
 
 [workspace.package]

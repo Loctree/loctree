@@ -127,6 +127,14 @@ pub struct ParsedArgs {
     pub library_example_globs: Vec<String>,
     /// Python library mode: treat __all__ exports as public API
     pub python_library: bool,
+    /// Override mode: include files normally excluded by `.loctignore` and mark
+    /// them `ignored=true` in the snapshot. Only used by the ephemeral
+    /// (non-persisted) superset scan behind `--include-ignored`.
+    pub include_ignored: bool,
+    /// Raw `.loctignore` patterns kept separate from `ignore_patterns` when
+    /// `include_ignored` is set, so the scan can gather these files yet still
+    /// mark them as ignored.
+    pub loctignore_override_patterns: Vec<String>,
 }
 
 impl Default for ParsedArgs {
@@ -217,6 +225,8 @@ impl Default for ParsedArgs {
             library_mode: false,
             library_example_globs: Vec::new(),
             python_library: false,
+            include_ignored: false,
+            loctignore_override_patterns: Vec::new(),
         }
     }
 }

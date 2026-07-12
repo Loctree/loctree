@@ -21,6 +21,12 @@ pub struct ImpactResult {
     pub total_affected: usize,
     /// Maximum depth in the dependency chain
     pub max_depth: usize,
+    /// True when the target itself is normally excluded by `.loctignore` and was
+    /// only analyzed because the read ran with `--include-ignored`. A `.loctignore`
+    /// target usually has no indexed consumers, so a "safe to remove" verdict on
+    /// such a file must be read with this caveat in mind.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub target_ignored: bool,
 }
 
 /// Single file in the impact chain
@@ -135,12 +141,18 @@ pub fn analyze_impact(snapshot: &Snapshot, target: &str, options: &ImpactOptions
 
     let total_affected = direct_consumers.len() + transitive_consumers.len();
 
+    let target_ignored = snapshot
+        .files
+        .iter()
+        .any(|f| f.ignored && (f.path == target || f.path.ends_with(target)));
+
     ImpactResult {
         target: target.to_string(),
         direct_consumers,
         transitive_consumers,
         total_affected,
         max_depth,
+        target_ignored,
     }
 }
 
@@ -186,10 +198,22 @@ fn normalize_path(path: &str) -> String {
 pub fn format_impact_text(result: &ImpactResult) -> String {
     let mut output = String::new();
 
-    output.push_str(&format!("Impact analysis for: {}\n\n", result.target));
+    output.push_str(&format!("Impact analysis for: {}\n", result.target));
+    if result.target_ignored {
+        output.push_str(
+            "[ignored: .loctignore] Target is normally excluded from the index; consumer edges may be undercounted.\n",
+        );
+    }
+    output.push('\n');
 
     if result.total_affected == 0 {
-        output.push_str("[OK] No files depend on this file. Safe to remove.\n");
+        if result.target_ignored {
+            output.push_str(
+                "[OK] No indexed files depend on this file — but it is `.loctignore`-excluded, so treat 'safe to remove' with care.\n",
+            );
+        } else {
+            output.push_str("[OK] No files depend on this file. Safe to remove.\n");
+        }
         return output;
     }
 

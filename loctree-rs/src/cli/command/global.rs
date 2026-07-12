@@ -41,4 +41,10 @@ pub struct GlobalOptions {
 
     /// Fail if snapshot is stale (different git HEAD) - for CI (--fail-stale)
     pub fail_stale: bool,
+
+    /// Override `.loctignore`: include normally-excluded files (tests, scripts,
+    /// docs, ...) in this single read and mark them `ignored` in the output
+    /// (--include-ignored). Uses an ephemeral scan; the persisted snapshot and
+    /// all default commands stay unaffected. Does not override `.gitignore`.
+    pub include_ignored: bool,
 }

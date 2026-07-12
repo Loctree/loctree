@@ -88,6 +88,11 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
     parsed.library_mode = global.library_mode;
     parsed.python_library = global.python_library;
     parsed.py_roots = global.py_roots.clone();
+    // Carrier only: read commands that call `acquire_snapshot` directly (slice)
+    // read this to request the ephemeral include-ignored snapshot. The scan-time
+    // override flag proper is set by `unified_scan_args_with_ignore`, so an empty
+    // `loctignore_override_patterns` here keeps normal scans unaffected.
+    parsed.include_ignored = global.include_ignored;
 
     // Convert command-specific options
     match cmd {
@@ -830,6 +835,7 @@ fn acquire_options_from_global(global: &GlobalOptions) -> crate::snapshot::Acqui
         json: global.json,
         // Suppress the scan summary in json/quiet mode to keep stdout clean.
         print_scan_summary: !(global.json || global.quiet),
+        include_ignored: global.include_ignored,
         ..Default::default()
     }
 }

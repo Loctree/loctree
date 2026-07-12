@@ -4257,6 +4257,57 @@ mod management_commands {
             .stdout(predicate::str::starts_with("{").or(predicate::str::starts_with("[")));
     }
 
+    // CLI flag drift (loctree-feedback.md): `loct find --mode <x>` used to fail with
+    // `Unknown option '--mode'`. It now aliases 1:1 onto the mode flags.
+    #[test]
+    fn find_mode_alias_where_symbol_does_not_error() {
+        let fixture = fixtures_path().join("simple_ts");
+
+        let assert = loctree()
+            .current_dir(&fixture)
+            .args(["find", "--mode", "where-symbol", "greet"])
+            .assert()
+            .success();
+        let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+        assert!(
+            !stdout.contains("Unknown option"),
+            "--mode where-symbol must not report Unknown option, got: {stdout}"
+        );
+    }
+
+    #[test]
+    fn find_mode_alias_literal_matches_direct_flag() {
+        let fixture = fixtures_path().join("simple_ts");
+
+        loctree()
+            .current_dir(&fixture)
+            .args(["find", "--mode", "literal", "greet", "--json"])
+            .assert()
+            .success()
+            .stdout(predicate::str::starts_with("{").or(predicate::str::starts_with("[")));
+    }
+
+    #[test]
+    fn find_mode_unknown_value_suggests_valid_modes() {
+        loctree()
+            .args(["find", "--mode", "bogus", "greet"])
+            .assert()
+            .failure()
+            .stderr(
+                predicate::str::contains("where-symbol")
+                    .and(predicate::str::contains("query where-symbol")),
+            );
+    }
+
+    #[test]
+    fn find_unknown_format_flag_redirects_to_json() {
+        loctree()
+            .args(["find", "--format", "markdown", "greet"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("--json"));
+    }
+
     // ----------------------------------------
     // Report Command Tests
     // ----------------------------------------
@@ -4329,10 +4380,7 @@ mod management_commands {
             "report must start with DOCTYPE, got first chars: {:?}",
             html.chars().take(40).collect::<String>()
         );
-        assert!(
-            html.contains("Loctree Report"),
-            "missing Vista report title"
-        );
+        assert!(html.contains("Loctree Report"), "missing report title");
         assert!(
             html.contains(env!("CARGO_PKG_VERSION")),
             "missing loctree binary version ({}) in rendered provenance chip",
@@ -5476,13 +5524,13 @@ mod env_truth {
         assert!(stdout.contains("sha256:"));
     }
 
-    /// W2-c: default report stays small even on a CodeScribe-like surface
+    /// W2-c: default report stays small even on a codescribe-like surface
     /// (the 2026-line wall regression).
     #[test]
     fn default_report_is_bounded_under_200_lines() {
         let temp = TempDir::new().unwrap();
         stage_env_drift(&temp, 30, 2);
-        // Add a CodeScribe-like pile of one-off declarations to fatten the
+        // Add a codescribe-like pile of one-off declarations to fatten the
         // would-be full dump.
         let mut extra = String::new();
         for i in 0..120 {
@@ -5706,7 +5754,7 @@ mod env_truth {
 mod occurrences_cli {
     use super::*;
 
-    /// W1-A regression — the CodeScribe `utterance_id` failure class.
+    /// W1-A regression — the codescribe `utterance_id` failure class.
     ///
     /// `loct occurrences <ident>` must find LOCAL-variable occurrences buried
     /// inside a large function — exactly the case `find`/`tagmap` missed (they
@@ -6504,7 +6552,7 @@ mod find_literal_cli {
     /// `loct find --literal <ident> --json` must return a `literal_matches`
     /// section whose occurrences are byte-for-byte the same lines `loct
     /// occurrences` surfaces — every result tagged `source: "literal"`, and the
-    /// buried-local CodeScribe lines (`let mut utterance_id`, `utterance_id += 1`)
+    /// buried-local codescribe lines (`let mut utterance_id`, `utterance_id += 1`)
     /// present. This is the W1-B acceptance: when the mode says literal, the
     /// answer is literal.
     #[test]
@@ -6909,7 +6957,7 @@ mod occurrences_quality_cli {
     }
 
     /// `--whole-token` tightens the boundary so `backdrop` stops matching inside
-    /// hyphenated neighbors (`--vista-z-overlay-backdrop`, `backdrop-filter`),
+    /// hyphenated neighbors (`--sample-z-overlay-backdrop`, `backdrop-filter`),
     /// cutting the z-index noise — while the default boundary is unchanged.
     #[test]
     fn whole_token_cuts_hyphenated_noise() {
@@ -6927,7 +6975,7 @@ mod occurrences_quality_cli {
         assert!(
             tight_occ.iter().all(|o| {
                 let ctx = o["context"].as_str().unwrap_or("");
-                !ctx.contains("--vista-z-overlay-backdrop")
+                !ctx.contains("--sample-z-overlay-backdrop")
             }) || tight_occ.iter().all(|o| o["matched_text"] == "backdrop"),
             "whole_token must not surface a hit *inside* the hyphenated custom property"
         );
@@ -6936,9 +6984,9 @@ mod occurrences_quality_cli {
             !tight_occ.iter().any(|o| o["context"]
                 .as_str()
                 .unwrap_or("")
-                .contains("--vista-z-overlay-backdrop")
+                .contains("--sample-z-overlay-backdrop")
                 && o["occurrence_kind"] == "custom_property"),
-            "the `--vista-z-overlay-backdrop` noise hit must be gone under whole_token"
+            "the `--sample-z-overlay-backdrop` noise hit must be gone under whole_token"
         );
     }
 
@@ -7009,7 +7057,7 @@ mod occurrences_quality_cli {
         fs::create_dir_all(&subdir).unwrap();
         fs::write(
             subdir.join("styles.css"),
-            "/* backdrop */\n.backdrop { --vista-z-overlay-backdrop: 40; }\n",
+            "/* backdrop */\n.backdrop { --sample-z-overlay-backdrop: 40; }\n",
         )
         .unwrap();
         fs::write(
@@ -7665,7 +7713,7 @@ mod dead_truth {
         );
     }
 
-    /// Empiria: Vista lazy-import `import('./Steps').then((m) => m.InviteTeamStep)`
+    /// Empiria: example-app lazy-import `import('./Steps').then((m) => m.InviteTeamStep)`
     /// — the named export consumed only through the dynamic-import member
     /// access must not be dead.
     #[test]
@@ -7681,7 +7729,7 @@ mod dead_truth {
         );
     }
 
-    /// Empiria: CodeScribe stt-bridge — runtime entry files spawned only by
+    /// Empiria: codescribe stt-bridge — runtime entry files spawned only by
     /// string. The fixture carries BOTH a Cargo [[bin]]
     /// (`src/bin/stt_bridge.rs`) and a package.json bin
     /// (`daemon/voice_daemon.js`, spawned via `spawn('voice-daemon')`).
