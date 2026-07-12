@@ -3,8 +3,8 @@
 - Component: `engine`
 - Version: `0.13.1`
 - Target repo: `Loctree/loctree`
-- Source commit: `7d5f7e72fd8f`
-- Generated at: `2026-07-12T11:09:14Z`
+- Source commit: `48a9526de88b`
+- Generated at: `2026-07-12T15:28:49Z`
 - Push mode: `disabled`
 - Dependency mode: `crates.io registry`
 

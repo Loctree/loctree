@@ -69,6 +69,14 @@ fn jetbrains_router_handles(commands: &BTreeSet<String>) -> Vec<String> {
 
 #[test]
 fn lsp_emitted_loctree_commands_have_vscode_and_jetbrains_contributions() {
+    // The editor clients live only in the integration monorepo; the public
+    // engine-bundle mirror ships loctree-lsp without editors/, so the parity
+    // guard has nothing to check there. In the suite editors/ always exists,
+    // so this skip never weakens the real gate.
+    if !repo_root().join("editors").is_dir() {
+        eprintln!("skipping editor command parity: no editors/ tree in this checkout");
+        return;
+    }
     let emitted = extract_lsp_emitted_commands(&[
         "loctree-lsp/src/actions/refactor.rs",
         "loctree-lsp/src/actions/quickfix.rs",
