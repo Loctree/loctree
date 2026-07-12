@@ -530,24 +530,24 @@ mod tests {
                 git_scan_id: None,
             },
             files: vec![
-                // Files in src/features/patients/
+                // Files in src/features/settings/
                 FileAnalysis {
-                    path: "src/features/patients/index.ts".to_string(),
+                    path: "src/features/settings/index.ts".to_string(),
                     loc: 20,
                     language: "typescript".to_string(),
-                    ..FileAnalysis::new("src/features/patients/index.ts".to_string())
+                    ..FileAnalysis::new("src/features/settings/index.ts".to_string())
                 },
                 FileAnalysis {
-                    path: "src/features/patients/PatientsList.tsx".to_string(),
+                    path: "src/features/settings/SettingsList.tsx".to_string(),
                     loc: 150,
                     language: "typescript".to_string(),
-                    ..FileAnalysis::new("src/features/patients/PatientsList.tsx".to_string())
+                    ..FileAnalysis::new("src/features/settings/SettingsList.tsx".to_string())
                 },
                 FileAnalysis {
-                    path: "src/features/patients/usePatient.ts".to_string(),
+                    path: "src/features/settings/useSetting.ts".to_string(),
                     loc: 80,
                     language: "typescript".to_string(),
-                    ..FileAnalysis::new("src/features/patients/usePatient.ts".to_string())
+                    ..FileAnalysis::new("src/features/settings/useSetting.ts".to_string())
                 },
                 // External files
                 FileAnalysis {
@@ -570,32 +570,32 @@ mod tests {
                 },
             ],
             edges: vec![
-                // Internal edges (within patients/)
+                // Internal edges (within settings/)
                 GraphEdge {
-                    from: "src/features/patients/index.ts".to_string(),
-                    to: "src/features/patients/PatientsList.tsx".to_string(),
+                    from: "src/features/settings/index.ts".to_string(),
+                    to: "src/features/settings/SettingsList.tsx".to_string(),
                     label: "reexport".to_string(),
                 },
                 GraphEdge {
-                    from: "src/features/patients/PatientsList.tsx".to_string(),
-                    to: "src/features/patients/usePatient.ts".to_string(),
+                    from: "src/features/settings/SettingsList.tsx".to_string(),
+                    to: "src/features/settings/useSetting.ts".to_string(),
                     label: "import".to_string(),
                 },
-                // External deps (patients imports external)
+                // External deps (settings imports external)
                 GraphEdge {
-                    from: "src/features/patients/PatientsList.tsx".to_string(),
+                    from: "src/features/settings/SettingsList.tsx".to_string(),
                     to: "src/components/Button.tsx".to_string(),
                     label: "import".to_string(),
                 },
                 GraphEdge {
-                    from: "src/features/patients/usePatient.ts".to_string(),
+                    from: "src/features/settings/useSetting.ts".to_string(),
                     to: "src/utils/api.ts".to_string(),
                     label: "import".to_string(),
                 },
-                // Consumer (App imports patients)
+                // Consumer (App imports settings)
                 GraphEdge {
                     from: "src/App.tsx".to_string(),
-                    to: "src/features/patients/index.ts".to_string(),
+                    to: "src/features/settings/index.ts".to_string(),
                     label: "import".to_string(),
                 },
             ],
@@ -613,10 +613,10 @@ mod tests {
         let snapshot = create_test_snapshot();
         let config = FocusConfig::default();
 
-        let focus = HolographicFocus::from_path(&snapshot, "src/features/patients", &config)
-            .expect("focus on patients");
+        let focus = HolographicFocus::from_path(&snapshot, "src/features/settings", &config)
+            .expect("focus on settings");
 
-        assert_eq!(focus.target, "src/features/patients");
+        assert_eq!(focus.target, "src/features/settings");
         assert_eq!(focus.stats.core_files, 3);
         assert_eq!(focus.stats.core_loc, 250); // 20 + 150 + 80
     }
@@ -626,10 +626,10 @@ mod tests {
         let snapshot = create_test_snapshot();
         let config = FocusConfig::default();
 
-        let focus = HolographicFocus::from_path(&snapshot, "src/features/patients", &config)
-            .expect("focus on patients");
+        let focus = HolographicFocus::from_path(&snapshot, "src/features/settings", &config)
+            .expect("focus on settings");
 
-        // Two internal edges: index->PatientsList, PatientsList->usePatient
+        // Two internal edges: index->SettingsList, SettingsList->useSetting
         assert_eq!(focus.stats.internal_edges, 2);
     }
 
@@ -638,10 +638,10 @@ mod tests {
         let snapshot = create_test_snapshot();
         let config = FocusConfig::default();
 
-        let focus = HolographicFocus::from_path(&snapshot, "src/features/patients", &config)
-            .expect("focus on patients");
+        let focus = HolographicFocus::from_path(&snapshot, "src/features/settings", &config)
+            .expect("focus on settings");
 
-        // PatientsList imports Button, usePatient imports api
+        // SettingsList imports Button, useSetting imports api
         assert_eq!(focus.stats.deps_files, 2);
         let dep_paths: Vec<_> = focus.deps.iter().map(|f| f.path.as_str()).collect();
         assert!(dep_paths.contains(&"src/components/Button.tsx"));
@@ -654,10 +654,10 @@ mod tests {
         let index = snapshot
             .files
             .iter_mut()
-            .find(|file| file.path == "src/features/patients/index.ts")
+            .find(|file| file.path == "src/features/settings/index.ts")
             .expect("fixture index.ts");
         index.exports.push(crate::types::ExportSymbol {
-            name: "PatientsModule".to_string(),
+            name: "SettingsModule".to_string(),
             kind: "function".to_string(),
             export_type: "named".to_string(),
             line: Some(3),
@@ -667,10 +667,10 @@ mod tests {
 
         let focus = HolographicFocus::from_path(
             &snapshot,
-            "src/features/patients",
+            "src/features/settings",
             &FocusConfig::default(),
         )
-        .expect("focus on patients");
+        .expect("focus on settings");
         let json = focus.to_json();
 
         assert_eq!(
@@ -684,8 +684,8 @@ mod tests {
                 .expect("coreSymbols")
                 .iter()
                 .any(|symbol| {
-                    symbol["name"] == "PatientsModule"
-                        && symbol["file"] == "src/features/patients/index.ts"
+                    symbol["name"] == "SettingsModule"
+                        && symbol["file"] == "src/features/settings/index.ts"
                         && symbol["line"] == 3
                         && symbol["authority"] == "LoctreeDerived"
                 }),
@@ -696,7 +696,7 @@ mod tests {
                 .as_array()
                 .expect("suggestedNext")
                 .iter()
-                .any(|step| step["command"] == "loct occurrences 'PatientsModule' --json"),
+                .any(|step| step["command"] == "loct occurrences 'SettingsModule' --json"),
             "focus should carry non-empty suggested next steps: {json}"
         );
     }
@@ -709,10 +709,10 @@ mod tests {
             ..Default::default()
         };
 
-        let focus = HolographicFocus::from_path(&snapshot, "src/features/patients", &config)
-            .expect("focus on patients with consumers");
+        let focus = HolographicFocus::from_path(&snapshot, "src/features/settings", &config)
+            .expect("focus on settings with consumers");
 
-        // App.tsx imports from patients
+        // App.tsx imports from settings
         assert_eq!(focus.stats.consumers_files, 1);
         assert_eq!(focus.consumers[0].path, "src/App.tsx");
     }
@@ -732,9 +732,9 @@ mod tests {
         let config = FocusConfig::default();
 
         // All these should work the same
-        let f1 = HolographicFocus::from_path(&snapshot, "src/features/patients", &config);
-        let f2 = HolographicFocus::from_path(&snapshot, "src/features/patients/", &config);
-        let f3 = HolographicFocus::from_path(&snapshot, "./src/features/patients", &config);
+        let f1 = HolographicFocus::from_path(&snapshot, "src/features/settings", &config);
+        let f2 = HolographicFocus::from_path(&snapshot, "src/features/settings/", &config);
+        let f3 = HolographicFocus::from_path(&snapshot, "./src/features/settings", &config);
 
         assert!(f1.is_some());
         assert!(f2.is_some());

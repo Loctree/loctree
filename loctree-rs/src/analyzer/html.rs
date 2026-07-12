@@ -283,7 +283,7 @@ mod tests {
 
         // Verify key parts exist in the Leptos-rendered output
         assert!(html.contains("<!DOCTYPE html>"));
-        assert!(html.contains("Loctree Report")); // Title in new Vista design
+        assert!(html.contains("Loctree Report")); // Title in new example-app design
 
         // The output format might differ slightly from legacy, check for content
         assert!(html.contains("Hint"));

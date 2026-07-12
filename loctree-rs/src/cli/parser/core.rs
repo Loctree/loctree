@@ -53,6 +53,7 @@ pub fn uses_new_syntax(args: &[String]) -> bool {
             || arg == "--fresh"
             || arg == "--no-scan"
             || arg == "--fail-stale"
+            || arg == "--include-ignored"
             || arg == "--for-ai"
             || arg == "--findings"
             || arg == "--summary"
@@ -195,6 +196,10 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
             }
             "--fail-stale" => {
                 global.fail_stale = true;
+                i += 1;
+            }
+            "--include-ignored" => {
+                global.include_ignored = true;
                 i += 1;
             }
             "--findings" => match subcommand.as_deref() {

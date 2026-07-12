@@ -511,6 +511,9 @@ fn print_literal_find_human(query: &str, literal: &OccurrenceResults, fuzzy: &[F
                 if let Some(enclosing) = &occ.enclosing_symbol {
                     suffix.push_str(&format!("  in {}", enclosing.symbol_id));
                 }
+                if occ.ignored {
+                    suffix.push_str("  [ignored: .loctignore]");
+                }
                 println!(
                     "  {}:{}:{}  [{}]  {}{}",
                     occ.file,

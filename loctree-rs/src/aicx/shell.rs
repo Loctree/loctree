@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn parse_steer_handles_three_line_blocks() {
-        let payload = "Loctree/loctree-suite | claude | 2026-04-19 | conversations\n  run_id: -  prompt_id: -  model: -\n  /home/polyversai/.aicx/store/foo.md\n\nLoctree/loctree-suite | codex | 2026-04-25 | reports\n  run_id: mrbl-001  prompt_id: cut3-task  model: opus-4.7\n  /home/polyversai/.aicx/store/bar.md\n";
+        let payload = "Loctree/loctree-suite | claude | 2026-04-19 | conversations\n  run_id: -  prompt_id: -  model: -\n  /home/tester/.aicx/store/foo.md\n\nLoctree/loctree-suite | codex | 2026-04-25 | reports\n  run_id: mrbl-001  prompt_id: cut3-task  model: opus-4.7\n  /home/tester/.aicx/store/bar.md\n";
         let parsed = parse_steer(payload);
         assert_eq!(parsed.len(), 2);
 
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(parsed[1].model.as_deref(), Some("opus-4.7"));
         assert_eq!(
             parsed[1].source_chunk_path,
-            "/home/polyversai/.aicx/store/bar.md"
+            "/home/tester/.aicx/store/bar.md"
         );
     }
 

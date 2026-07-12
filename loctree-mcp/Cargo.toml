@@ -1,0 +1,71 @@
+[package]
+name = "loctree-mcp"
+version.workspace = true
+edition.workspace = true
+description = "MCP server for loctree - hot codebase analysis for AI agents"
+license.workspace = true
+authors.workspace = true
+repository = "https://github.com/Loctree/loctree-mcp"
+homepage = "https://loct.io"
+rust-version.workspace = true
+keywords = ["mcp", "loctree", "ai", "code-analysis", "agents"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+# MCP Protocol
+rmcp = { workspace = true, features = [
+    "server",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+
+# Loctree core (workspace version)
+loctree = { workspace = true }
+
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+
+# HTTP / Axum stack for the `--transport http` server. Sits in front of
+# rmcp::transport::streamable_http_server::StreamableHttpService.
+axum = { workspace = true }
+tower = { workspace = true }
+tokio-util = { workspace = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Regex for symbol search
+regex = "1.10"
+
+# Schema generation for MCP tools
+schemars = "1.1"
+
+# Error handling
+anyhow = "1.0"
+thiserror = { workspace = true }
+
+# Crypto + auth primitives (src/auth/* ported from rust-memex; SaaS 0.20.x)
+sha2 = { workspace = true }
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+subtle = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+shellexpand = { workspace = true }
+
+reqwest = { workspace = true }
+
+# Unix signal handling (for SIGPIPE)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

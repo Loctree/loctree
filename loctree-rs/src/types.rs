@@ -956,6 +956,15 @@ pub struct FileAnalysis {
     /// on the file so incremental scans preserve symbols for unchanged files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_fragment: Option<crate::symbols::SymbolGraph>,
+
+    /// True when this file is normally excluded by `.loctignore` and only
+    /// surfaced because the caller passed `--include-ignored`. Default snapshots
+    /// never contain such files, so this is `false` on every persisted snapshot;
+    /// it is set to `true` only in the ephemeral (non-persisted) superset built
+    /// for an override read. Read commands must surface it so an agent knows the
+    /// file is not part of the normal indexed universe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
 }
 
 /// Lightweight reference into the per-snapshot SemanticFacts table.
@@ -1083,6 +1092,7 @@ impl FileAnalysis {
             log_messages: Vec::new(),
             crate_membership: None,
             symbol_fragment: None,
+            ignored: false,
         }
     }
 }

@@ -1181,7 +1181,7 @@ echo "${LANG:-en_US.UTF-8}"
 
     #[test]
     fn env_contract_skips_locally_assigned_uppercase_vars() {
-        // W2-c regression (CodeScribe 126 / suite 152 false orphans):
+        // W2-c regression (codescribe 126 / suite 152 false orphans):
         // `APP_NAME=x` + `echo $APP_NAME` is a script-local variable, not an
         // env contract. Same for ANSI color locals and loop variables.
         let tmp = tempfile::tempdir().unwrap();

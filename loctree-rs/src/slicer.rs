@@ -98,6 +98,10 @@ pub struct SliceFile {
     pub resource_kind: Option<String>,
     /// Depth from target (0 = core, 1 = direct dep, etc.)
     pub depth: usize,
+    /// True when this file is normally excluded by `.loctignore` and is only
+    /// visible because the read was run with `--include-ignored`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignored: bool,
 }
 
 /// Symbol defined in the core layer of a slice/focus response.
@@ -140,6 +144,7 @@ impl SliceFile {
             kind: file.kind.clone(),
             resource_kind: file.resource_kind.clone(),
             depth,
+            ignored: file.ignored,
         }
     }
 
@@ -150,6 +155,16 @@ impl SliceFile {
                 format!("{}, {}", self.language, self.kind)
             }
             _ => self.language.clone(),
+        }
+    }
+
+    /// Human-output suffix marking a file that is normally hidden by
+    /// `.loctignore` and only surfaced via `--include-ignored`.
+    pub(crate) fn ignored_tag(&self) -> &'static str {
+        if self.ignored {
+            " [ignored: .loctignore]"
+        } else {
+            ""
         }
     }
 }
@@ -679,7 +694,13 @@ impl HolographicSlice {
             self.stats.core_files, self.stats.core_loc
         );
         for f in &self.core {
-            println!("  {} ({} LOC, {})", f.path, f.loc, f.descriptor());
+            println!(
+                "  {} ({} LOC, {}){}",
+                f.path,
+                f.loc,
+                f.descriptor(),
+                f.ignored_tag()
+            );
         }
 
         if !self.core_symbols.is_empty() {
@@ -717,12 +738,13 @@ impl HolographicSlice {
             }
             let indent = "  ".repeat(f.depth);
             println!(
-                "{}[d{}] {} ({} LOC, {})",
+                "{}[d{}] {} ({} LOC, {}){}",
                 indent,
                 f.depth,
                 f.path,
                 f.loc,
-                f.descriptor()
+                f.descriptor(),
+                f.ignored_tag()
             );
         }
 
@@ -740,7 +762,13 @@ impl HolographicSlice {
                     );
                     break;
                 }
-                println!("  {} ({} LOC, {})", f.path, f.loc, f.descriptor());
+                println!(
+                    "  {} ({} LOC, {}){}",
+                    f.path,
+                    f.loc,
+                    f.descriptor(),
+                    f.ignored_tag()
+                );
             }
         }
 
@@ -901,7 +929,10 @@ pub fn run_slice(
     let snapshot = crate::snapshot::acquire_snapshot(
         std::slice::from_ref(&effective_root),
         crate::snapshot::SnapshotReusePolicy::Strict,
-        &crate::snapshot::AcquireOptions::default(),
+        &crate::snapshot::AcquireOptions {
+            include_ignored: parsed.include_ignored,
+            ..Default::default()
+        },
     )?;
 
     let config = SliceConfig {
@@ -1269,6 +1300,7 @@ mod tests {
             kind: "code".to_string(),
             resource_kind: None,
             depth: 0,
+            ignored: false,
         };
         assert_eq!(file.path, "src/main.rs");
         assert_eq!(file.layer, "core");
@@ -1345,6 +1377,7 @@ mod tests {
                 kind: "code".to_string(),
                 resource_kind: None,
                 depth: 0,
+                ignored: false,
             }],
             deps: vec![],
             consumers: vec![],

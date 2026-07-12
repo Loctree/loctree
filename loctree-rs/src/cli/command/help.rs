@@ -402,6 +402,13 @@ impl Command {
         help.push_str("=== GLOBAL OPTIONS ===\n\n");
         help.push_str("  --json             Output as JSON\n");
         help.push_str("  --fresh            Force rescan (ignore cache)\n");
+        help.push_str(
+            "  --include-ignored  Also surface .loctignore-excluded files (tests/scripts/docs),\n",
+        );
+        help.push_str(
+            "                     marked `ignored`; for find/slice/impact. Ephemeral scan,\n",
+        );
+        help.push_str("                     does not touch the cache or override .gitignore.\n");
         help.push_str("  --verbose          Detailed progress\n");
         help.push_str("  --fail             Exit non-zero on issues (CI mode)\n");
         help.push_str("  --sarif            SARIF 2.1.0 output for CI\n\n");

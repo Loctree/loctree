@@ -187,6 +187,33 @@ EXAMPLES:
     Ok(Command::Cycles(opts))
 }
 
+/// Build a friendly "unknown option" error for `find`, redirecting the most
+/// common docs/runtime drift mistakes (from loctree-feedback.md) to the real syntax
+/// instead of the bare generic message.
+fn find_unknown_option_error(arg: &str) -> String {
+    let hint = match arg {
+        "--format" => Some(
+            "`find` has no `--format`; use the global `--json` flag for machine output \
+             (`loct find <query> --json`).",
+        ),
+        "--group-by" => Some("did you mean `--group-by-file`? (literal mode only)"),
+        "--count" => Some("did you mean `--count-only` / `--slim`? (literal mode only)"),
+        "--where" | "--wheresymbol" => {
+            Some("did you mean `--where-symbol` (or `loct query where-symbol <SYMBOL>`)?")
+        }
+        _ => None,
+    };
+    match hint {
+        Some(h) => format!("Unknown option '{arg}' for 'find' command. {h}"),
+        None => format!(
+            "Unknown option '{arg}' for 'find' command. Search modes are direct flags: \
+             --literal, --regex, --where-symbol, --who-imports, --dead, --exported (or \
+             `--mode <name>`). Filters: --symbol/-s, --file/-f, --lang, --limit. Output: global \
+             --json. Run `loct find --help` for the full list."
+        ),
+    }
+}
+
 /// Parse `loct find [options]` command - semantic search for symbols.
 pub(super) fn parse_find_command(args: &[String]) -> Result<Command, String> {
     // Check for help flag first
@@ -217,7 +244,7 @@ OPTIONS:
                                         accounting + context labels. For secret/privacy audits where
                                         --literal cannot evaluate a pattern. Mutually exclusive with --literal.
     --whole-token                       (literal) Treat '-' as token-internal: 'backdrop' no longer matches
-                                        inside 'overlay-backdrop'/'--vista-z-overlay-backdrop' (opt-in, no default change)
+                                        inside 'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file                     (literal) Add a per-file occurrence rollup ('by_file')
     --count-only, --slim                (literal) Suppress the full occurrence list, keep counters only
     --offset <N>                        (literal) Zero-based occurrence offset for paged output
@@ -227,8 +254,12 @@ OPTIONS:
     --file <PATTERN>, -f <PATTERN>      Search for files matching regex; in --literal, exact path/suffix scope
     --similar <SYMBOL>                  Find symbols with similar names (fuzzy)
     --who-imports                       Find files that import QUERY (same graph path as `loct query who-imports`)
+    --where-symbol                      Resolve where a symbol is defined/exported (same as `loct query where-symbol`)
     --dead                              Only show dead/unused symbols
     --exported                          Only show exported symbols
+    --mode <NAME>                       Alias that dispatches to a mode flag instead of typing the flag directly:
+                                        literal | regex | where-symbol | who-imports | dead | exported | fuzzy (default).
+                                        e.g. `--mode where-symbol` == `--where-symbol`. Compat shim for `--mode <x>` muscle memory.
     --lang <LANG>                       Filter by language (ts, rs, js, py, etc.)
     --limit <N>                         Maximum results to show; in --literal, page size for occurrences
     --help, -h                          Show this help message
@@ -320,6 +351,43 @@ EXAMPLES:
                 opts.where_symbol = true;
                 i += 1;
             }
+            "--mode" => {
+                // Compat alias for `--mode <x>` muscle memory (loctree-feedback.md: agents
+                // repeatedly type `loct find --mode where-symbol` / `--mode literal` and
+                // hit `Unknown option '--mode'`). Dispatch cleanly onto the existing mode
+                // flags where the mapping is 1:1; refuse ambiguous/unknown modes with a
+                // pointed message instead of the generic unknown-option error.
+                let value = args.get(i + 1).ok_or_else(|| {
+                    "--mode requires a value: literal | regex | where-symbol | who-imports | \
+                     dead | exported | fuzzy. Each is also a direct flag (e.g. `--where-symbol`)."
+                        .to_string()
+                })?;
+                match value.as_str() {
+                    "literal" => opts.literal = true,
+                    "regex" => opts.regex = true,
+                    "where-symbol" | "where_symbol" => opts.where_symbol = true,
+                    "who-imports" | "who_imports" => who_imports = true,
+                    "dead" => opts.dead_only = true,
+                    "exported" => opts.exported_only = true,
+                    // Default AST/fuzzy discovery mode — no flag to set.
+                    "fuzzy" | "ast" | "default" | "symbol" => {}
+                    "similar" => {
+                        return Err(
+                            "`--mode similar` needs a target symbol. Use `loct find --similar <SYMBOL>` instead."
+                                .to_string(),
+                        );
+                    }
+                    other => {
+                        return Err(format!(
+                            "Unknown find --mode '{other}'. Valid modes: literal, regex, where-symbol, \
+                             who-imports, dead, exported, fuzzy. Each is also a direct flag (e.g. \
+                             `--where-symbol`); for a where-symbol lookup you can also run \
+                             `loct query where-symbol <SYMBOL>`."
+                        ));
+                    }
+                }
+                i += 2;
+            }
             "--who-imports" => {
                 who_imports = true;
                 i += 1;
@@ -379,7 +447,7 @@ EXAMPLES:
                     queries.push(arg.clone());
                     i += 1;
                 } else {
-                    return Err(format!("Unknown option '{}' for 'find' command.", arg));
+                    return Err(find_unknown_option_error(arg));
                 }
             }
         }
@@ -468,7 +536,7 @@ DESCRIPTION:
 OPTIONS:
     --root <PATH>        Project root to scan (default: current directory)
     --whole-token        Treat '-' as token-internal: 'backdrop' no longer matches inside
-                         'overlay-backdrop'/'--vista-z-overlay-backdrop' (opt-in, no default change)
+                         'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file      Add a per-file occurrence rollup ('by_file')
     --count-only, --slim Suppress the full occurrence list, keep counters only ('slim')
     --compact            Human output only: print path:line plus one context line per hit
@@ -883,6 +951,119 @@ mod tests {
         assert!(
             err.contains("mutually exclusive"),
             "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    // --mode <x> compat alias (loctree-feedback.md CLI flag drift): agents type
+    // `loct find --mode where-symbol` / `--mode literal` and used to hit
+    // `Unknown option '--mode'`. The alias must dispatch 1:1 onto the mode flags.
+    #[test]
+    fn test_parse_find_mode_where_symbol_alias() {
+        let args = vec!["--mode".into(), "where-symbol".into(), "Foo".into()];
+        let result = parse_find_command(&args).unwrap();
+        if let Command::Find(opts) = result {
+            assert!(
+                opts.where_symbol,
+                "--mode where-symbol must set where_symbol"
+            );
+            assert_eq!(opts.queries, vec!["Foo".to_string()]);
+        } else {
+            panic!("Expected Find command");
+        }
+    }
+
+    #[test]
+    fn test_parse_find_mode_literal_alias() {
+        let args = vec!["--mode".into(), "literal".into(), "utterance_id".into()];
+        let result = parse_find_command(&args).unwrap();
+        if let Command::Find(opts) = result {
+            assert!(opts.literal, "--mode literal must set literal");
+            assert_eq!(opts.queries, vec!["utterance_id".to_string()]);
+        } else {
+            panic!("Expected Find command");
+        }
+    }
+
+    #[test]
+    fn test_parse_find_mode_who_imports_alias_dispatches_to_query() {
+        // --who-imports (also reachable via --mode who-imports) rewrites to a Query.
+        let args = vec!["--mode".into(), "who-imports".into(), "src/utils.ts".into()];
+        let result = parse_find_command(&args).unwrap();
+        if let Command::Query(opts) = result {
+            assert!(matches!(opts.kind, QueryKind::WhoImports));
+            assert_eq!(opts.target, "src/utils.ts");
+        } else {
+            panic!("Expected Query command from --mode who-imports");
+        }
+    }
+
+    #[test]
+    fn test_parse_find_mode_fuzzy_is_noop_default() {
+        let args = vec!["--mode".into(), "fuzzy".into(), "Patient".into()];
+        let result = parse_find_command(&args).unwrap();
+        if let Command::Find(opts) = result {
+            assert!(!opts.literal && !opts.regex && !opts.where_symbol);
+            assert_eq!(opts.queries, vec!["Patient".to_string()]);
+        } else {
+            panic!("Expected Find command");
+        }
+    }
+
+    #[test]
+    fn test_parse_find_mode_similar_needs_target() {
+        let args = vec!["--mode".into(), "similar".into()];
+        let err = parse_find_command(&args).unwrap_err();
+        assert!(
+            err.contains("--similar"),
+            "expected redirect to --similar, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_find_mode_unknown_lists_valid_modes() {
+        let args = vec!["--mode".into(), "bogus".into()];
+        let err = parse_find_command(&args).unwrap_err();
+        assert!(
+            err.contains("where-symbol"),
+            "should list valid modes: {err}"
+        );
+        assert!(
+            err.contains("query where-symbol"),
+            "should point at `loct query where-symbol`: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_find_mode_missing_value_errors() {
+        let args = vec!["--mode".into()];
+        let err = parse_find_command(&args).unwrap_err();
+        assert!(err.contains("--mode requires a value"), "got: {err}");
+    }
+
+    // Friendly unknown-option error redirects the common docs-drift flags
+    // (loctree-feedback.md: `--format markdown`, `--group-by`, ...) instead of the
+    // bare generic message.
+    #[test]
+    fn test_parse_find_unknown_format_flag_redirects_to_json() {
+        let args = vec!["--format".into(), "markdown".into(), "Foo".into()];
+        let err = parse_find_command(&args).unwrap_err();
+        assert!(
+            err.contains("--json"),
+            "should redirect --format to --json: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_find_unknown_option_lists_modes() {
+        let args = vec!["--frobnicate".into()];
+        let err = parse_find_command(&args).unwrap_err();
+        assert!(
+            err.contains("--where-symbol"),
+            "generic error should list modes: {err}"
+        );
+        assert!(
+            err.contains("loct find --help"),
+            "should point at help: {err}"
         );
     }
 

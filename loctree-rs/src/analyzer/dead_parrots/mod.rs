@@ -1,6 +1,6 @@
 //! Dead Parrots Module - Janitor tools for code analysis and cleanup
 //!
-//! Named after the Monty Python sketch and the Vista project's "Dead Parrot Protocol"
+//! Named after the Monty Python sketch and the example-app project's "Dead Parrot Protocol"
 //! for identifying unused/dead code that "just resting" but is actually dead.
 //!
 //! This module contains:
@@ -2346,20 +2346,20 @@ mod tests {
 
     #[test]
     fn test_react_lazy_with_subdirectory_resolved_path() {
-        // Vista pattern: lazy(() => import('./features/patient/PasswordResetModal').then(...))
+        // example-app pattern: lazy(() => import('./features/settings/PasswordResetModal').then(...))
         // Component is in a subdirectory, import uses resolved_path via ImportKind::Dynamic
         let mut importer = mock_file("src/App.tsx");
         // Add dynamic import via ImportEntry with resolved_path (like real AST produces)
         let mut dyn_import = ImportEntry::new(
-            "./features/patient/PasswordResetModal".to_string(),
+            "./features/settings/PasswordResetModal".to_string(),
             ImportKind::Dynamic,
         );
-        dyn_import.resolved_path = Some("src/features/patient/PasswordResetModal.tsx".to_string());
+        dyn_import.resolved_path = Some("src/features/settings/PasswordResetModal.tsx".to_string());
         importer.imports.push(dyn_import);
         // Also add to dynamic_imports for backward compat
-        importer.dynamic_imports = vec!["./features/patient/PasswordResetModal".to_string()];
+        importer.dynamic_imports = vec!["./features/settings/PasswordResetModal".to_string()];
 
-        let mut exporter = mock_file("src/features/patient/PasswordResetModal.tsx");
+        let mut exporter = mock_file("src/features/settings/PasswordResetModal.tsx");
         exporter.exports = vec![ExportSymbol {
             name: "PasswordResetModal".to_string(),
             kind: "function".to_string(),
@@ -2385,7 +2385,7 @@ mod tests {
 
     #[test]
     fn test_react_lazy_named_export_via_then_pattern() {
-        // Vista pattern: lazy(() => import('./X').then((m) => ({ default: m.ComponentName })))
+        // example-app pattern: lazy(() => import('./X').then((m) => ({ default: m.ComponentName })))
         // This extracts a NAMED export and re-wraps it as default for React.lazy()
         // The file has NAMED export (not default), but it's still used via dynamic import
         let mut importer = mock_file("src/App.tsx");
