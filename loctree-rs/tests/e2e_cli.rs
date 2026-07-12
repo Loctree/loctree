@@ -121,6 +121,44 @@ mod cli_basics {
     }
 
     #[test]
+    fn unknown_top_level_subcommand_does_not_fall_through_to_path() {
+        loct()
+            .args(["blame", "--help"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unknown subcommand 'blame'"))
+            .stderr(predicate::str::contains("did you mean 'plan'?"))
+            .stderr(predicate::str::contains("Commands include:"))
+            .stderr(predicate::str::contains("Path 'blame'").not());
+    }
+
+    #[test]
+    fn unknown_top_level_subcommand_typo_suggests_real_command() {
+        loct()
+            .args(["contezt", "--help"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(
+                "unknown subcommand 'contezt', did you mean 'context'?",
+            ));
+    }
+
+    #[test]
+    fn existing_path_named_like_unknown_command_still_uses_path_flow() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("blame")).unwrap();
+
+        loct()
+            .current_dir(temp.path())
+            .args(["blame", "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Static Analysis for AI Agents"))
+            .stderr(predicate::str::contains("unknown subcommand").not())
+            .stderr(predicate::str::contains("Path 'blame'").not());
+    }
+
+    #[test]
     fn full_help_has_no_duplicate_command_table_lines_or_stale_timings() {
         let output = loct()
             .arg("--help-full")
@@ -4291,7 +4329,10 @@ mod management_commands {
             "report must start with DOCTYPE, got first chars: {:?}",
             html.chars().take(40).collect::<String>()
         );
-        assert!(html.contains("Loctree Report"), "missing report title");
+        assert!(
+            html.contains("Loctree Report"),
+            "missing Vista report title"
+        );
         assert!(
             html.contains(env!("CARGO_PKG_VERSION")),
             "missing loctree binary version ({}) in rendered provenance chip",
@@ -5435,13 +5476,13 @@ mod env_truth {
         assert!(stdout.contains("sha256:"));
     }
 
-    /// W2-c: default report stays small even on a codescribe-like surface
+    /// W2-c: default report stays small even on a CodeScribe-like surface
     /// (the 2026-line wall regression).
     #[test]
     fn default_report_is_bounded_under_200_lines() {
         let temp = TempDir::new().unwrap();
         stage_env_drift(&temp, 30, 2);
-        // Add a codescribe-like pile of one-off declarations to fatten the
+        // Add a CodeScribe-like pile of one-off declarations to fatten the
         // would-be full dump.
         let mut extra = String::new();
         for i in 0..120 {
@@ -5665,7 +5706,7 @@ mod env_truth {
 mod occurrences_cli {
     use super::*;
 
-    /// W1-A regression — the codescribe `utterance_id` failure class.
+    /// W1-A regression — the CodeScribe `utterance_id` failure class.
     ///
     /// `loct occurrences <ident>` must find LOCAL-variable occurrences buried
     /// inside a large function — exactly the case `find`/`tagmap` missed (they
@@ -6084,6 +6125,133 @@ mod occurrences_cli {
                     .contains("without treating suggestions as evidence")),
             "zero literal results must suggest broadening without pretending suggestions are evidence"
         );
+        assert!(
+            json.get("near_matches")
+                .and_then(Value::as_array)
+                .is_none_or(|near| near.is_empty()),
+            "unrelated zero-hit query must not invent near matches: {json}"
+        );
+    }
+
+    #[test]
+    fn occurrences_zero_results_suggest_prefix_matches_from_symbol_table() {
+        let temp = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub struct MissingSymbolExtra;\n\
+             pub fn MissingSymbolFactory() {}\n\
+             fn helper_for_MissingSymbol() {}\n\
+             pub fn unrelated() {}\n",
+        )
+        .unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["add", "."]);
+
+        let output = loctree()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["occurrences", "MissingSymbol", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value =
+            serde_json::from_slice(&output).expect("occurrences --json must be valid JSON");
+        assert_eq!(json["total"], 0, "prefix-only symbols are not exact hits");
+
+        let near = json["near_matches"]
+            .as_array()
+            .expect("zero-hit result should carry near_matches when symbol-table names are close");
+        let symbols: Vec<&str> = near.iter().filter_map(|m| m["symbol"].as_str()).collect();
+        assert!(
+            symbols.contains(&"MissingSymbolExtra")
+                && symbols.contains(&"MissingSymbolFactory")
+                && symbols.contains(&"helper_for_MissingSymbol"),
+            "expected prefix/substring symbol hints, got {json}"
+        );
+        assert!(
+            near.iter().all(|m| m["source"] == "symbol_table"
+                && (m["match_kind"] == "prefix" || m["match_kind"] == "substring")),
+            "near matches must be separate symbol-table hints, not literal evidence: {json}"
+        );
+    }
+
+    #[test]
+    fn occurrences_zero_results_suggest_fuzzy_symbol_table_matches() {
+        let temp = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn handle_follow_command() {}\n",
+        )
+        .unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["add", "."]);
+        let typo = ["handle_folow", "command"].join("_");
+
+        let output = loctree()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["occurrences", typo.as_str(), "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+
+        let json: Value =
+            serde_json::from_slice(&output).expect("occurrences --json must be valid JSON");
+        assert_eq!(json["total"], 0, "typo hints are not literal hits");
+
+        let near = json["near_matches"]
+            .as_array()
+            .expect("zero-hit typo should carry near_matches from the symbol table");
+        assert!(
+            near.iter().any(|m| m["symbol"] == "handle_follow_command"
+                && m["match_kind"] == "fuzzy"
+                && m["source"] == "symbol_table"),
+            "expected fuzzy symbol-table hint, got {json}"
+        );
+    }
+
+    #[test]
+    fn occurrences_compact_output_is_path_line_context_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("src/lib.rs"),
+            "pub fn target_ident() {}\npub fn call() { target_ident(); }\n",
+        )
+        .unwrap();
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["add", "."]);
+
+        let output = loctree()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["occurrences", "target_ident", "--compact"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let stdout = String::from_utf8(output).expect("compact output is utf8");
+
+        assert_eq!(
+            stdout,
+            "src/lib.rs:1 pub fn target_ident() {}\n\
+             src/lib.rs:2 pub fn call() { target_ident(); }\n",
+            "compact output must stay a terse path:line plus one context line snapshot"
+        );
     }
 
     #[test]
@@ -6234,6 +6402,95 @@ mod occurrences_cli {
             human_find_str.contains("scanned 3 of 3 repo files; artifact-flagged: generated(1)")
         );
     }
+
+    #[test]
+    fn occurrences_scans_extensionless_text_files_and_excludes_binary() {
+        let temp = TempDir::new().expect("temp project");
+        let cache = TempDir::new().expect("cache dir");
+        let root = temp.path();
+
+        std::fs::create_dir_all(root.join("bin")).expect("create bin dir");
+        std::fs::write(
+            root.join("LICENSE"),
+            "LOCTREE_EXTENSIONLESS_LICENSE_TOKEN grants literal truth.\n",
+        )
+        .expect("write LICENSE");
+        std::fs::write(
+            root.join("bin/bootstrap"),
+            "#!/usr/bin/env bash\necho LOCTREE_EXTENSIONLESS_SCRIPT_TOKEN\n",
+        )
+        .expect("write bootstrap");
+        std::fs::write(
+            root.join("extensionless-binary"),
+            b"LOCTREE_EXTENSIONLESS_BINARY_TOKEN\0still binary",
+        )
+        .expect("write binary fixture");
+
+        run_git(root, &["init"]);
+        run_git(root, &["add", "."]);
+
+        let license_output = loctree()
+            .current_dir(root)
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args([
+                "occurrences",
+                "LOCTREE_EXTENSIONLESS_LICENSE_TOKEN",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let license_json: Value =
+            serde_json::from_slice(&license_output).expect("license occurrences json");
+        assert_eq!(license_json["total"], 1);
+        let license_hits = license_json["occurrences"]
+            .as_array()
+            .expect("license occurrence list");
+        assert_eq!(license_hits[0]["file"], "LICENSE");
+
+        let script_output = loctree()
+            .current_dir(root)
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args([
+                "occurrences",
+                "LOCTREE_EXTENSIONLESS_SCRIPT_TOKEN",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let script_json: Value =
+            serde_json::from_slice(&script_output).expect("script occurrences json");
+        assert_eq!(script_json["total"], 1);
+        let script_hits = script_json["occurrences"]
+            .as_array()
+            .expect("script occurrence list");
+        assert_eq!(script_hits[0]["file"], "bin/bootstrap");
+
+        let binary_output = loctree()
+            .current_dir(root)
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args([
+                "occurrences",
+                "LOCTREE_EXTENSIONLESS_BINARY_TOKEN",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let binary_json: Value =
+            serde_json::from_slice(&binary_output).expect("binary occurrences json");
+        assert_eq!(
+            binary_json["total"], 0,
+            "NUL-bearing extensionless binary must not enter literal scan universe"
+        );
+    }
 }
 
 // ============================================
@@ -6247,7 +6504,7 @@ mod find_literal_cli {
     /// `loct find --literal <ident> --json` must return a `literal_matches`
     /// section whose occurrences are byte-for-byte the same lines `loct
     /// occurrences` surfaces — every result tagged `source: "literal"`, and the
-    /// buried-local codescribe lines (`let mut utterance_id`, `utterance_id += 1`)
+    /// buried-local CodeScribe lines (`let mut utterance_id`, `utterance_id += 1`)
     /// present. This is the W1-B acceptance: when the mode says literal, the
     /// answer is literal.
     #[test]
@@ -6652,7 +6909,7 @@ mod occurrences_quality_cli {
     }
 
     /// `--whole-token` tightens the boundary so `backdrop` stops matching inside
-    /// hyphenated neighbors (`--sample-z-overlay-backdrop`, `backdrop-filter`),
+    /// hyphenated neighbors (`--vista-z-overlay-backdrop`, `backdrop-filter`),
     /// cutting the z-index noise — while the default boundary is unchanged.
     #[test]
     fn whole_token_cuts_hyphenated_noise() {
@@ -6670,7 +6927,7 @@ mod occurrences_quality_cli {
         assert!(
             tight_occ.iter().all(|o| {
                 let ctx = o["context"].as_str().unwrap_or("");
-                !ctx.contains("--sample-z-overlay-backdrop")
+                !ctx.contains("--vista-z-overlay-backdrop")
             }) || tight_occ.iter().all(|o| o["matched_text"] == "backdrop"),
             "whole_token must not surface a hit *inside* the hyphenated custom property"
         );
@@ -6679,9 +6936,9 @@ mod occurrences_quality_cli {
             !tight_occ.iter().any(|o| o["context"]
                 .as_str()
                 .unwrap_or("")
-                .contains("--sample-z-overlay-backdrop")
+                .contains("--vista-z-overlay-backdrop")
                 && o["occurrence_kind"] == "custom_property"),
-            "the `--sample-z-overlay-backdrop` noise hit must be gone under whole_token"
+            "the `--vista-z-overlay-backdrop` noise hit must be gone under whole_token"
         );
     }
 
@@ -6752,7 +7009,7 @@ mod occurrences_quality_cli {
         fs::create_dir_all(&subdir).unwrap();
         fs::write(
             subdir.join("styles.css"),
-            "/* backdrop */\n.backdrop { --sample-z-overlay-backdrop: 40; }\n",
+            "/* backdrop */\n.backdrop { --vista-z-overlay-backdrop: 40; }\n",
         )
         .unwrap();
         fs::write(
@@ -7408,7 +7665,7 @@ mod dead_truth {
         );
     }
 
-    /// Empiria: example-app lazy-import `import('./Steps').then((m) => m.InviteTeamStep)`
+    /// Empiria: Vista lazy-import `import('./Steps').then((m) => m.InviteTeamStep)`
     /// — the named export consumed only through the dynamic-import member
     /// access must not be dead.
     #[test]
@@ -7424,7 +7681,7 @@ mod dead_truth {
         );
     }
 
-    /// Empiria: codescribe stt-bridge — runtime entry files spawned only by
+    /// Empiria: CodeScribe stt-bridge — runtime entry files spawned only by
     /// string. The fixture carries BOTH a Cargo [[bin]]
     /// (`src/bin/stt_bridge.rs`) and a package.json bin
     /// (`daemon/voice_daemon.js`, spawned via `spawn('voice-daemon')`).

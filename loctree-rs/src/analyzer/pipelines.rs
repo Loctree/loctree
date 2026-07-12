@@ -590,9 +590,9 @@ mod tests {
         // FE file with matching emit/listen
         let mut fe = FileAnalysis::new("src/frontend.ts".into());
         fe.event_emits
-            .push(mk_event("sample://ok", 10, "emit_literal", false));
+            .push(mk_event("vista://ok", 10, "emit_literal", false));
         fe.event_listens
-            .push(mk_event("sample://ok", 5, "listen_literal", true));
+            .push(mk_event("vista://ok", 5, "listen_literal", true));
         fe.command_calls.push(CommandRef {
             name: "unified_ai_chat".into(),
             exposed_name: None,
@@ -605,7 +605,7 @@ mod tests {
         // BE file emitting ghost event and handling command
         let mut be = FileAnalysis::new("src/backend.rs".into());
         be.event_emits
-            .push(mk_event("sample://ghost", 20, "emit_literal", false));
+            .push(mk_event("vista://ghost", 20, "emit_literal", false));
         be.command_handlers.push(CommandRef {
             name: "unified_ai_chat".into(),
             exposed_name: None,
@@ -626,7 +626,7 @@ mod tests {
             plugin_name: None,
         });
         racy.event_listens
-            .push(mk_event("sample://racy", 10, "listen_literal", false));
+            .push(mk_event("vista://racy", 10, "listen_literal", false));
 
         let analyses = vec![fe, be, racy];
         let summary = build_pipeline_summary(
@@ -645,12 +645,12 @@ mod tests {
         let ghost = events["ghostEmits"]
             .as_array()
             .expect("ghostEmits array present");
-        assert!(ghost.iter().any(|g| g["name"] == "sample://ghost"));
+        assert!(ghost.iter().any(|g| g["name"] == "vista://ghost"));
 
         let orphans = events["orphanListeners"]
             .as_array()
             .expect("orphanListeners array present");
-        assert!(orphans.iter().any(|o| o["name"] == "sample://racy"));
+        assert!(orphans.iter().any(|o| o["name"] == "vista://racy"));
 
         let chains = summary["commands"]["chains"]
             .as_array()

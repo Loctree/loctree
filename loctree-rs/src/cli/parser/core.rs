@@ -14,7 +14,10 @@ use super::context_commands::{
     parse_context_command, parse_coverage_command, parse_focus_command, parse_follow_command,
     parse_hotspots_command, parse_repo_view_command, parse_slice_command, parse_trace_command,
 };
-use super::helpers::{SUBCOMMANDS, is_jq_filter, parse_color_mode, suggest_similar_command};
+use super::helpers::{
+    SUBCOMMANDS, format_unknown_subcommand_error, is_jq_filter, parse_color_mode,
+    should_treat_unknown_as_subcommand,
+};
 use super::misc_commands::{
     parse_audit_command, parse_cache_command, parse_crowd_command, parse_dist_command,
     parse_doctor_command, parse_env_truth_command, parse_health_command, parse_help_command,
@@ -96,7 +99,8 @@ pub fn uses_new_syntax(args: &[String]) -> bool {
         }
         return SUBCOMMANDS.contains(&arg.as_str())
             || Command::retired_command_message(arg).is_some()
-            || is_jq_filter(arg);
+            || is_jq_filter(arg)
+            || should_treat_unknown_as_subcommand(args, arg);
     }
     // No arguments = default to auto (new syntax)
     true
@@ -124,6 +128,7 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
     let mut help_requested = false;
     let mut legacy_findings_alias = false;
     let mut legacy_summary_only = false;
+    let mut unknown_subcommand: Option<String> = None;
 
     // Check for jq-style query before extracting global options
     // This allows: loct '.metadata' to work without conflicts
@@ -284,6 +289,11 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
                         || Command::retired_command_message(arg).is_some())
                 {
                     subcommand = Some(arg.clone());
+                } else if subcommand.is_none()
+                    && !legacy_findings_alias
+                    && should_treat_unknown_as_subcommand(args, arg)
+                {
+                    unknown_subcommand = Some(arg.clone());
                 } else {
                     remaining_args.push(arg.clone());
                 }
@@ -301,6 +311,10 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
             "`--findings` and bare `--summary` are no longer global output flags. Use `loct findings` or `loct findings --summary`."
                 .to_string(),
         );
+    }
+
+    if let Some(unknown) = unknown_subcommand {
+        return Err(format_unknown_subcommand_error(&unknown));
     }
 
     if help_requested {
@@ -420,15 +434,7 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
         Some("plan") | Some("p") => parse_plan_command(&remaining_args)?,
         Some("cache") => parse_cache_command(&remaining_args)?,
         Some("prune-old-artifacts") => parse_prune_old_artifacts_command(&remaining_args)?,
-        Some(unknown) => {
-            // Try to find a similar command using fuzzy matching
-            let suggestion = suggest_similar_command(unknown);
-            return Err(format!(
-                "Unknown command '{}'. {}Run 'loct --help' for available commands.",
-                unknown,
-                suggestion.map_or(String::new(), |s| format!("Did you mean: {}?\n", s))
-            ));
-        }
+        Some(unknown) => return Err(format_unknown_subcommand_error(unknown)),
     };
 
     if for_ai_alias {
@@ -751,6 +757,48 @@ mod tests {
         let args = vec!["--tree".into()];
         let result = parse_command(&args).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_unknown_bare_token_with_help_errors_as_subcommand() {
+        let args = vec!["blame".into(), "--help".into()];
+        let err = parse_command(&args).unwrap_err();
+        assert!(
+            err.contains("unknown subcommand 'blame'"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("did you mean 'plan'?"),
+            "unknown subcommand should include a suggestion: {err}"
+        );
+        assert!(
+            err.contains("Commands include:"),
+            "error should include a short command list: {err}"
+        );
+        assert!(
+            !err.contains("Path 'blame'"),
+            "unknown subcommand must not fall through to path validation: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_subcommand_typo_suggests_real_command() {
+        let args = vec!["contezt".into()];
+        let err = parse_command(&args).unwrap_err();
+        assert!(
+            err.contains("unknown subcommand 'contezt', did you mean 'context'?"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_existing_path_positional_still_falls_back_to_legacy_parser() {
+        let args = vec!["Cargo.toml".into(), "--help".into()];
+        let result = parse_command(&args).unwrap();
+        assert!(
+            result.is_none(),
+            "existing paths must keep legacy positional behavior"
+        );
     }
 
     #[test]

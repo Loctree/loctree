@@ -291,19 +291,19 @@ fn annotate_scope(entries: &mut Vec<CacheEntry>, requested_root: Option<&Path>) 
         entry.scope_state = Some(state);
     }
 
-    if entries.is_empty() {
-        if let Some(project_root) = requested_root {
-            entries.push(CacheEntry {
-                project_id: project_id_for(project_root),
-                canonical_root: Some(project_root.display().to_string()),
-                last_scan_branch: None,
-                last_scan_commit: None,
-                last_scan_mtime: None,
-                cache_size_bytes: None,
-                scope_state: Some(ScopeState::NotFound),
-                fix_command: Some(format!("loct scan --project {}", project_root.display())),
-            });
-        }
+    if entries.is_empty()
+        && let Some(project_root) = requested_root
+    {
+        entries.push(CacheEntry {
+            project_id: project_id_for(project_root),
+            canonical_root: Some(project_root.display().to_string()),
+            last_scan_branch: None,
+            last_scan_commit: None,
+            last_scan_mtime: None,
+            cache_size_bytes: None,
+            scope_state: Some(ScopeState::NotFound),
+            fix_command: Some(format!("loct scan --project {}", project_root.display())),
+        });
     }
 }
 
@@ -532,10 +532,10 @@ fn enumerate_cache_entries(target_id: Option<&str>) -> Result<Vec<CacheEntry>> {
         }
 
         let project_id = project_entry.file_name().to_string_lossy().to_string();
-        if let Some(wanted) = target_id {
-            if project_id != wanted {
-                continue;
-            }
+        if let Some(wanted) = target_id
+            && project_id != wanted
+        {
+            continue;
         }
 
         // From here on every path is derived from the iterator's own
@@ -549,20 +549,20 @@ fn enumerate_cache_entries(target_id: Option<&str>) -> Result<Vec<CacheEntry>> {
             project_dir.join("latest").join("snapshot.json"),
             project_dir.join("snapshot.json"),
         ] {
-            if let Ok(metadata) = fs::metadata(&fixed_path) {
-                if metadata.is_file() {
-                    if let Ok(modified) = metadata.modified() {
-                        candidates.push((fixed_path, modified));
-                        continue;
-                    }
-                    return Err(anyhow::anyhow!(
-                        "read mtime for cache project {project_id} snapshot {}",
-                        candidates
-                            .last()
-                            .map(|(p, _)| p.display().to_string())
-                            .unwrap_or_default()
-                    ));
+            if let Ok(metadata) = fs::metadata(&fixed_path)
+                && metadata.is_file()
+            {
+                if let Ok(modified) = metadata.modified() {
+                    candidates.push((fixed_path, modified));
+                    continue;
                 }
+                return Err(anyhow::anyhow!(
+                    "read mtime for cache project {project_id} snapshot {}",
+                    candidates
+                        .last()
+                        .map(|(p, _)| p.display().to_string())
+                        .unwrap_or_default()
+                ));
             }
         }
 
@@ -591,12 +591,11 @@ fn enumerate_cache_entries(target_id: Option<&str>) -> Result<Vec<CacheEntry>> {
                     continue;
                 }
                 let candidate_path = child.path().join("snapshot.json");
-                if let Ok(metadata) = fs::metadata(&candidate_path) {
-                    if metadata.is_file() {
-                        if let Ok(modified) = metadata.modified() {
-                            candidates.push((candidate_path, modified));
-                        }
-                    }
+                if let Ok(metadata) = fs::metadata(&candidate_path)
+                    && metadata.is_file()
+                    && let Ok(modified) = metadata.modified()
+                {
+                    candidates.push((candidate_path, modified));
                 }
             }
         }

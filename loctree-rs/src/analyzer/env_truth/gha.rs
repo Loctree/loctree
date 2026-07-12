@@ -181,7 +181,7 @@ fn walk_strings<F: FnMut(&str)>(value: &Value, f: &mut F) {
 /// not attempt to track `GITHUB_ENV` / `$GITHUB_OUTPUT` propagation across
 /// steps — that is out of scope and architectural.
 ///
-/// W2-c assignment-scope predicate (example-app CI-vars regression): a `$VAR`
+/// W2-c assignment-scope predicate (Vista CI-vars regression): a `$VAR`
 /// reference counts as a read ONLY when no `run:` block in the same workflow
 /// assigns `VAR=` itself and VAR is not a runner-provided builtin
 /// (`GITHUB_*`, `RUNNER_*`, `CI`, ...). `BASE_REF="${1:-main}"` followed by
@@ -213,7 +213,7 @@ pub fn parse_workflow_shell_reads(path: &Path, root: &Path) -> Vec<(String, EnvR
 
     // Pass 1: collect shell-local assignments across every `run:` block in
     // the file (steps share a workflow file even if not a process — file
-    // scope keeps the predicate simple and kills the example-app false positives).
+    // scope keeps the predicate simple and kills the Vista false positives).
     let mut assigned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for_each_run_block(jobs, &mut |run| {
         let cleaned = strip_gha_expressions(run);
@@ -417,7 +417,7 @@ jobs:
         );
     }
 
-    /// W2-c regression (example-app CI-vars): `BASE_REF` assigned inside the same
+    /// W2-c regression (Vista CI-vars): `BASE_REF` assigned inside the same
     /// workflow's `run:` block must not count as an env read, and runner
     /// builtins (`GITHUB_ENV`, `GITHUB_OUTPUT`, `RUNNER_OS`, `CI`) are
     /// never reads regardless of declarations.

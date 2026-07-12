@@ -166,16 +166,16 @@ fn swift_hits(file: &str, source: &str) -> Vec<RuntimeHit> {
             continue;
         }
         let window = call_window(source, idx, 6);
-        if window.contains("NotificationCenter") || window.contains("name:") {
-            if let Some(name) = extract_argument_name(window, &["name:"]) {
-                hits.push(RuntimeHit {
-                    line: line_number(source, idx),
-                    name,
-                    edge_kind: SymbolEdgeKind::NotificationEmit,
-                    source_kind: "notification_emit_site",
-                    target_kind: "notification",
-                });
-            }
+        if (window.contains("NotificationCenter") || window.contains("name:"))
+            && let Some(name) = extract_argument_name(window, &["name:"])
+        {
+            hits.push(RuntimeHit {
+                line: line_number(source, idx),
+                name,
+                edge_kind: SymbolEdgeKind::NotificationEmit,
+                source_kind: "notification_emit_site",
+                target_kind: "notification",
+            });
         }
     }
     for (idx, _) in source.match_indices("addObserver") {

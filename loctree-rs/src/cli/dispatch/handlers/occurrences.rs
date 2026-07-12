@@ -3,15 +3,16 @@
 //! Loads (or creates) the snapshot, enumerates its files, reads each file's
 //! raw bytes, and reports every literal occurrence of the queried text.
 //! Identifier-like queries stay token-boundary aware; phrase/punctuation queries
-//! behave as fixed strings. No AST. No fuzz. "Not found" means not found.
+//! behave as fixed strings. Primary matches are never AST/fuzzy hits. Zero-hit
+//! output may add separate symbol-table near-match hints, never evidence.
 
 use std::path::{Path, PathBuf};
 
 use super::super::super::command::{FindOptions, OccurrencesOptions};
 use super::super::{DispatchResult, GlobalOptions, load_or_create_query_snapshot_for_roots};
 use crate::analyzer::occurrences::{
-    FileScope, OccurrenceResults, ReportOptions, ScanOptions, enrich_with_snapshot,
-    scan_files_with, scan_files_with_regex, scan_files_with_scope,
+    FileScope, OccurrenceResults, ReportOptions, ScanOptions, attach_near_matches,
+    enrich_with_snapshot, scan_files_with, scan_files_with_regex, scan_files_with_scope,
 };
 use crate::analyzer::search::{FuzzySuggestion, literal_fuzzy_suggestions};
 use crate::snapshot::Snapshot;
@@ -50,6 +51,7 @@ pub fn handle_occurrences_command(
         },
     );
     enrich_with_snapshot(&mut results, &snapshot);
+    attach_near_matches(&mut results, &snapshot.files);
     results.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
         count_only: opts.count_only,
@@ -66,7 +68,7 @@ pub fn handle_occurrences_command(
             }
         }
     } else {
-        print_human(&results);
+        print_human(&results, opts.compact);
     }
 
     DispatchResult::Exit(0)
@@ -122,6 +124,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
         },
     );
     enrich_with_snapshot(&mut literal_matches, &snapshot);
+    attach_near_matches(&mut literal_matches, &snapshot.files);
     literal_matches.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
         count_only: opts.count_only,
@@ -359,7 +362,11 @@ fn resolve_path(base: &Path, rel: &str) -> PathBuf {
     joined
 }
 
-fn print_human(results: &OccurrenceResults) {
+fn print_human(results: &OccurrenceResults, compact: bool) {
+    if compact {
+        print_compact(results);
+        return;
+    }
     println!(
         "Literal occurrences of '{}' ({} in {} file(s)) [source: {}]",
         results.query, results.total, results.files_matched, results.source
@@ -368,7 +375,7 @@ fn print_human(results: &OccurrenceResults) {
         println!("  {}", results.coverage_line);
     }
     if results.total == 0 {
-        println!("  (not found)");
+        print_no_exact_occurrences(results, "  ");
         print_suggested_next(results);
         return;
     }
@@ -400,6 +407,37 @@ fn print_human(results: &OccurrenceResults) {
         );
     }
     print_suggested_next(results);
+}
+
+fn print_compact(results: &OccurrenceResults) {
+    if results.total == 0 {
+        print_no_exact_occurrences(results, "");
+        return;
+    }
+    if results.slim {
+        println!("occurrence list suppressed; total={}", results.total);
+        return;
+    }
+    for occ in &results.occurrences {
+        println!("{}:{} {}", occ.file, occ.line, occ.context);
+    }
+}
+
+fn print_no_exact_occurrences(results: &OccurrenceResults, indent: &str) {
+    if results.near_matches.is_empty() {
+        println!("{}no exact occurrences of '{}'", indent, results.query);
+        return;
+    }
+    let symbols = results
+        .near_matches
+        .iter()
+        .map(|m| m.symbol.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!(
+        "{}no exact occurrences of '{}'; near-matches: {}",
+        indent, results.query, symbols
+    );
 }
 
 /// Render the per-file occurrence rollup, when `group_by_file` populated it.

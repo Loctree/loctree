@@ -467,10 +467,14 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
         None
     };
     let dispatch_ext = shebang_ext.unwrap_or(ext.as_str());
+    let is_plain_extensionless_text =
+        ext.is_empty() && !is_makefile && !is_loctree_config && shebang_ext.is_none();
 
     let mut analysis = if is_loctree_config {
         FileAnalysis::new(relative.clone())
-    } else if is_scan_only_resource_extension(dispatch_ext) && resource_kind(&relative).is_some() {
+    } else if is_plain_extensionless_text
+        || (is_scan_only_resource_extension(dispatch_ext) && resource_kind(&relative).is_some())
+    {
         FileAnalysis::new(relative)
     } else if is_makefile || dispatch_ext == "mk" || dispatch_ext == "make" {
         analyze_makefile(&content, relative)

@@ -888,12 +888,11 @@ fn find_cycles_normalized(edges: &[(String, String)]) -> Vec<Vec<String>> {
             if scc.len() > 1 {
                 return true;
             }
-            if scc.len() == 1 {
-                if let Some(node) = scc.first() {
-                    if let Some(neighbors) = adj.get(node) {
-                        return neighbors.contains(node);
-                    }
-                }
+            if scc.len() == 1
+                && let Some(node) = scc.first()
+                && let Some(neighbors) = adj.get(node)
+            {
+                return neighbors.contains(node);
             }
             false
         })

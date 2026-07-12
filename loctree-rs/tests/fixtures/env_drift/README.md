@@ -1,6 +1,6 @@
 # env_drift fixture (Cut 8 / Lane 4)
 
-Synthesises the example-app April-2026 incident pattern.
+Synthesises the Vista April-2026 incident pattern.
 
 - `.env` — fresh local credentials (operator just rotated `DATABASE_URL`).
 - `k8s/sealed-secret.yaml` — production SealedSecret with **stale** ciphertext

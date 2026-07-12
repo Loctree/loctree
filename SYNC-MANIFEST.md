@@ -1,10 +1,10 @@
 # Component Sync Manifest
 
 - Component: `engine`
-- Version: `0.13.0`
+- Version: `0.13.1`
 - Target repo: `Loctree/loctree`
-- Source commit: `a38afb8aba01`
-- Generated at: `2026-07-08T21:47:10Z`
+- Source commit: `53cf52c1728b`
+- Generated at: `2026-07-12T05:17:28Z`
 - Push mode: `disabled`
 - Dependency mode: `crates.io registry`
 

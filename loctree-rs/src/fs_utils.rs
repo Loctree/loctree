@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -516,7 +516,7 @@ fn matchers_exclude(matchers: &IgnoreMatchers, abs_path: &Path) -> bool {
 /// not loctignore-excluded. This lets callers (focus / slice) distinguish
 /// "wrong path — check it" from "right path, but parked outside the snapshot by
 /// .loctignore", instead of misleadingly telling the user to check a path that
-/// is in fact correct (loctree-feedback.md: example-app `docs/` excluded by .loctignore).
+/// is in fact correct (loctree-feedback.md: vista `docs/` excluded by .loctignore).
 pub fn loctignore_exclusion_hint(root: &Path, target: &str) -> Option<String> {
     let abs = root.join(target);
     if !abs.exists() {
@@ -599,22 +599,21 @@ pub fn matches_extension(
             {
                 return true;
             }
-            if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
-                if set.contains(&ext.to_lowercase()) {
-                    return true;
-                }
+            if let Some(ext) = path.extension().and_then(|ext| ext.to_str())
+                && set.contains(&ext.to_lowercase())
+            {
+                return true;
             }
             // Filename-based match for extensionless files (Makefile family)
             // — only when the allowed set actually opted into make parsing.
-            if set.contains("mk") || set.contains("make") {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if matches!(
-                        filename,
-                        "Makefile" | "makefile" | "GNUmakefile" | "BSDmakefile"
-                    ) {
-                        return true;
-                    }
-                }
+            if (set.contains("mk") || set.contains("make"))
+                && let Some(filename) = path.file_name().and_then(|n| n.to_str())
+                && matches!(
+                    filename,
+                    "Makefile" | "makefile" | "GNUmakefile" | "BSDmakefile"
+                )
+            {
+                return true;
             }
             false
         }
@@ -712,13 +711,13 @@ pub fn matches_extensionless_source_shebang(
         return false;
     }
     // Skip the Makefile-family names we already classify as `make` above.
-    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-        if matches!(
+    if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+        && matches!(
             filename,
             "Makefile" | "makefile" | "GNUmakefile" | "BSDmakefile"
-        ) {
-            return false;
-        }
+        )
+    {
+        return false;
     }
     let Ok(file) = File::open(path) else {
         return false;
@@ -733,6 +732,32 @@ pub fn matches_extensionless_source_shebang(
         .is_some_and(|ext| extension_set_accepts_shebang_source(ext, extensions))
 }
 
+const EXTENSIONLESS_TEXT_SNIFF_BYTES: usize = 512;
+
+/// Generic fallback for extensionless text that should participate in literal
+/// truth surfaces (LICENSE, Dockerfile, CODEOWNERS, extensionless scripts).
+/// Reads only a small prefix and accepts files whose prefix contains no NUL.
+pub fn matches_extensionless_text(path: &Path) -> bool {
+    if path.extension().is_some() {
+        return false;
+    }
+    if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+        && filename.starts_with('.')
+        && !is_hidden_truth_config_filename(filename)
+    {
+        return false;
+    }
+
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0u8; EXTENSIONLESS_TEXT_SNIFF_BYTES];
+    let Ok(read) = file.read(&mut buffer) else {
+        return false;
+    };
+    !buffer[..read].contains(&0)
+}
+
 pub fn matches_extensionless_shell(
     path: &Path,
     extensions: Option<&std::collections::HashSet<String>>,
@@ -743,13 +768,13 @@ pub fn matches_extensionless_shell(
     if path.extension().is_some() {
         return false;
     }
-    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-        if matches!(
+    if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+        && matches!(
             filename,
             "Makefile" | "makefile" | "GNUmakefile" | "BSDmakefile"
-        ) {
-            return false;
-        }
+        )
+    {
+        return false;
     }
     let Ok(file) = File::open(path) else {
         return false;
@@ -969,7 +994,8 @@ fn gather_files_inner(
                 )?;
             } else if meta.is_file()
                 && (matches_extension(&target, options.extensions.as_ref())
-                    || matches_extensionless_source_shebang(&target, options.extensions.as_ref()))
+                    || matches_extensionless_source_shebang(&target, options.extensions.as_ref())
+                    || matches_extensionless_text(&target))
             {
                 files.push(target);
             }
@@ -980,6 +1006,7 @@ fn gather_files_inner(
             let canonical = path.canonicalize().unwrap_or(path.clone());
             if matches_extension(&canonical, options.extensions.as_ref())
                 || matches_extensionless_source_shebang(&canonical, options.extensions.as_ref())
+                || matches_extensionless_text(&canonical)
             {
                 files.push(canonical);
             }
@@ -1436,6 +1463,60 @@ mod tests {
     }
 
     #[test]
+    fn test_gather_files_collects_extensionless_text_but_not_binary() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let root = tmp.path();
+
+        std::fs::write(root.join("LICENSE"), "extensionless license text\n")
+            .expect("write LICENSE");
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").expect("write Dockerfile");
+        std::fs::write(root.join("CODEOWNERS"), "* @loctree/team\n").expect("write CODEOWNERS");
+        std::fs::write(root.join("plain-script"), "echo no shebang but text\n")
+            .expect("write plain-script");
+        std::fs::write(root.join("blob"), b"\x7fELF\0not text").expect("write blob");
+        std::fs::write(root.join(".env"), "SECRET_SHOULD_NOT_ENTER=1\n").expect("write .env");
+
+        let exts: HashSet<String> = ["rs", "make", "mk"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let options = crate::types::Options {
+            extensions: Some(exts),
+            ..Default::default()
+        };
+        let mut visited = HashSet::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+        gather_files(root, &options, 0, None, &mut visited, &mut files).expect("gather");
+
+        let names: Vec<String> = files
+            .iter()
+            .filter_map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        for expected in ["LICENSE", "Dockerfile", "CODEOWNERS", "plain-script"] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "{expected} missing from extensionless text collection: {:?}",
+                names
+            );
+        }
+        assert!(
+            !names.iter().any(|n| n == "blob"),
+            "NUL-bearing extensionless binary must stay out of collection: {:?}",
+            names
+        );
+        assert!(
+            !names.iter().any(|n| n == ".env"),
+            "generic hidden extensionless files must not enter via text sniff: {:?}",
+            names
+        );
+    }
+
+    #[test]
     fn test_is_allowed_hidden() {
         // Allowed hidden files
         assert!(is_allowed_hidden(".env"));
@@ -1613,7 +1694,7 @@ mod tests {
 
     #[test]
     fn loctignore_exclusion_hint_distinguishes_ignored_from_wrong_path() {
-        // loctree-feedback.md (2026-06-25, example-app): focus(docs)/slice fell back with
+        // loctree-feedback.md (2026-06-25, vista): focus(docs)/slice fell back with
         // "No files found. Check the path." when docs/ EXISTS on disk but is
         // excluded by .loctignore. The hint must name .loctignore so the agent
         // does not chase a wrong-path that is actually correct.
