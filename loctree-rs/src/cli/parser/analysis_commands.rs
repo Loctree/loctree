@@ -217,7 +217,7 @@ OPTIONS:
                                         accounting + context labels. For secret/privacy audits where
                                         --literal cannot evaluate a pattern. Mutually exclusive with --literal.
     --whole-token                       (literal) Treat '-' as token-internal: 'backdrop' no longer matches
-                                        inside 'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
+                                        inside 'overlay-backdrop'/'--vista-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file                     (literal) Add a per-file occurrence rollup ('by_file')
     --count-only, --slim                (literal) Suppress the full occurrence list, keep counters only
     --offset <N>                        (literal) Zero-based occurrence offset for paged output
@@ -468,9 +468,10 @@ DESCRIPTION:
 OPTIONS:
     --root <PATH>        Project root to scan (default: current directory)
     --whole-token        Treat '-' as token-internal: 'backdrop' no longer matches inside
-                         'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
+                         'overlay-backdrop'/'--vista-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file      Add a per-file occurrence rollup ('by_file')
     --count-only, --slim Suppress the full occurrence list, keep counters only ('slim')
+    --compact            Human output only: print path:line plus one context line per hit
     --limit <N>          Maximum number of occurrences to return in this page
     --offset <N>         Zero-based occurrence offset for paged output
     --json               Emit JSON (file, line, column, matched_text, context, source, occurrence_kind)
@@ -480,6 +481,7 @@ EXAMPLES:
     loct occurrences utterance_id
     loct occurrences utterance_id --json
     loct occurrences backdrop --whole-token            # Exclude hyphenated z-index noise
+    loct occurrences utterance_id --compact            # Terse path:line context for agents
     loct occurrences agent --limit 50 --offset 100 --json  # Page through large result sets
     loct occurrences backdrop --group-by-file --count-only --json  # Per-file counts, no list"
                 .to_string(),
@@ -509,6 +511,10 @@ EXAMPLES:
             }
             "--count-only" | "--slim" => {
                 opts.count_only = true;
+                i += 1;
+            }
+            "--compact" => {
+                opts.compact = true;
                 i += 1;
             }
             "--limit" => {

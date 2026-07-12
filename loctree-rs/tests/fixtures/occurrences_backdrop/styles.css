@@ -1,5 +1,5 @@
 /* backdrop styling tokens */
 .backdrop {
   backdrop-filter: blur(2px);
-  --sample-z-overlay-backdrop: 40;
+  --vista-z-overlay-backdrop: 40;
 }

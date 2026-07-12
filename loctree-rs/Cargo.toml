@@ -29,6 +29,7 @@ name = "loct"
 path = "src/bin/loct.rs"
 
 [dependencies]
+aicx = { workspace = true, optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -111,7 +112,8 @@ regex = "1.12"
 serial_test = "3.2"
 
 [features]
-default = []
+default = ["aicx-inprocess"]
+aicx-inprocess = ["dep:aicx"]
 deep-index = ["dep:prost"]
 # macOS-only Swift/Objective-C deep mode. The feature gates an opportunistic
 # reader for existing Apple IndexStore data; non-macOS builds compile it out.

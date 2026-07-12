@@ -16,8 +16,8 @@ use std::time::Instant;
 use crate::aicx::summarize_entry;
 use crate::context_render::chunk_ref;
 use crate::pack::{
-    AuthorityLabel, AuthoritySlice, ContextPack, MemoryEntry, MemorySlice, RiskSlice,
-    RuntimeIdiomTag, RuntimeSlice,
+    AuthorityLabel, AuthoritySlice, ContextPack, MemoryEntry, MemorySlice, RiskCacheScope,
+    RiskSlice, RuntimeIdiomTag, RuntimeSlice,
 };
 
 use super::budget::{Budget, count_lines, rank_and_render, truncate_with_tail};
@@ -153,25 +153,24 @@ fn render_header(input: &PillInput<'_>) -> String {
         branch = branch,
         ts = input.timestamp_iso,
     ));
-    let snapshot_state = if input.pack.risk.stale_snapshot {
-        "stale"
-    } else {
-        "fresh"
-    };
     // `AutoScope::dirty` is the canonical worktree-dirty signal captured at
     // scope discovery. Fall back to the risk slice if discovery never ran.
     let dirty = input.scope.dirty || input.pack.risk.dirty_worktree;
-    header.push_str(&format!(
-        "_{files} files · {edges} import edges · snapshot {state} · {worktree}_\n\n",
-        files = input.snapshot_files,
-        edges = input.snapshot_edges,
-        state = snapshot_state,
-        worktree = if dirty {
-            "dirty worktree"
-        } else {
-            "clean worktree"
-        },
-    ));
+    let worktree = if dirty {
+        "dirty worktree"
+    } else {
+        "clean worktree"
+    };
+    if snapshot_is_missing(input) {
+        header.push_str(&format!("_no snapshot - run `loct scan` · {worktree}_\n\n"));
+    } else {
+        header.push_str(&format!(
+            "_{files} files · {edges} import edges · snapshot {state} · {worktree}_\n\n",
+            files = input.snapshot_files,
+            edges = input.snapshot_edges,
+            state = snapshot_state_label(input),
+        ));
+    }
     header
 }
 
@@ -185,25 +184,27 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     lines.push(String::new());
 
     // What this is (auto-derived from project name + scope branch hint)
-    let what = match input.scope.branch_hint.as_deref() {
-        Some(hint) if !hint.is_empty() => format!(
-            "**What this is.** `{}` repository — current focus: _{}_.",
-            input.project_name, hint
-        ),
-        _ => format!(
-            "**What this is.** `{}` repository ({} files, {} import edges).",
-            input.project_name, input.snapshot_files, input.snapshot_edges
-        ),
+    let what = if snapshot_is_missing(input) {
+        format!(
+            "**What this is.** `{}` repository — no snapshot. Run `loct scan` before trusting file/import metrics.",
+            input.project_name
+        )
+    } else {
+        match input.scope.branch_hint.as_deref() {
+            Some(hint) if !hint.is_empty() => format!(
+                "**What this is.** `{}` repository — current focus: _{}_.",
+                input.project_name, hint
+            ),
+            _ => format!(
+                "**What this is.** `{}` repository ({} files, {} import edges).",
+                input.project_name, input.snapshot_files, input.snapshot_edges
+            ),
+        }
     };
     lines.push(what);
     lines.push(String::new());
 
     // Where you stand
-    let snapshot_state = if input.pack.risk.stale_snapshot {
-        "stale"
-    } else {
-        "fresh"
-    };
     let worktree = if input.pack.risk.dirty_worktree {
         "dirty"
     } else {
@@ -211,7 +212,8 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     };
     let branch = input.scope.branch.as_deref().unwrap_or("<detached>");
     lines.push(format!(
-        "**Where you stand.** Branch `{branch}`, {worktree} worktree, snapshot {snapshot_state}."
+        "**Where you stand.** Branch `{branch}`, {worktree} worktree, snapshot {}.",
+        snapshot_state_label(input)
     ));
     if !input.scope.commit_hints.is_empty() {
         lines.push(format!(
@@ -270,16 +272,23 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     lines.push(String::new());
 
     // Snapshot facts (compact one-liner sourced from collected metrics)
-    lines.push(format!(
-        "**Snapshot facts.** {hubs} hubs · {idiom} idiom tag(s) · {dispatch} dispatch edge(s) · {env} env contract(s) · {mem} memory entr{plural} · {auth} authority claim(s).",
-        hubs = m.hub_count,
-        idiom = m.idiom_tag_count,
-        dispatch = m.dispatch_edge_count,
-        env = m.env_contract_count,
-        mem = m.memory_entry_count,
-        plural = if m.memory_entry_count == 1 { "y" } else { "ies" },
-        auth = m.authority_total,
-    ));
+    if snapshot_is_missing(input) {
+        lines.push(
+            "**Snapshot facts.** no snapshot - run `loct scan`; derived file/import metrics are unavailable. (RepoVerified)"
+                .to_string(),
+        );
+    } else {
+        lines.push(format!(
+            "**Snapshot facts.** {hubs} hubs · {idiom} idiom tag(s) · {dispatch} dispatch edge(s) · {env} env contract(s) · {mem} memory entr{plural} · {auth} authority claim(s).",
+            hubs = m.hub_count,
+            idiom = m.idiom_tag_count,
+            dispatch = m.dispatch_edge_count,
+            env = m.env_contract_count,
+            mem = m.memory_entry_count,
+            plural = if m.memory_entry_count == 1 { "y" } else { "ies" },
+            auth = m.authority_total,
+        ));
+    }
     lines.push(String::new());
 
     // What's stale
@@ -341,7 +350,9 @@ fn top_three_warnings(input: &PillInput<'_>, m: &Metrics) -> Vec<String> {
         );
     }
 
-    let risk_message = if input.pack.risk.stale_snapshot {
+    let risk_message = if snapshot_is_missing(input) {
+        Some("No snapshot is loaded — run `loct scan` before trusting ContextPack metrics. (RepoVerified)".to_string())
+    } else if input.pack.risk.stale_snapshot {
         Some("Snapshot is stale relative to current git HEAD — run `loct scan` before trusting derived facts. (RepoVerified)".to_string())
     } else if m.cycles_status.is_measured()
         && let MeasurementStatus::Measured(n) = &m.cycles_status
@@ -417,6 +428,12 @@ fn top_three_warnings(input: &PillInput<'_>, m: &Metrics) -> Vec<String> {
 
 fn collect_stale(input: &PillInput<'_>) -> Vec<String> {
     let mut out = Vec::new();
+    if snapshot_is_missing(input) {
+        out.push(
+            "No snapshot loaded: run `loct scan` before relying on derived file/import metrics. (RepoVerified)"
+                .to_string(),
+        );
+    }
     if input.pack.risk.stale_snapshot {
         out.push(format!(
             "Snapshot HEAD diverged from worktree HEAD ({}). (RepoVerified)",
@@ -449,6 +466,21 @@ fn collect_stale(input: &PillInput<'_>) -> Vec<String> {
         AicxRenderStatus::EnabledWithRows | AicxRenderStatus::Disabled => {}
     }
     out
+}
+
+fn snapshot_is_missing(input: &PillInput<'_>) -> bool {
+    matches!(input.pack.risk.cache_scope, RiskCacheScope::MissingSnapshot)
+        || input.pack.risk.snapshot_health.as_deref() == Some("missing_snapshot")
+}
+
+fn snapshot_state_label(input: &PillInput<'_>) -> &'static str {
+    if snapshot_is_missing(input) {
+        "no snapshot - run `loct scan`"
+    } else if input.pack.risk.stale_snapshot {
+        "stale"
+    } else {
+        "fresh"
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1637,8 +1669,7 @@ mod tests {
     #[test]
     fn pill_aicx_memory_does_not_leak_absolute_aicx_store_paths() {
         let mut pack = fixture_pack();
-        let leaky_path =
-            "/home/tester/.aicx/store/Loctree/loctree-suite/2026_0525/conversations/claude/s1.md";
+        let leaky_path = "/home/polyversai/.aicx/store/Loctree/loctree-suite/2026_0525/conversations/claude/s1.md";
         pack.memory = MemorySlice {
             entries: vec![MemoryEntry {
                 kind: "decision".to_string(),
@@ -1663,7 +1694,7 @@ mod tests {
         let input = input_with(&pack, &scope, AicxRenderStatus::EnabledWithRows);
         let md = render_pill(input);
         assert!(
-            !md.contains("/home/tester/.aicx/store/"),
+            !md.contains("/home/polyversai/.aicx/store/"),
             "absolute aicx-store path must NOT leak into rendered context: {md}"
         );
         assert!(
@@ -1721,5 +1752,45 @@ mod tests {
         assert!(md.contains("2026-04-28T16:58:02Z"));
         assert!(md.contains("231 files"));
         assert!(md.contains("421 import edges"));
+    }
+
+    #[test]
+    fn pill_missing_snapshot_never_reports_zero_files_fresh() {
+        let mut pack = fixture_pack();
+        pack.risk.cache_scope = RiskCacheScope::MissingSnapshot;
+        pack.risk.cache_scope_authority = AuthorityLabel::RepoVerified;
+        pack.risk.snapshot_health = Some("missing_snapshot".to_string());
+        pack.risk.stale_snapshot = false;
+        pack.risk.hotspots.clear();
+        pack.risk.high_fan_in.clear();
+
+        let mut scope = fixture_scope();
+        scope.branch_hint = None;
+        scope.top_hubs.clear();
+        scope.recent_files.clear();
+        let input = PillInput {
+            pack: &pack,
+            scope: &scope,
+            project_name: "loctree-suite".to_string(),
+            timestamp_iso: "2026-07-06T09:00:00Z".to_string(),
+            snapshot_files: 0,
+            snapshot_edges: 0,
+            elapsed: std::time::Duration::from_millis(12),
+            aicx_status: AicxRenderStatus::Disabled,
+        };
+
+        let md = render_pill(input);
+        assert!(
+            md.contains("no snapshot - run `loct scan`"),
+            "missing snapshot must be explicit: {md}"
+        );
+        assert!(
+            !md.contains("0 files") && !md.contains("0 import edges"),
+            "missing snapshot must not masquerade as zero metrics: {md}"
+        );
+        assert!(
+            !md.contains("snapshot fresh"),
+            "missing snapshot must not render as fresh: {md}"
+        );
     }
 }

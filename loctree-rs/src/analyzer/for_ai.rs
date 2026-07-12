@@ -172,10 +172,11 @@ fn location_path(location: &str) -> Option<&str> {
     if location.is_empty() || location == "unknown" {
         return None;
     }
-    if let Some((path, line)) = location.rsplit_once(':') {
-        if !path.is_empty() && line.chars().all(|c| c.is_ascii_digit()) {
-            return Some(path);
-        }
+    if let Some((path, line)) = location.rsplit_once(':')
+        && !path.is_empty()
+        && line.chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(path);
     }
     Some(location)
 }

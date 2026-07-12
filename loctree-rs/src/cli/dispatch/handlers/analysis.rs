@@ -1556,7 +1556,7 @@ pub fn handle_focus_command(opts: &FocusOptions, global: &GlobalOptions) -> Disp
         Some(f) => f,
         None => {
             // Distinguish a genuine wrong path from a correct path that is simply
-            // parked outside the snapshot by .loctignore (loctree-feedback.md: example-app
+            // parked outside the snapshot by .loctignore (loctree-feedback.md: vista
             // docs/). When the latter, lead with the precise cause instead of
             // telling the user to "check the path".
             let ignore_hint = crate::fs_utils::loctignore_exclusion_hint(root, &opts.target);

@@ -1190,9 +1190,9 @@ fn parse_duration_env(raw: &str) -> Option<Duration> {
 
 fn format_duration(duration: Duration) -> String {
     let secs = duration.as_secs();
-    if secs % (60 * 60) == 0 {
+    if secs.is_multiple_of(60 * 60) {
         format!("{}h", secs / (60 * 60))
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
@@ -1662,10 +1662,10 @@ fn collect_tauri_commands(bridges: &[CommandBridge], target: &str, slice: &mut R
 }
 
 fn tauri_command_in_scope(bridge: &CommandBridge, target: &str) -> bool {
-    if let Some((file, _)) = &bridge.backend_handler {
-        if file == target {
-            return true;
-        }
+    if let Some((file, _)) = &bridge.backend_handler
+        && file == target
+    {
+        return true;
     }
     bridge.frontend_calls.iter().any(|(file, _)| file == target)
 }

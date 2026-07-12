@@ -661,10 +661,10 @@ pub fn categorize_twin(twin: &ExactTwin) -> TwinCategory {
         return TwinCategory::Namesake;
     }
 
-    if let Some(sim) = twin.signature_similarity {
-        if sim == 0.0 {
-            return TwinCategory::Namesake;
-        }
+    if let Some(sim) = twin.signature_similarity
+        && sim == 0.0
+    {
+        return TwinCategory::Namesake;
     }
 
     TwinCategory::SameLanguage(languages.into_iter().next().unwrap_or(Language::Other))
@@ -1157,17 +1157,17 @@ pub fn detect_exact_twins_with_frameworks(
         // Class B: Token from a comment block flagged as a type declaration.
         let mut is_comment = false;
         for loc in &locations {
-            if let Ok(content) = std::fs::read_to_string(&loc.file_path) {
-                if let Some(line) = content.lines().nth(loc.line.saturating_sub(1)) {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("//")
-                        || trimmed.starts_with("/*")
-                        || trimmed.starts_with("*")
-                        || trimmed.starts_with("#")
-                    {
-                        is_comment = true;
-                        break;
-                    }
+            if let Ok(content) = std::fs::read_to_string(&loc.file_path)
+                && let Some(line) = content.lines().nth(loc.line.saturating_sub(1))
+            {
+                let trimmed = line.trim();
+                if trimmed.starts_with("//")
+                    || trimmed.starts_with("/*")
+                    || trimmed.starts_with("*")
+                    || trimmed.starts_with("#")
+                {
+                    is_comment = true;
+                    break;
                 }
             }
         }

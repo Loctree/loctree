@@ -252,20 +252,20 @@ fn parse_imports(content: &str) -> Vec<ImportEntry> {
     let mut imports: Vec<ImportEntry> = Vec::new();
     for (idx, line) in content.lines().enumerate() {
         let effective = strip_line_comment(line);
-        if let Some(caps) = RE_IMPORT.captures(effective) {
-            if let Some(m) = caps.get(1) {
-                let path = m.as_str().trim();
-                if path.is_empty() {
-                    continue;
-                }
-                if imports.iter().any(|i| i.source == path) {
-                    continue;
-                }
-                let mut entry = ImportEntry::new(path.to_string(), ImportKind::Static);
-                entry.line = Some(idx + 1);
-                entry.resolution = ImportResolutionKind::Unknown;
-                imports.push(entry);
+        if let Some(caps) = RE_IMPORT.captures(effective)
+            && let Some(m) = caps.get(1)
+        {
+            let path = m.as_str().trim();
+            if path.is_empty() {
+                continue;
             }
+            if imports.iter().any(|i| i.source == path) {
+                continue;
+            }
+            let mut entry = ImportEntry::new(path.to_string(), ImportKind::Static);
+            entry.line = Some(idx + 1);
+            entry.resolution = ImportResolutionKind::Unknown;
+            imports.push(entry);
         }
     }
     imports

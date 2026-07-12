@@ -1,9 +1,10 @@
 //! Read-only consumer wrapper around the external `aicx` memory surfaces.
 //!
 //! Loctree never panics or fails when AICX is missing. By default the wrapper
-//! tries `aicx-mcp --transport stdio` first and falls back to the installed
-//! `aicx` CLI when MCP is unavailable. `LOCT_AICX_MODE=cli|mcp|auto` can force
-//! the transport.
+//! tries the in-process AICX library first when compiled with
+//! `aicx-inprocess`, then falls back to `aicx-mcp --transport stdio`, then the
+//! installed `aicx` CLI. `LOCT_AICX_MODE=inprocess|cli|mcp|auto` can force the
+//! transport.
 //!
 //! Cache: each [`AicxClient`] holds its own per-instance cache, keyed by the
 //! call signature (window/filters/query). The cache is shared across all
@@ -25,6 +26,8 @@
 //!
 //! When neither transport can produce data, the wrapper returns an empty result.
 
+#[cfg(feature = "aicx-inprocess")]
+mod inprocess;
 mod intent_source;
 pub mod intents;
 mod mcp;
@@ -275,6 +278,13 @@ fn truncate_summary(raw: &str) -> String {
 /// healthy even when this returns `false`; callers that need real data should
 /// construct [`AicxClient`] and let it try MCP first.
 pub fn is_aicx_available() -> bool {
+    #[cfg(feature = "aicx-inprocess")]
+    {
+        let mode = AicxMode::from_env();
+        if mode.may_try_inprocess() && inprocess::AicxInProcessClient::from_env().is_ok() {
+            return true;
+        }
+    }
     shell::is_aicx_available()
 }
 
@@ -749,6 +759,8 @@ type SteerCacheKey = (String, SteerFilters);
 pub struct AicxClient {
     scope: ProjectScope,
     mode: AicxMode,
+    #[cfg(feature = "aicx-inprocess")]
+    inprocess: Option<inprocess::AicxInProcessClient>,
     mcp: Option<mcp::AicxMcpClient>,
     /// `true` when the cfg(test) kill switch refused to set up an
     /// AICX transport (see [`test_mode_blocks_spawn`]). Forces
@@ -857,6 +869,7 @@ impl FailureBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AicxMode {
     Auto,
+    InProcess,
     Cli,
     Mcp,
 }
@@ -868,6 +881,7 @@ impl AicxMode {
             .map(|raw| raw.trim().to_ascii_lowercase())
             .as_deref()
         {
+            Some("inprocess") => Self::InProcess,
             Some("cli") => Self::Cli,
             Some("mcp") => Self::Mcp,
             Some("auto") | None | Some("") => Self::Auto,
@@ -878,12 +892,16 @@ impl AicxMode {
         }
     }
 
+    fn may_try_inprocess(self) -> bool {
+        matches!(self, Self::Auto | Self::InProcess)
+    }
+
     fn may_try_mcp(self) -> bool {
-        matches!(self, Self::Auto | Self::Mcp)
+        matches!(self, Self::Auto | Self::InProcess | Self::Mcp)
     }
 
     fn may_fallback_to_cli(self) -> bool {
-        matches!(self, Self::Auto)
+        matches!(self, Self::Auto | Self::InProcess)
     }
 }
 
@@ -951,7 +969,31 @@ impl AicxClient {
         let mut connect_timed_out = false;
 
         let mode = AicxMode::from_env();
-        let mcp = if mode.may_try_mcp() && !test_blocked {
+        #[cfg(feature = "aicx-inprocess")]
+        let inprocess = if mode.may_try_inprocess() && !test_blocked {
+            match inprocess::AicxInProcessClient::from_env() {
+                Ok(client) => Some(client),
+                Err(error) => {
+                    shell::debug_log(format!(
+                        "in-process AICX unavailable; falling back to transports: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "aicx-inprocess"))]
+        if mode == AicxMode::InProcess {
+            shell::debug_log(
+                "LOCT_AICX_MODE=inprocess requested but loctree was built without aicx-inprocess; falling back to transports",
+            );
+        }
+        #[cfg(feature = "aicx-inprocess")]
+        let should_eager_connect_mcp = mode == AicxMode::Mcp || inprocess.is_none();
+        #[cfg(not(feature = "aicx-inprocess"))]
+        let should_eager_connect_mcp = true;
+        let mcp = if mode.may_try_mcp() && !test_blocked && should_eager_connect_mcp {
             let connect_cap = overlay_deadline.map(|d| d.saturating_duration_since(Instant::now()));
             match mcp::AicxMcpClient::connect_and_check(connect_cap) {
                 Ok(client) => Some(client),
@@ -974,6 +1016,8 @@ impl AicxClient {
         Self {
             scope,
             mode,
+            #[cfg(feature = "aicx-inprocess")]
+            inprocess,
             mcp,
             test_blocked,
             // Three failures within 60 seconds trip the breaker. Generous
@@ -1061,39 +1105,42 @@ impl AicxClient {
             return cached;
         }
 
-        let parsed = match self.mcp_intents(window_hours, limit) {
+        let parsed = match self.inprocess_intents(window_hours, limit) {
             Some(parsed) => parsed,
-            None => {
-                let primary = self.scope.primary();
-                if primary.is_empty() {
-                    // ProjectScope::All — `aicx intents` CLI cannot serve
-                    // "all projects" without a bucket name, and we refuse
-                    // to fabricate one. Operator should configure MCP for
-                    // the all-projects intents path.
-                    shell::debug_log(
-                        "intents: ProjectScope::All has no CLI shape; configure aicx-mcp \
-                         (LOCT_AICX_MODE=auto|mcp) for cross-project intents",
-                    );
-                    return Vec::new();
-                }
-                let limit_str = limit.to_string();
-                let hours_str = window_hours.to_string();
-                let args = [
-                    "intents", "-p", primary, "-H", &hours_str, "--limit", &limit_str, "--emit",
-                    "json",
-                ];
-                let stdout = match self.cli_fallback(&args) {
-                    Some(s) => s,
-                    None => {
-                        // Plan L03 / Finding #8 — do NOT cache failures.
-                        // A transient AICX failure returning None must not
-                        // poison the cache with `Vec::new()` for the
-                        // lifetime of the client. Next call retries.
+            None => match self.mcp_intents(window_hours, limit) {
+                Some(parsed) => parsed,
+                None => {
+                    let primary = self.scope.primary();
+                    if primary.is_empty() {
+                        // ProjectScope::All — `aicx intents` CLI cannot serve
+                        // "all projects" without a bucket name, and we refuse
+                        // to fabricate one. Operator should configure MCP for
+                        // the all-projects intents path.
+                        shell::debug_log(
+                            "intents: ProjectScope::All has no CLI shape; configure in-process AICX or aicx-mcp \
+                         (LOCT_AICX_MODE=auto|inprocess|mcp) for cross-project intents",
+                        );
                         return Vec::new();
                     }
-                };
-                shell::parse_intents(&stdout)
-            }
+                    let limit_str = limit.to_string();
+                    let hours_str = window_hours.to_string();
+                    let args = [
+                        "intents", "-p", primary, "-H", &hours_str, "--limit", &limit_str,
+                        "--emit", "json",
+                    ];
+                    let stdout = match self.cli_fallback(&args) {
+                        Some(s) => s,
+                        None => {
+                            // Plan L03 / Finding #8 — do NOT cache failures.
+                            // A transient AICX failure returning None must not
+                            // poison the cache with `Vec::new()` for the
+                            // lifetime of the client. Next call retries.
+                            return Vec::new();
+                        }
+                    };
+                    shell::parse_intents(&stdout)
+                }
+            },
         };
         cache_put(&self.intents_cache, key, parsed.clone());
         parsed
@@ -1308,6 +1355,54 @@ impl AicxClient {
                 timeout_cap,
             )
         })
+    }
+
+    fn inprocess_intents(&self, window_hours: u64, limit: usize) -> Option<Vec<AicxIntent>> {
+        // Overlay wall-clock budget exhausted — skip the in-process work
+        // before it starts and latch the timeout flag. Once inside the
+        // library call we cannot preempt safely, so the deadline is checked
+        // at the same gate as the external transports.
+        match self.transport_cap() {
+            Ok(_) => {}
+            Err(()) => {
+                self.note_timeout();
+                shell::debug_log("overlay budget exhausted; skipping in-process AICX call");
+                return Some(Vec::new());
+            }
+        }
+
+        if !self.mode.may_try_inprocess() {
+            return None;
+        }
+
+        #[cfg(feature = "aicx-inprocess")]
+        {
+            let Some(client) = &self.inprocess else {
+                return None;
+            };
+            let cap = self
+                .overlay_deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            match client.intents(&self.scope, window_hours, limit, cap) {
+                Ok(rows) => Some(rows),
+                Err(inprocess::AicxInProcessError::TimedOut) => {
+                    self.note_timeout();
+                    shell::debug_log("in-process AICX call timed out; returning empty result");
+                    Some(Vec::new())
+                }
+                Err(inprocess::AicxInProcessError::Other(error)) => {
+                    shell::debug_log(format!(
+                        "in-process AICX intents unavailable on hot path; returning empty result without subprocess fallback: {error}"
+                    ));
+                    Some(Vec::new())
+                }
+            }
+        }
+        #[cfg(not(feature = "aicx-inprocess"))]
+        {
+            let _ = (window_hours, limit);
+            None
+        }
     }
 
     fn mcp_steer(&self, filters: &SteerFilters) -> Option<Vec<AicxSteerResult>> {
@@ -1630,6 +1725,70 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(aicx_env)]
+    fn mode_selector_accepts_inprocess() {
+        unsafe {
+            clear_aicx_env();
+            std::env::set_var(AICX_MODE_ENV, "inprocess");
+        }
+
+        let mode = AicxMode::from_env();
+
+        unsafe {
+            clear_aicx_env();
+        }
+
+        assert_eq!(mode, AicxMode::InProcess);
+        assert!(mode.may_try_inprocess());
+        assert!(mode.may_try_mcp());
+        assert!(mode.may_fallback_to_cli());
+    }
+
+    #[cfg(feature = "aicx-inprocess")]
+    #[test]
+    #[serial_test::serial(aicx_env)]
+    fn auto_mode_prefers_inprocess_without_eager_mcp_spawn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mcp_script = dir.path().join("aicx-mcp-mock.sh");
+        let cli_script = dir.path().join("aicx-mock.sh");
+        let log = dir.path().join("spawn.log");
+        write_script(
+            &mcp_script,
+            &format!("#!/bin/sh\nprintf 'mcp\n' >> '{}'\nexit 1\n", log.display()),
+        );
+        write_script(
+            &cli_script,
+            &format!("#!/bin/sh\nprintf 'cli\n' >> '{}'\nexit 1\n", log.display()),
+        );
+        let aicx_home = dir.path().join("aicx-home");
+        std::fs::create_dir_all(aicx_home.join("store")).expect("aicx store dir");
+
+        unsafe {
+            clear_aicx_env();
+            enable_aicx_for_test();
+            std::env::set_var("AICX_HOME", &aicx_home);
+            std::env::set_var(AICX_MODE_ENV, "auto");
+            std::env::set_var(AICX_MCP_BINARY_ENV, &mcp_script);
+            std::env::set_var(AICX_BINARY_ENV, &cli_script);
+        }
+
+        let client = AicxClient::new("Loctree/loctree-suite");
+        let rows = client.intents(168, 100);
+
+        unsafe {
+            clear_aicx_env();
+            std::env::remove_var("AICX_HOME");
+        }
+
+        assert!(rows.is_empty());
+        assert!(!client.transport_timed_out());
+        assert!(
+            !log.exists(),
+            "in-process warm path must not spawn aicx or aicx-mcp"
+        );
+    }
+
+    #[test]
     fn summarize_entry_collapses_raw_unified_diff_json() {
         let raw = r#"{
             "call_id":"call_123",
@@ -1933,6 +2092,7 @@ done
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "aicx-inprocess"))]
     #[test]
     #[serial_test::serial(aicx_env)]
     fn auto_mode_falls_back_to_cli_when_mcp_unreachable() {

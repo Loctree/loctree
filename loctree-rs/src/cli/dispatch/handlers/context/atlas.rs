@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::context_render::current_iso_timestamp;
-use crate::pack::ContextPack;
+use crate::pack::{ContextPack, RiskCacheScope};
 
 pub const CONTEXT_ATLAS_PROTOCOL: &str = "loctree.context_atlas.v1";
 pub const CONTEXT_ATLAS_DIR: &str = "context-atlas";
@@ -327,13 +327,18 @@ struct CardOverflow {
 }
 
 fn snapshot_label(pack: &ContextPack) -> String {
+    if snapshot_missing(pack) {
+        return "no snapshot".to_string();
+    }
     let branch = pack.project.branch.as_deref().unwrap_or("unknown");
     let commit = pack.project.commit.as_deref().unwrap_or("unknown");
     format!("{}@{}", branch, commit)
 }
 
 fn atlas_freshness_line(pack: &ContextPack) -> String {
-    if pack.risk.stale_snapshot {
+    if snapshot_missing(pack) {
+        "NO SNAPSHOT - run loct scan before relying on this card.".to_string()
+    } else if pack.risk.stale_snapshot {
         format!(
             "STALE - card snapshot {} lags live git state; refresh with `loct context --full` before relying on this card.",
             snapshot_label(pack)
@@ -344,6 +349,11 @@ fn atlas_freshness_line(pack: &ContextPack) -> String {
     } else {
         "fresh - card matches the loaded snapshot authority.".to_string()
     }
+}
+
+fn snapshot_missing(pack: &ContextPack) -> bool {
+    matches!(pack.risk.cache_scope, RiskCacheScope::MissingSnapshot)
+        || pack.risk.snapshot_health.as_deref() == Some("missing_snapshot")
 }
 
 fn render_manifest(manifest: &ContextAtlasManifest) -> String {
@@ -523,7 +533,9 @@ fn line_count(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pack::{AuthorityLabel, ProjectIdentity, StructuralFile, StructuralRole};
+    use crate::pack::{
+        AuthorityLabel, ProjectIdentity, RiskCacheScope, StructuralFile, StructuralRole,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -701,6 +713,42 @@ mod tests {
         assert!(
             body.content
                 .contains("refresh with `loct context --full` before relying on this card")
+        );
+    }
+
+    #[test]
+    fn render_json_card_surfaces_missing_snapshot_in_header() {
+        let mut pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some("/tmp/proj".to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: None,
+        });
+        pack.risk.cache_scope = RiskCacheScope::MissingSnapshot;
+        pack.risk.cache_scope_authority = AuthorityLabel::RepoVerified;
+        pack.risk.snapshot_health = Some("missing_snapshot".to_string());
+
+        let body = render_json_card(
+            &pack,
+            "00-core-map.md",
+            "Core Map",
+            "lead",
+            "missing",
+            json!({}),
+        );
+
+        assert!(
+            body.content
+                .contains("Freshness: `NO SNAPSHOT - run loct scan"),
+            "missing atlas cards must carry a no-snapshot header: {}",
+            body.content
+        );
+        assert!(
+            !body
+                .content
+                .contains("Freshness: `fresh - card matches the loaded snapshot authority.`"),
+            "missing snapshot must not render as fresh: {}",
+            body.content
         );
     }
 

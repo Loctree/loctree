@@ -205,7 +205,7 @@ pub struct OrphanRead {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EnvWarning {
     /// A higher-precedence declaration is materially older than a
-    /// lower-precedence one. The classic example-app incident: stale SealedSecret
+    /// lower-precedence one. The classic Vista incident: stale SealedSecret
     /// (highest precedence, slow update cadence) overrides a freshly-edited
     /// `.env` / ConfigMap.
     StaleOverridesFresh {
@@ -228,7 +228,7 @@ pub enum EnvWarning {
     OrphanDeclaration { sources: Vec<String> },
     /// Specialization of `StaleOverridesFresh` for the SealedSecret/plain
     /// pair — emitted as a separate kind so CI gates can target the
-    /// example-app-style failure surface specifically.
+    /// Vista-style failure surface specifically.
     SealedSecretSuspectedStale {
         sealed_path: String,
         sealed_age_days: u32,

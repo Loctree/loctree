@@ -152,10 +152,10 @@ pub(super) fn parse_tagmap_command(args: &[String]) -> Result<Command, String> {
 
 /// Parse `loct prism --task A --task B [options]` command.
 pub(super) fn parse_prism_command(args: &[String]) -> Result<Command, String> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        if let Some(help) = Command::format_command_help("prism") {
-            return Err(help.to_string());
-        }
+    if args.iter().any(|a| a == "--help" || a == "-h")
+        && let Some(help) = Command::format_command_help("prism")
+    {
+        return Err(help.to_string());
     }
 
     let mut opts = PrismOptions::default();
@@ -326,10 +326,10 @@ EXAMPLES:
 /// Parse `loct dist [options]` command - analyze bundle distribution.
 pub(super) fn parse_dist_command(args: &[String]) -> Result<Command, String> {
     // Check for help flag first
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        if let Some(help) = Command::format_command_help("dist") {
-            return Err(help.to_string());
-        }
+    if args.iter().any(|a| a == "--help" || a == "-h")
+        && let Some(help) = Command::format_command_help("dist")
+    {
+        return Err(help.to_string());
     }
 
     let mut opts = DistOptions::default();

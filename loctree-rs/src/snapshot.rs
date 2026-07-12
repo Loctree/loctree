@@ -2280,16 +2280,15 @@ impl Snapshot {
     /// This is a lightweight check (commit hash comparison only).
     /// Returns `false` for non-git directories.
     pub fn is_commit_stale(&self, root: &Path) -> bool {
-        if let Some(snapshot_commit) = &self.metadata.git_commit {
-            if let Ok(repo) = crate::git::GitRepo::discover(root) {
-                if let Ok(current_commit) = repo.head_commit() {
-                    // Snapshot stores short hash, head_commit() returns full —
-                    // prefix comparison handles both directions.
-                    let is_same = current_commit.starts_with(snapshot_commit)
-                        || snapshot_commit.starts_with(&current_commit);
-                    return !is_same;
-                }
-            }
+        if let Some(snapshot_commit) = &self.metadata.git_commit
+            && let Ok(repo) = crate::git::GitRepo::discover(root)
+            && let Ok(current_commit) = repo.head_commit()
+        {
+            // Snapshot stores short hash, head_commit() returns full —
+            // prefix comparison handles both directions.
+            let is_same = current_commit.starts_with(snapshot_commit)
+                || snapshot_commit.starts_with(&current_commit);
+            return !is_same;
         }
         false
     }
@@ -5712,20 +5711,20 @@ mod cache_tests {
     #[test]
     fn snapshot_parse_owner_repo_https() {
         assert_eq!(
-            parse_owner_repo("https://github.com/Loctree/loctree.git"),
-            Some("Loctree/loctree".to_string()),
+            parse_owner_repo("https://github.com/polyversai/loctree.git"),
+            Some("polyversai/loctree".to_string()),
         );
         assert_eq!(
-            parse_owner_repo("https://github.com/Loctree/loctree"),
-            Some("Loctree/loctree".to_string()),
+            parse_owner_repo("https://github.com/polyversai/loctree"),
+            Some("polyversai/loctree".to_string()),
         );
     }
 
     #[test]
     fn snapshot_parse_owner_repo_ssh() {
         assert_eq!(
-            parse_owner_repo("git@github.com:Loctree/loctree.git"),
-            Some("Loctree/loctree".to_string()),
+            parse_owner_repo("git@github.com:polyversai/loctree.git"),
+            Some("polyversai/loctree".to_string()),
         );
         assert_eq!(
             parse_owner_repo("git@gitlab.example.com:org/sub-repo.git"),
@@ -5746,11 +5745,11 @@ mod cache_tests {
     #[test]
     fn snapshot_parse_repo_name_extracts_last_segment() {
         assert_eq!(
-            parse_repo_name("https://github.com/Loctree/loctree.git"),
+            parse_repo_name("https://github.com/polyversai/loctree.git"),
             Some("loctree".to_string()),
         );
         assert_eq!(
-            parse_repo_name("git@github.com:Loctree/loctree.git"),
+            parse_repo_name("git@github.com:polyversai/loctree.git"),
             Some("loctree".to_string()),
         );
     }
@@ -5810,7 +5809,7 @@ mod cache_tests {
             entrypoints: Vec::new(),
             entrypoint_drift: EntrypointDriftSummary::default(),
             git_repo: Some("loctree".to_string()),
-            git_owner_repo: Some("Loctree/loctree".to_string()),
+            git_owner_repo: Some("polyversai/loctree".to_string()),
             git_branch: Some("main".to_string()),
             git_commit: Some("d6ecd24".to_string()),
             git_scan_id: Some("main@d6ecd24".to_string()),
@@ -5820,7 +5819,7 @@ mod cache_tests {
         let deser: SnapshotMetadata = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(deser.git_repo, Some("loctree".to_string()));
-        assert_eq!(deser.git_owner_repo, Some("Loctree/loctree".to_string()));
+        assert_eq!(deser.git_owner_repo, Some("polyversai/loctree".to_string()));
         assert_eq!(deser.git_branch, Some("main".to_string()));
         assert_eq!(deser.git_commit, Some("d6ecd24".to_string()));
     }

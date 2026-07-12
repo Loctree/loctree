@@ -100,14 +100,14 @@ pub fn handle_prune_old_artifacts(opts: &PruneOldArtifactsOptions) -> DispatchRe
                 victim.path.display(),
                 victim.size_bytes as f64 / 1_048_576.0
             );
-            if opts.apply {
-                if let Err(err) = fs::remove_dir_all(&victim.path) {
-                    eprintln!(
-                        "    [error] failed to remove {}: {err}",
-                        victim.path.display()
-                    );
-                    continue;
-                }
+            if opts.apply
+                && let Err(err) = fs::remove_dir_all(&victim.path)
+            {
+                eprintln!(
+                    "    [error] failed to remove {}: {err}",
+                    victim.path.display()
+                );
+                continue;
             }
             total_removed_bytes = total_removed_bytes.saturating_add(victim.size_bytes);
             total_removed_dirs += 1;

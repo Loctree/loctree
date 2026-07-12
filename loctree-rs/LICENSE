@@ -12,14 +12,14 @@ https://mariadb.com/bsl11/
 Parameters
 ----------
 
-  Licensor:             Libraxis AI sp. z o.o. (contact@libraxis.ai)
+  Licensor:             Loctree Team (loct@loct.io)
 
   Licensed Work:        Loctree
-                        - This repository and all artifacts
+                        - This repository (loctree-suite) and all artifacts
                           published from it: loct, loctree-mcp, loctree-lsp,
                           the loctree library crate, report-leptos,
                           rmcp-common, and the loctree-landing site.
-                        - Copyright (c) 2024-2026 Libraxis AI sp. z o.o.
+                        - Copyright (c) 2024-2026 Loctree Team.
 
   Additional Use Grant: You may make production use of the Licensed Work,
                         provided that your use does not include offering the

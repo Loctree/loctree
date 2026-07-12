@@ -9,12 +9,13 @@
 //! — there are no fuzzy suggestions promoted as primary results, because a
 //! suggestion is not evidence.
 //!
-//! The codescribe `utterance_id` failure class is the canonical motivation: a
+//! The CodeScribe `utterance_id` failure class is the canonical motivation: a
 //! `let mut utterance_id` plus later `utterance_id += 1` increments living
 //! inside a 400-line function were invisible to `find`/`tagmap`. The literal
 //! scanner sees them because it does not depend on symbol extraction.
 
 use serde::{Deserialize, Serialize};
+use strsim::levenshtein;
 
 use crate::snapshot::Snapshot;
 use crate::types::{FileAnalysis, ImportEntry, ReexportKind};
@@ -258,6 +259,23 @@ pub struct SuggestedNext {
     pub reason: String,
 }
 
+/// Symbol-table hint surfaced only when literal occurrences are absent.
+///
+/// These are prefix/substring/fuzzy matches against known symbols, not evidence
+/// that the queried identifier exists. Keeping them on a separate field
+/// preserves the core literal contract while giving agents an immediate
+/// typo/rename lead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NearMatch {
+    pub symbol: String,
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub kind: String,
+    pub match_kind: &'static str,
+    pub source: &'static str,
+}
+
 /// Definition-vs-callsite roll-up over the whole result set.
 ///
 /// Agents asking "is this symbol mostly *defined* here or mostly *used* here?"
@@ -486,6 +504,11 @@ pub struct OccurrenceResults {
     /// Next structural commands an agent can run after reading this literal
     /// result. These remain suggestions, not evidence.
     pub suggested_next: Vec<SuggestedNext>,
+    /// Prefix/substring symbol-table hints when the literal result set is empty.
+    /// These are never primary matches and are omitted when exact occurrences
+    /// exist or no nearby symbol names are known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub near_matches: Vec<NearMatch>,
     /// Definition-vs-callsite roll-up for the whole result set. `Some` whenever
     /// there is at least one hit; omitted on a not-found result. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,9 +529,9 @@ fn is_false(b: &bool) -> bool {
 ///
 /// Default (`whole_token = false`) preserves the historical behavior exactly:
 /// `[A-Za-z0-9_]` are identifier-internal, so `backdrop` still matches inside
-/// the hyphenated CSS token `--sample-z-overlay-backdrop`. Opt-in
+/// the hyphenated CSS token `--vista-z-overlay-backdrop`. Opt-in
 /// `whole_token = true` additionally treats `-` as token-internal, so the same
-/// query no longer lights up `overlay-backdrop` / `--sample-z-overlay-backdrop`
+/// query no longer lights up `overlay-backdrop` / `--vista-z-overlay-backdrop`
 /// — the z-index noise the literal layer used to drag in.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanOptions {
@@ -566,7 +589,7 @@ fn is_ident_char(c: char) -> bool {
 
 /// Boundary test under a given [`ScanOptions`]. With `whole_token`, `-` also
 /// counts as token-internal, so a query like `backdrop` no longer matches
-/// inside `overlay-backdrop` / `--sample-z-overlay-backdrop`.
+/// inside `overlay-backdrop` / `--vista-z-overlay-backdrop`.
 #[inline]
 fn is_boundary_char(c: char, whole_token: bool) -> bool {
     is_ident_char(c) || (whole_token && c == '-')
@@ -1424,6 +1447,7 @@ where
         }),
         scope_classifications,
         suggested_next,
+        near_matches: Vec::new(),
         role_summary: role,
         file_context: Vec::new(),
     }
@@ -1545,6 +1569,7 @@ where
         }),
         scope_classifications,
         suggested_next,
+        near_matches: Vec::new(),
         role_summary: role,
         file_context: Vec::new(),
     }
@@ -1565,6 +1590,114 @@ pub fn enrich_with_snapshot(results: &mut OccurrenceResults, snapshot: &Snapshot
     }
     results.file_context = file_contexts(snapshot, &results.occurrences);
     results.suggested_next = suggested_next(&results.query, &results.occurrences);
+}
+
+pub fn attach_near_matches(results: &mut OccurrenceResults, analyses: &[FileAnalysis]) {
+    if results.total == 0 {
+        results.near_matches = near_symbol_matches(&results.query, analyses);
+    }
+}
+
+const MAX_NEAR_MATCHES: usize = 8;
+
+pub fn near_symbol_matches(query: &str, analyses: &[FileAnalysis]) -> Vec<NearMatch> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query_lower = query.to_ascii_lowercase();
+    let mut matches = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for analysis in analyses {
+        for export in &analysis.exports {
+            push_near_match(
+                &mut matches,
+                &mut seen,
+                &query_lower,
+                &export.name,
+                &analysis.path,
+                export.line,
+                &export.kind,
+            );
+        }
+        for local in &analysis.local_symbols {
+            push_near_match(
+                &mut matches,
+                &mut seen,
+                &query_lower,
+                &local.name,
+                &analysis.path,
+                local.line,
+                &local.kind,
+            );
+        }
+    }
+
+    matches.sort_by(|a, b| {
+        match_rank(a.match_kind)
+            .cmp(&match_rank(b.match_kind))
+            .then(a.symbol.len().cmp(&b.symbol.len()))
+            .then(a.symbol.cmp(&b.symbol))
+            .then(a.file.cmp(&b.file))
+            .then(a.line.cmp(&b.line))
+    });
+    matches.truncate(MAX_NEAR_MATCHES);
+    matches
+}
+
+fn push_near_match(
+    matches: &mut Vec<NearMatch>,
+    seen: &mut std::collections::BTreeSet<(String, String, Option<usize>, String)>,
+    query_lower: &str,
+    symbol: &str,
+    file: &str,
+    line: Option<usize>,
+    kind: &str,
+) {
+    let symbol_lower = symbol.to_ascii_lowercase();
+    if symbol_lower == query_lower {
+        return;
+    }
+    let match_kind = if symbol_lower.starts_with(query_lower) {
+        "prefix"
+    } else if symbol_lower.contains(query_lower) {
+        "substring"
+    } else if is_fuzzy_near_match(query_lower, &symbol_lower) {
+        "fuzzy"
+    } else {
+        return;
+    };
+    let key = (symbol.to_string(), file.to_string(), line, kind.to_string());
+    if !seen.insert(key) {
+        return;
+    }
+    matches.push(NearMatch {
+        symbol: symbol.to_string(),
+        file: file.to_string(),
+        line,
+        kind: kind.to_string(),
+        match_kind,
+        source: "symbol_table",
+    });
+}
+
+fn match_rank(kind: &str) -> u8 {
+    match kind {
+        "prefix" => 0,
+        "substring" => 1,
+        "fuzzy" => 2,
+        _ => 3,
+    }
+}
+
+fn is_fuzzy_near_match(query_lower: &str, symbol_lower: &str) -> bool {
+    if query_lower.len() < 4 {
+        return false;
+    }
+    let distance = levenshtein(query_lower, symbol_lower);
+    let max_distance = if query_lower.len() >= 12 { 3 } else { 2 };
+    distance > 0 && distance <= max_distance
 }
 
 /// Maximum number of hit-carrying files we attach importer/consumer context for.
@@ -1866,10 +1999,10 @@ fn reexport_anchor(snapshot: &Snapshot, target_path: &str, query: &str) -> Optio
                     .as_deref()
                     .and_then(|path| snapshot_path_for(snapshot, path))
                     .or_else(|| rust_source_target_path(snapshot, &file.path, &reexport.source));
-                if let Some(source_path) = source_path {
-                    if let Some(anchor) = export_anchor(snapshot, &source_path, query) {
-                        return Some(anchor);
-                    }
+                if let Some(source_path) = source_path
+                    && let Some(anchor) = export_anchor(snapshot, &source_path, query)
+                {
+                    return Some(anchor);
                 }
             }
             ReexportKind::Named(names) => {
@@ -1891,10 +2024,10 @@ fn reexport_anchor(snapshot: &Snapshot, target_path: &str, query: &str) -> Optio
                             original,
                         )
                     });
-                if let Some(source_path) = source_path {
-                    if let Some(anchor) = export_anchor(snapshot, &source_path, original) {
-                        return Some(anchor);
-                    }
+                if let Some(source_path) = source_path
+                    && let Some(anchor) = export_anchor(snapshot, &source_path, original)
+                {
+                    return Some(anchor);
                 }
             }
         }
@@ -2743,7 +2876,7 @@ mod tests {
 
     #[test]
     fn whole_token_excludes_hyphenated_neighbors() {
-        let line = "  z-index: var(--sample-z-overlay-backdrop);";
+        let line = "  z-index: var(--vista-z-overlay-backdrop);";
         // Default boundary: `backdrop` leaks into the hyphenated custom property.
         assert_eq!(occurrences_in_line_with(line, "backdrop", false).len(), 1);
         // whole_token: hyphen is token-internal, so the noisy hit disappears.
@@ -2758,7 +2891,7 @@ mod tests {
 
     #[test]
     fn scan_files_with_whole_token_drops_z_index_noise() {
-        let css = ".backdrop {}\n  --sample-z-overlay-backdrop: 40;";
+        let css = ".backdrop {}\n  --vista-z-overlay-backdrop: 40;";
         let loose = scan_files_with([("a.css", css)], "backdrop", ScanOptions::default());
         let tight = scan_files_with(
             [("a.css", css)],

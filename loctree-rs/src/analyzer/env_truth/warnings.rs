@@ -81,43 +81,43 @@ pub fn compute_warnings(
     //    so `decl.sources[0]` wins at deploy time. The runner-up gives the
     //    canonical "obvious neighbor" comparison, but the SealedSecret/
     //    SOPS/ExternalSecret specialization scans **all** lower-rank
-    //    plain-bearing sources — example-app's case had a stale SealedSecret
+    //    plain-bearing sources — Vista's case had a stale SealedSecret
     //    overriding a fresh ConfigMap several layers down, not just the
     //    immediate runner-up.
     if decl.sources.len() >= 2 {
         let high = &decl.sources[0];
         let low = &decl.sources[1];
-        if let (Some(h_age), Some(l_age)) = (high.mtime_age_days, low.mtime_age_days) {
-            if h_age > l_age && h_age.saturating_sub(l_age) >= stale_threshold_days {
-                let delta = h_age.saturating_sub(l_age);
-                decl.precedence_warnings
-                    .push(EnvWarning::StaleOverridesFresh {
-                        stale_source: high.path.clone(),
-                        fresh_source: low.path.clone(),
-                        age_delta_days: delta,
-                    });
-            }
+        if let (Some(h_age), Some(l_age)) = (high.mtime_age_days, low.mtime_age_days)
+            && h_age > l_age
+            && h_age.saturating_sub(l_age) >= stale_threshold_days
+        {
+            let delta = h_age.saturating_sub(l_age);
+            decl.precedence_warnings
+                .push(EnvWarning::StaleOverridesFresh {
+                    stale_source: high.path.clone(),
+                    fresh_source: low.path.clone(),
+                    age_delta_days: delta,
+                });
         }
-        // example-app specialization: highest is sealed/sops/external AND any
+        // Vista specialization: highest is sealed/sops/external AND any
         // lower-rank plain-bearing source is materially fresher.
         if matches!(
             high.kind,
             EnvSourceKind::SealedSecret | EnvSourceKind::SopsFile | EnvSourceKind::ExternalSecret
-        ) {
-            if let Some(h_age) = high.mtime_age_days {
-                let plain_fresh_neighbor = decl.sources[1..].iter().find(|s| {
-                    matches!(s.value_present, ValuePresence::Plain { .. })
-                        && s.mtime_age_days
-                            .is_some_and(|a| h_age > a && h_age - a >= stale_threshold_days)
-                });
-                if let Some(neighbor) = plain_fresh_neighbor {
-                    decl.precedence_warnings
-                        .push(EnvWarning::SealedSecretSuspectedStale {
-                            sealed_path: high.path.clone(),
-                            sealed_age_days: h_age,
-                            plain_age_days: neighbor.mtime_age_days.unwrap_or(0),
-                        });
-                }
+        ) && let Some(h_age) = high.mtime_age_days
+        {
+            let plain_fresh_neighbor = decl.sources[1..].iter().find(|s| {
+                matches!(s.value_present, ValuePresence::Plain { .. })
+                    && s.mtime_age_days
+                        .is_some_and(|a| h_age > a && h_age - a >= stale_threshold_days)
+            });
+            if let Some(neighbor) = plain_fresh_neighbor {
+                decl.precedence_warnings
+                    .push(EnvWarning::SealedSecretSuspectedStale {
+                        sealed_path: high.path.clone(),
+                        sealed_age_days: h_age,
+                        plain_age_days: neighbor.mtime_age_days.unwrap_or(0),
+                    });
             }
         }
     }

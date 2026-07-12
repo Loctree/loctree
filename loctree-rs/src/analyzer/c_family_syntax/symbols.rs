@@ -87,12 +87,12 @@ pub(super) fn extract(content: &str, relative: &str, lang: LanguageId) -> Extrac
         if out.nodes.len() >= MAX_SYMBOLS_PER_FILE {
             break;
         }
-        if let Some((kind, role)) = classify(node, lang) {
-            if let Some((name, name_node)) = resolve_name(node, src, lang, &kind) {
-                push_symbol(
-                    &mut out, relative, lang, kind, role, name, node, name_node, src,
-                );
-            }
+        if let Some((kind, role)) = classify(node, lang)
+            && let Some((name, name_node)) = resolve_name(node, src, lang, &kind)
+        {
+            push_symbol(
+                &mut out, relative, lang, kind, role, name, node, name_node, src,
+            );
         }
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {

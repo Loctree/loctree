@@ -91,10 +91,8 @@ fn collapse_continuations(raw: &str) -> Vec<String> {
         out.push(s);
     }
     // Flush any in-progress continuation at end of file.
-    if continuing {
-        if let Some(last) = out.last_mut() {
-            last.push_str(&buf);
-        }
+    if continuing && let Some(last) = out.last_mut() {
+        last.push_str(&buf);
     }
     out
 }

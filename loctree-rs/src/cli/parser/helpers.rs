@@ -5,6 +5,8 @@
 //! - JQ filter detection
 //! - Command suggestion via Levenshtein distance
 
+use std::path::Path;
+
 use strsim::levenshtein;
 
 use crate::types::ColorMode;
@@ -71,23 +73,47 @@ pub(crate) const SUBCOMMANDS: &[&str] = &[
     "prune-old-artifacts",
 ];
 
+const LEGACY_POSITIONAL_COMMANDS: &[&str] = &["tauri", "styles", "init", "search", "git", "for-ai"];
+
 /// Check if an argument looks like a new-style subcommand.
 pub fn is_subcommand(arg: &str) -> bool {
     SUBCOMMANDS.contains(&arg)
 }
 
+pub(super) fn should_treat_unknown_as_subcommand(args: &[String], input: &str) -> bool {
+    if input.is_empty()
+        || input.starts_with('-')
+        || is_jq_filter(input)
+        || SUBCOMMANDS.contains(&input)
+        || LEGACY_POSITIONAL_COMMANDS.contains(&input)
+        || Path::new(input).exists()
+    {
+        return false;
+    }
+
+    let help_requested = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"));
+
+    help_requested || !looks_path_like(input)
+}
+
 /// Suggest a similar command using Levenshtein distance.
-/// Returns Some(suggestion) if a close match is found (distance <= 2).
+/// Returns Some(suggestion) if a close match is found.
 pub(super) fn suggest_similar_command(input: &str) -> Option<&'static str> {
     let input_lower = input.to_lowercase();
     let mut best_match: Option<(&str, usize)> = None;
+    let max_distance = if input_lower.len() >= 5 { 3 } else { 2 };
 
     for &cmd in SUBCOMMANDS {
         let distance = levenshtein(&input_lower, cmd);
-        // Only suggest if distance is small (max 2 for reasonable similarity)
-        if distance <= 2 {
-            if let Some((_, best_dist)) = best_match {
-                if distance < best_dist {
+        if distance <= max_distance {
+            if let Some((best_cmd, best_dist)) = best_match {
+                if distance < best_dist
+                    || (distance == best_dist
+                        && (cmd.len() < best_cmd.len()
+                            || (cmd.len() == best_cmd.len() && cmd < best_cmd)))
+                {
                     best_match = Some((cmd, distance));
                 }
             } else {
@@ -97,6 +123,19 @@ pub(super) fn suggest_similar_command(input: &str) -> Option<&'static str> {
     }
 
     best_match.map(|(cmd, _)| cmd)
+}
+
+pub(super) fn format_unknown_subcommand_error(input: &str) -> String {
+    let mut message = format!("unknown subcommand '{}'", input);
+    if let Some(suggestion) = suggest_similar_command(input) {
+        message.push_str(&format!(", did you mean '{}'?", suggestion));
+    } else {
+        message.push('.');
+    }
+    message.push_str(
+        "\nCommands include: auto, scan, tree, slice, context, repo-view, find, occurrences, findings, dead, cycles, trace, impact, focus, follow, doctor.\nRun 'loct --help' for available commands.",
+    );
+    message
 }
 
 /// Check if argument looks like a jq filter expression
@@ -123,6 +162,15 @@ pub(super) fn is_jq_filter(arg: &str) -> bool {
         return true;
     }
     false
+}
+
+fn looks_path_like(input: &str) -> bool {
+    input == "."
+        || input == ".."
+        || input.starts_with('~')
+        || input.contains('/')
+        || input.contains('\\')
+        || Path::new(input).extension().is_some()
 }
 
 /// Parse color mode from string value.

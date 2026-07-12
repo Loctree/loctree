@@ -65,10 +65,10 @@ fn visit_rust_files(dir: &Path, sink: &mut dyn FnMut(&Path, &str)) {
         let path = entry.path();
         if path.is_dir() {
             visit_rust_files(&path, sink);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            if let Ok(content) = fs::read_to_string(&path) {
-                sink(&path, &content);
-            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs")
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            sink(&path, &content);
         }
     }
 }

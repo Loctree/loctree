@@ -714,7 +714,7 @@ fn render_warning(w: &EnvWarning) -> String {
             sealed_age_days,
             plain_age_days,
         } => format!(
-            "sealed-secret-suspected-stale: `{}` is {}d old vs plain {}d — example-app pattern",
+            "sealed-secret-suspected-stale: `{}` is {}d old vs plain {}d — Vista pattern",
             sealed_path, sealed_age_days, plain_age_days
         ),
         EnvWarning::EncryptedDecodeBlocked { source } => {

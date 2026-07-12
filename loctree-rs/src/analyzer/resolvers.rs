@@ -294,8 +294,7 @@ impl TsPathResolver {
         let rest = if let Some(r) = normalized.strip_prefix("$app/") {
             format!("app/{}", r)
         } else {
-            let r = normalized.strip_prefix("$env/")?;
-            format!("env/{}", r)
+            format!("env/{}", normalized.strip_prefix("$env/")?)
         };
 
         // Try monorepo layout: packages/kit/src/runtime/{app|env}/...
@@ -325,8 +324,7 @@ impl TsPathResolver {
         let rest = if let Some(r) = normalized.strip_prefix("$app/") {
             format!("app/{}", r)
         } else {
-            let r = normalized.strip_prefix("$env/")?;
-            format!("env/{}", r)
+            format!("env/{}", normalized.strip_prefix("$env/")?)
         };
 
         // Try node_modules layout

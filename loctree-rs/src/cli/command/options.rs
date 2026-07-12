@@ -236,7 +236,7 @@ pub struct FindOptions {
     pub offset: usize,
 
     /// Literal-mode: treat `-` as token-internal so `backdrop` does not match
-    /// inside `overlay-backdrop` / `--sample-z-overlay-backdrop`. Opt-in; the
+    /// inside `overlay-backdrop` / `--vista-z-overlay-backdrop`. Opt-in; the
     /// default boundary is unchanged. Ignored outside `--literal`.
     pub whole_token: bool,
 
@@ -265,7 +265,7 @@ pub struct OccurrencesOptions {
     pub roots: Vec<PathBuf>,
 
     /// Treat `-` as token-internal (tighter boundary) so `backdrop` does not
-    /// match inside `overlay-backdrop` / `--sample-z-overlay-backdrop`. Opt-in;
+    /// match inside `overlay-backdrop` / `--vista-z-overlay-backdrop`. Opt-in;
     /// the default boundary is unchanged.
     pub whole_token: bool,
 
@@ -274,6 +274,9 @@ pub struct OccurrencesOptions {
 
     /// Suppress the full occurrence list, keep only counters (`slim`).
     pub count_only: bool,
+
+    /// Emit terse human output: `path:line context` per occurrence.
+    pub compact: bool,
 
     /// Zero-based occurrence offset for paged output.
     pub offset: usize,
