@@ -57,7 +57,7 @@ pub fn run(opts: &EntryOptions) -> std::io::Result<()> {
                     return Ok(());
                 }
                 DispatchResult::ShowVersion => {
-                    println!("{} {}", opts.binary_name, env!("CARGO_PKG_VERSION"));
+                    println!("{} {}", opts.binary_name, crate::BUILD_VERSION);
                     return Ok(());
                 }
                 DispatchResult::Exit(code) => {
@@ -121,7 +121,7 @@ pub fn run(opts: &EntryOptions) -> std::io::Result<()> {
     }
 
     if parsed.show_version {
-        println!("{} {}", opts.binary_name, env!("CARGO_PKG_VERSION"));
+        println!("{} {}", opts.binary_name, crate::BUILD_VERSION);
         return Ok(());
     }
 

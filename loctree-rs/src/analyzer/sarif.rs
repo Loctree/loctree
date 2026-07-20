@@ -237,7 +237,7 @@ fn build_sarif(inputs: SarifInputs) -> serde_json::Value {
         "driver": {
             "name": "loctree",
             "informationUri": "https://github.com/Loctree/Loctree",
-            "version": env!("CARGO_PKG_VERSION"),
+            "version": crate::BUILD_VERSION,
             "rules": [
                 { "id": "duplicate-export", "shortDescription": { "text": "Duplicate export detected" } },
                 { "id": "missing-handler", "shortDescription": { "text": "Missing backend handler for frontend command" } },

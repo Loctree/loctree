@@ -13,7 +13,7 @@ use loctree_lsp::{run_server, static_initialize_result};
 #[derive(Debug, Parser)]
 #[command(
     name = "loctree-lsp",
-    version,
+    version = env!("LOCTREE_LSP_BUILD_VERSION"),
     about = "Language Server Protocol server for Loctree"
 )]
 struct Args {

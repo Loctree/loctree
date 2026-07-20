@@ -270,7 +270,7 @@ impl Findings {
         config: FindingsConfig,
         dist: Option<DistResult>,
     ) -> Self {
-        let version = env!("CARGO_PKG_VERSION").to_string();
+        let version = crate::BUILD_VERSION.to_string();
         let generated_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Iso8601::DEFAULT)
             .unwrap_or_else(|_| "unknown".to_string());
@@ -1071,7 +1071,7 @@ impl Manifest {
         agent_size_kb: usize,
         dist: Option<&DistResult>,
     ) -> Self {
-        let version = env!("CARGO_PKG_VERSION").to_string();
+        let version = crate::BUILD_VERSION.to_string();
         let generated_at = time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Iso8601::DEFAULT)
             .unwrap_or_else(|_| "unknown".to_string());

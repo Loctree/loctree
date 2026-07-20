@@ -43,10 +43,14 @@ fn main() {
 
     // Re-stamp when HEAD moves so the binary tracks the checkout it was built
     // from. Resolve the git dir (workspace member builds run from a subdir).
-    if let Some(git_dir) = git(&["rev-parse", "--git-dir"]) {
+    if let Some(git_dir) = git(&["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={git_dir}/HEAD");
-        if let Some(head_ref) = git(&["rev-parse", "--symbolic-full-name", "HEAD"]) {
-            println!("cargo:rerun-if-changed={git_dir}/{head_ref}");
+        println!("cargo:rerun-if-changed={git_dir}/index");
+    }
+    if let Some(common_dir) = git(&["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+        println!("cargo:rerun-if-changed={common_dir}/packed-refs");
+        if let Some(head_ref) = git(&["symbolic-ref", "-q", "HEAD"]) {
+            println!("cargo:rerun-if-changed={common_dir}/{head_ref}");
         }
     }
 

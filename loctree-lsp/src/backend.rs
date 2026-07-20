@@ -52,7 +52,7 @@ use loctree::types::SymbolIdV1;
 pub fn server_info() -> ServerInfo {
     ServerInfo {
         name: "Loctree Language Server".to_string(),
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        version: Some(crate::BUILD_VERSION.to_string()),
     }
 }
 
