@@ -87,7 +87,7 @@ mod cli_basics {
             .arg("--version")
             .assert()
             .success()
-            .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
+            .stdout(predicate::str::contains(env!("LOCTREE_BUILD_VERSION")));
     }
 
     #[test]

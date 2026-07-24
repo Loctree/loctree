@@ -69,6 +69,11 @@
 #![doc(html_favicon_url = "https://loct.io/assets/loctree-logo.png")]
 #![doc(html_logo_url = "https://loct.io/assets/loctree-logo.png")]
 
+/// Identity of the exact checkout used to build this Loctree artifact.
+pub const BUILD_VERSION: &str = env!("LOCTREE_BUILD_VERSION");
+pub const GIT_COMMIT: &str = env!("LOCTREE_GIT_COMMIT");
+pub const GIT_DIRTY: bool = env!("LOCTREE_GIT_DIRTY").as_bytes()[0] == b'1';
+
 // ============================================================================
 // Core Modules
 // ============================================================================

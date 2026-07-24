@@ -4,6 +4,10 @@
 //!
 //! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by VetCoders ⓒ 2025-2026 VetCoders
 
+pub const BUILD_VERSION: &str = env!("LOCTREE_LSP_BUILD_VERSION");
+pub const GIT_COMMIT: &str = env!("LOCTREE_LSP_GIT_COMMIT");
+pub const GIT_DIRTY: bool = env!("LOCTREE_LSP_GIT_DIRTY").as_bytes()[0] == b'1';
+
 use tower::ServiceBuilder;
 use tower_lsp::jsonrpc::Request;
 use tower_lsp::{LspService, Server};

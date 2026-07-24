@@ -150,7 +150,7 @@ impl Command {
         let mut help = String::new();
         help.push_str(&format!(
             "loctree {} - codebase map for agents and humans\n\n",
-            env!("CARGO_PKG_VERSION")
+            crate::BUILD_VERSION
         ));
 
         help.push_str("POWER PATH:\n");
@@ -271,7 +271,7 @@ impl Command {
         let mut help = String::new();
         help.push_str(&format!(
             "loctree {} - AI-oriented codebase analyzer (Full Reference)\n\n",
-            env!("CARGO_PKG_VERSION")
+            crate::BUILD_VERSION
         ));
 
         help.push_str("PHILOSOPHY: Scan once, query everything.\n");

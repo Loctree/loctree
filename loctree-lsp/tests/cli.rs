@@ -13,7 +13,7 @@ fn version_prints_and_exits() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("version stdout should be utf8");
-    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+    assert!(stdout.contains(env!("LOCTREE_LSP_BUILD_VERSION")));
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn capabilities_prints_initialize_result_json_and_exits() {
     assert_eq!(value["serverInfo"]["name"], "Loctree Language Server");
     assert_eq!(
         value["serverInfo"]["version"],
-        serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string())
+        serde_json::Value::String(env!("LOCTREE_LSP_BUILD_VERSION").to_string())
     );
     // Phase 1 surface cut: hover / references / definition are intentionally
     // NOT advertised — rust-analyzer / tsserver own those in the IDE; Loctree's
