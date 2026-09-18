@@ -4339,6 +4339,7 @@ pub(crate) fn write_auto_artifacts(
             python_library_mode: parsed.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs,
         },
     );

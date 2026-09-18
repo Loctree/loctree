@@ -256,9 +256,10 @@ SCOPES:
     all, dead, cycles, twins, hotspots, trace, commands, events, pipelines
 
 OPTIONS:
-    --handler <NAME>     Handler name for trace scope
-    --limit <N>          Global result bound across aggregate output families
-    --help, -h           Show this help message
+    --handler <NAME>        Handler name for trace scope
+    --limit <N>             Global result bound across aggregate output families
+    --workspace-closed      Treat pub in library crates as crate-internal (dead)
+    --help, -h              Show this help message
 
 EXAMPLES:
     loct follow
@@ -300,6 +301,10 @@ EXAMPLES:
                     .ok_or_else(|| "--limit requires a number".to_string())?;
                 opts.limit = Some(value.parse().map_err(|_| "--limit requires a number")?);
                 i += 2;
+            }
+            "--workspace-closed" => {
+                opts.workspace_closed = true;
+                i += 1;
             }
             _ if !arg.starts_with('-') && !scope_seen && valid_scopes.contains(&arg.as_str()) => {
                 opts.scope = arg.clone();

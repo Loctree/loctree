@@ -202,6 +202,10 @@ pub struct DeadFilterConfig {
     /// This is intended to be populated from `.loctignore` directives like:
     /// `@loctignore:dead-ok src/generated/**`
     pub dead_ok_globs: Vec<String>,
+    /// Closed-workspace mode: treat `pub` items in library crates as
+    /// crate-internal. Same-name imports that do not resolve inside the
+    /// scan are not enough to keep a Rust `pub` item live.
+    pub workspace_closed: bool,
 }
 pub fn find_dead_exports(
     analyses: &[FileAnalysis],
@@ -577,11 +581,11 @@ pub fn find_dead_exports(
         // Skip lib.rs and main.rs - they are crate entry points:
         // - lib.rs is the crate's public API, called via qualified paths like `crate_name::func()`
         // - main.rs is the binary entry point, its exports are not meant to be imported
-        let is_crate_root = analysis.path == "lib.rs"
-            || analysis.path == "main.rs"
-            || analysis.path.ends_with("/lib.rs")
-            || analysis.path.ends_with("/main.rs");
-        if is_crate_root {
+        // `--workspace-closed` treats lib-crate `pub` as internal, so unreachable
+        // pub in lib.rs is a dead candidate. main.rs stays skipped.
+        let is_lib_root = analysis.path == "lib.rs" || analysis.path.ends_with("/lib.rs");
+        let is_bin_root = analysis.path == "main.rs" || analysis.path.ends_with("/main.rs");
+        if is_bin_root || (is_lib_root && !config.workspace_closed) {
             continue;
         }
 
@@ -775,8 +779,14 @@ pub fn find_dead_exports(
             // Check if this is a Tauri command handler registered via generate_handler![]
             let is_tauri_handler = tauri_handlers.contains(&exp.name);
             // Fallback: check if symbol is imported anywhere by name
-            // This handles cases where path resolution fails (monorepos, $lib/, @scope/ packages)
-            let imported_by_name = all_imported_symbols.contains(&exp.name);
+            // This handles cases where path resolution fails (monorepos, $lib/, @scope/ packages).
+            // `--workspace-closed` treats Rust `pub` as internal: a same-name
+            // import that did not resolve inside this scan is not a use.
+            let imported_by_name = if config.workspace_closed && is_rust_file {
+                false
+            } else {
+                all_imported_symbols.contains(&exp.name)
+            };
             // Check if this is likely a Svelte component API method (called via bind:this)
             let is_svelte_api = is_svelte_component_api(&analysis.path, &exp.name);
             // Check if this Rust symbol is called via path qualification (e.g., `module::func()`)
@@ -2198,6 +2208,55 @@ mod tests {
     }
 
     #[test]
+    fn w1_02_workspace_closed_flags_unreachable_pub() {
+        let lib = crate::analyzer::rust::analyze_rust_file(
+            "pub fn unreachable_pub() {}\npub fn live_pub() {}\nfn boot() { live_pub(); }\n",
+            "closed_ws/src/lib.rs".to_string(),
+            &[],
+        );
+        assert!(
+            lib.exports.iter().any(|e| e.name == "unreachable_pub"),
+            "expected export unreachable_pub, got {:?}; local_uses={:?}",
+            lib.exports.iter().map(|e| &e.name).collect::<Vec<_>>(),
+            lib.local_uses
+        );
+        assert!(
+            !lib.local_uses.iter().any(|n| n == "unreachable_pub"),
+            "def line must not be a local use: {:?}",
+            lib.local_uses
+        );
+
+        let open_world = find_dead_exports(
+            std::slice::from_ref(&lib),
+            false,
+            None,
+            DeadFilterConfig::default(),
+        );
+        assert!(
+            !open_world.iter().any(|d| d.symbol == "unreachable_pub"),
+            "without --workspace-closed, lib.rs pub stays crate-public API: {open_world:?}"
+        );
+
+        let closed = find_dead_exports(
+            std::slice::from_ref(&lib),
+            false,
+            None,
+            DeadFilterConfig {
+                workspace_closed: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            closed.iter().any(|d| d.symbol == "unreachable_pub"),
+            "--workspace-closed must flag unreachable pub in a lib crate: {closed:?}"
+        );
+        assert!(
+            !closed.iter().any(|d| d.symbol == "live_pub"),
+            "internally called pub must stay live under --workspace-closed: {closed:?}"
+        );
+    }
+
+    #[test]
     fn test_find_dead_exports_dead_ok_glob_suppresses() {
         let analyses = vec![
             mock_file("src/app.ts"),
@@ -2215,6 +2274,7 @@ mod tests {
                 python_library_mode: false,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: vec!["src/generated/**".to_string()],
             },
         );
@@ -2255,6 +2315,7 @@ mod tests {
                 python_library_mode: false,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: Vec::new(),
             },
         );
@@ -2926,6 +2987,7 @@ mod tests {
                 python_library_mode: true, // Enable Python library mode
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: Vec::new(),
             },
         );
@@ -2968,6 +3030,7 @@ mod tests {
                 python_library_mode: true,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: Vec::new(),
             },
         );
@@ -3088,6 +3151,7 @@ mod tests {
                 python_library_mode: true,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: Vec::new(),
             },
         );

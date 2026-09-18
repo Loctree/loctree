@@ -121,6 +121,7 @@ pub fn health_report(
             python_library_mode: options.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs: crate::fs_utils::load_loctignore_dead_ok_globs(root),
         },
     );
@@ -233,6 +234,7 @@ pub fn audit_findings(
             python_library_mode: options.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs: crate::fs_utils::load_loctignore_dead_ok_globs(root),
         },
         false,

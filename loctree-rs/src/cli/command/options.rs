@@ -360,6 +360,9 @@ pub struct DeadOptions {
     /// Include dynamically generated symbols (exec/eval/compile templates) in analysis.
     /// By default these are excluded as they're generated at runtime, not actual dead code.
     pub with_dynamic: bool,
+
+    /// Treat `pub` items in library crates as crate-internal (closed workspace).
+    pub workspace_closed: bool,
 }
 
 /// Options for the `cycles` command.
@@ -465,6 +468,9 @@ pub struct FollowOptions {
 
     /// Root directories to analyze.
     pub roots: Vec<PathBuf>,
+
+    /// Treat `pub` items in library crates as crate-internal (closed workspace).
+    pub workspace_closed: bool,
 }
 
 impl Default for FollowOptions {
@@ -474,6 +480,7 @@ impl Default for FollowOptions {
             handler: None,
             limit: None,
             roots: Vec::new(),
+            workspace_closed: false,
         }
     }
 }

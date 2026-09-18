@@ -214,8 +214,122 @@ pub(super) fn extract_identifier_usages(content: &str, local_uses: &mut Vec<Stri
     }
 }
 
+/// True when `ident_start` is the name in a `fn ident(` / `fn ident!` definition
+/// rather than a callsite. Walks backward across whitespace (including wrapped
+/// `pub`/`async`/`#[attr]` lines) and requires the previous token to be `fn`.
+fn ident_is_fn_definition(content: &str, ident_start: usize) -> bool {
+    let bytes = content.as_bytes();
+    let mut i = ident_start;
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    let end = i;
+    while i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') {
+        i -= 1;
+    }
+    &content[i..end] == "fn"
+}
+
+/// Strip a leading `pub` / `pub(...)` visibility token.
+fn strip_rust_visibility(trimmed: &str) -> &str {
+    let Some(rest) = trimmed.strip_prefix("pub") else {
+        return trimmed;
+    };
+    if rest.is_empty() {
+        return rest;
+    }
+    if rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return rest.trim_start();
+    }
+    if !rest.starts_with('(') {
+        return trimmed;
+    }
+    let mut depth = 0usize;
+    for (idx, ch) in rest.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest[idx + 1..].trim_start();
+                }
+            }
+            _ => {}
+        }
+    }
+    trimmed
+}
+
+/// Strip a keyword only when it is a whole token (not `async_foo`).
+fn strip_leading_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(word)?;
+    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '"' || c == '(')
+    {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
+}
+
+/// Strip `async` / `const` / `unsafe` / `extern "ABI"` / `default` prefixes.
+fn strip_rust_fn_qualifiers(mut s: &str) -> &str {
+    loop {
+        if let Some(rest) = strip_leading_word(s, "async")
+            .or_else(|| strip_leading_word(s, "const"))
+            .or_else(|| strip_leading_word(s, "unsafe"))
+            .or_else(|| strip_leading_word(s, "default"))
+        {
+            s = rest;
+            continue;
+        }
+        if let Some(rest) = strip_leading_word(s, "extern") {
+            s = if let Some(quoted) = rest.strip_prefix('"') {
+                match quoted.find('"') {
+                    Some(end) => quoted[end + 1..].trim_start(),
+                    None => return s,
+                }
+            } else {
+                rest
+            };
+            continue;
+        }
+        return s;
+    }
+}
+
+/// True when `trimmed` (leading whitespace already stripped) is a Rust item
+/// definition line: vis + qualifiers + `fn`/`struct`/`enum`/… — including
+/// `async fn`, `const fn`, `pub(crate) fn`, and inherent/trait methods.
+/// `impl Type` headers are not definition lines of `Type` (that would hide
+/// a real use of the type).
+pub(super) fn is_rust_definition_line(trimmed: &str) -> bool {
+    if trimmed.starts_with("#[") || trimmed.starts_with("#!") {
+        return false;
+    }
+    let after_vis = strip_rust_visibility(trimmed);
+    let after_qualifiers = strip_rust_fn_qualifiers(after_vis);
+    after_qualifiers.starts_with("fn ")
+        || after_qualifiers.starts_with("fn(")
+        || after_qualifiers.starts_with("struct ")
+        || after_qualifiers.starts_with("enum ")
+        || after_qualifiers.starts_with("const ")
+        || after_qualifiers.starts_with("static ")
+        || after_qualifiers.starts_with("type ")
+        || after_qualifiers.starts_with("mod ")
+        || after_qualifiers.starts_with("trait ")
+        || after_qualifiers.starts_with("union ")
+        || after_qualifiers.starts_with("macro_rules!")
+}
+
 /// Extract identifiers that are followed by `(` indicating a function call.
 /// This catches bare function calls like `my_func(arg)` within the same file.
+///
+/// Definition sites (`fn foo(`, including `pub`/`async`/`#[attr]`-wrapped and
+/// impl methods) are not callsites: counting them as local uses makes every
+/// Rust `pub fn` look live to `loct dead`.
 pub(super) fn extract_bare_function_calls(content: &str, local_uses: &mut Vec<String>) {
     let bytes = content.as_bytes();
     let len = bytes.len();
@@ -244,7 +358,10 @@ pub(super) fn extract_bare_function_calls(content: &str, local_uses: &mut Vec<St
                     "trait", "type", "where", "unsafe", "async", "await", "move", "ref", "mut",
                     "self", "super", "crate", "dyn", "as", "in", "true", "false",
                 ];
-                if !KEYWORDS.contains(&ident) && !local_uses.contains(&ident.to_string()) {
+                if KEYWORDS.contains(&ident) || ident_is_fn_definition(content, start) {
+                    continue;
+                }
+                if !local_uses.contains(&ident.to_string()) {
                     local_uses.push(ident.to_string());
                 }
             }
@@ -343,17 +460,9 @@ pub(super) fn collect_identifier_mentions(content: &str, local_uses: &mut Vec<St
         {
             continue; // skip comment tokens entirely for local_uses (W2.2)
         }
-        // rough: if this line declares a name, don't let that self-name count as a "use"
-        // of the export for dead detection.
-        let is_def_line = t.starts_with("pub ")
-            || t.starts_with("fn ")
-            || t.starts_with("struct ")
-            || t.starts_with("enum ")
-            || t.starts_with("const ")
-            || t.starts_with("static ")
-            || t.starts_with("type ")
-            || t.starts_with("mod ")
-            || t.starts_with("trait ");
+        // Definition sites (including `async fn`, `pub(crate) fn`, attr-wrapped
+        // methods in `impl`) must not count the declared name as a local use.
+        let is_def_line = is_rust_definition_line(t);
         for cap in identifier_finder().find_iter(line) {
             let ident = cap.as_str();
             if SKIP.contains(&ident) {
@@ -798,6 +907,77 @@ mod tests {
         assert!(uses.contains(&"my_func".to_string()));
         assert!(uses.contains(&"another_func".to_string()));
         assert!(uses.contains(&"println".to_string()));
+    }
+
+    #[test]
+    fn w1_02_async_fn_def_line_not_a_use() {
+        let content = r#"
+#[inline]
+async fn sleeper() {}
+
+impl Worker {
+    #[must_use]
+    pub async fn run(&self) {}
+}
+
+fn boot() {
+    sleeper();
+    Worker.run();
+}
+"#;
+        let mut calls = Vec::new();
+        extract_bare_function_calls(content, &mut calls);
+        assert!(
+            calls.contains(&"sleeper".to_string()),
+            "real callsite must remain a use: {calls:?}"
+        );
+
+        let def_only = r#"
+#[inline]
+async fn sleeper() {}
+
+impl Worker {
+    #[must_use]
+    pub async fn run(&self) {}
+}
+"#;
+        let mut def_calls = Vec::new();
+        extract_bare_function_calls(def_only, &mut def_calls);
+        assert!(
+            !def_calls.contains(&"sleeper".to_string()),
+            "async fn definition is not a callsite: {def_calls:?}"
+        );
+        assert!(
+            !def_calls.contains(&"run".to_string()),
+            "attr-wrapped impl method definition is not a callsite: {def_calls:?}"
+        );
+
+        let mut mentions = Vec::new();
+        collect_identifier_mentions(def_only, &mut mentions);
+        assert!(
+            !mentions.contains(&"sleeper".to_string()),
+            "async fn def line must not be a mention-use: {mentions:?}"
+        );
+        assert!(
+            !mentions.contains(&"run".to_string()),
+            "impl method def line must not be a mention-use: {mentions:?}"
+        );
+        assert!(
+            is_rust_definition_line("async fn sleeper() {}"),
+            "async fn must be a definition line"
+        );
+        assert!(
+            is_rust_definition_line("pub async fn run(&self) {}"),
+            "pub async fn must be a definition line"
+        );
+        assert!(
+            is_rust_definition_line("pub(crate) const fn helper() {}"),
+            "vis+const fn must be a definition line"
+        );
+        assert!(
+            !is_rust_definition_line("impl Worker {"),
+            "impl header is a use of the type, not a def of it"
+        );
     }
 
     #[test]
