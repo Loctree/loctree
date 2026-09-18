@@ -4098,6 +4098,7 @@ impl LoctreeServer {
                 "include_fixtures": params.include_fixtures,
                 "total": inv.total,
                 "total_files": inv.total_files,
+                "excluded_by_ignore": inv.excluded_by_ignore,
                 "counts": inv.counts,
                 "files_per_kind": inv.files_per_kind,
                 "matches": inv.matches,
