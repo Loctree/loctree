@@ -15,6 +15,7 @@ use crate::aicx::overlay::{
     OverlayVerification, load_cached_overlay, overlay_cache_path, refresh_command, short_revision,
     staleness_reason,
 };
+use crate::aicx::redact::redact_secrets;
 use crate::context_render::current_iso_timestamp;
 use crate::pack::{
     ActionSlice, AuthorityLabel, AuthoritySlice, ContextPack, HighFanInFile, HotspotFile,
@@ -1048,7 +1049,8 @@ fn one_line_json<T: Serialize>(value: &T) -> String {
 /// `←` is neutralized so free-form memory text can never fake an edge-fact
 /// grammar line on a card whose receipt is empty.
 fn one_line_thesis(text: &str) -> String {
-    let flat = text
+    let flat = redact_secrets(text)
+        .text
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
