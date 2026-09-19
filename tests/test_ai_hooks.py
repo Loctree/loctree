@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,8 +42,11 @@ class LoctreeFirstGuardTests(unittest.TestCase):
             "tool_name": "Bash",
             "tool_input": {"command": command},
         }
+        # Supervisor PATH may bind `python3` to a stub that exits 127
+        # unless VIBECRAFTED_PYTHON is set. Drive the guard with the same
+        # interpreter as the delivery-verifier.
         return subprocess.run(
-            ["python3", str(GUARD)],
+            [sys.executable, str(GUARD)],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
