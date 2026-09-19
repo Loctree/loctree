@@ -45,3 +45,4 @@ mod tauri_commands;
 // Re-export public API
 pub use core::{parse_command, uses_new_syntax};
 pub use helpers::is_subcommand;
+pub(crate) use helpers::format_unknown_help_topic;

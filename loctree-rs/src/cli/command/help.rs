@@ -5,6 +5,51 @@
 use super::help_texts::*;
 use super::types::Command;
 
+/// Legacy-path usage banner. Version is compile-time so it cannot drift from Cargo.toml.
+pub const LOCT_USAGE: &str = concat!(
+    "loct - Static Analysis for AI Agents (v",
+    env!("CARGO_PKG_VERSION"),
+    ")\n\n\
+PHILOSOPHY: Scan the WHOLE repo once with `loct auto`, then query with subcommands.\n\
+            Artifacts live in your cache dir by default (override with LOCT_CACHE_DIR).\n\n\
+Quick Start:\n  \
+  loct auto                      Full scan → cached artifacts\n  \
+  loct slice src/foo.ts          Extract file context for AI agent\n  \
+  loct report --html out.html    Generate visual HTML report\n\n\
+Core Commands:\n  \
+  auto              Full scan + findings (writes artifacts)\n  \
+  doctor            Interactive diagnostics and quick-wins\n  \
+  findings          Emit canonical findings JSON\n  \
+  slice <file>      Extract file + dependencies + consumers\n  \
+  find <name>       Find symbol definitions\n  \
+  trace <handler>   Debug Tauri handler pipeline\n  \
+  --for-ai          AI-optimized project summary (JSON)\n\n\
+Analysis:\n  \
+  dead              Find unused exports (dead code)\n  \
+  cycles            Find circular imports\n  \
+  twins             Find duplicate symbol names\n  \
+  health            Quick structural health check\n  \
+  crowds            Find hub files (high import/export counts)\n\n\
+Output:\n  \
+  findings          Full findings JSON / summary JSON\n  \
+  report            Generate HTML/JSON/SARIF reports\n  \
+  --json            Machine-readable output\n  \
+  --sarif           SARIF for GitHub Code Scanning\n\n\
+Common:\n  \
+  -g, --gitignore   Respect .gitignore\n  \
+  --verbose         Detailed progress\n  \
+  --help-full       Complete command reference\n\n\
+Examples:\n  \
+  loct auto                                  # Full analysis\n  \
+  loct slice src/main.rs --consumers         # Context for AI\n  \
+  loct findings --summary | jq '.health_score' # CI summary JSON\n  \
+  loct dead --confidence high                # Find dead code\n  \
+  loct report --html out.html --serve        # Interactive report\n  \
+  loct doctor                                # Interactive fixes\n\n\
+Tip: Run `loct auto` from repo root first, then query!\n\n\
+More: loct --help-full\n"
+);
+
 impl Command {
     /// Hard retirement messages for command shells kept only for migration.
     pub fn retired_command_message(command: &str) -> Option<&'static str> {
@@ -260,14 +305,12 @@ impl Command {
             "routes" => Some(ROUTES_HELP),
             "dist" => Some(DIST_HELP),
             "coverage" => Some(COVERAGE_HELP),
-            "sniff" => Some(SNIFF_HELP),
             "suppress" => Some(SUPPRESS_HELP),
             "suppressions" => Some(SUPPRESSIONS_HELP),
             "focus" => Some(FOCUS_HELP),
             "hotspots" => Some(HOTSPOTS_HELP),
             "follow" => Some(FOLLOW_HELP),
             "layoutmap" => Some(LAYOUTMAP_HELP),
-            "zombie" => Some(ZOMBIE_HELP),
             "health" => Some(HEALTH_HELP),
             "audit" => Some(AUDIT_HELP),
             "doctor" => Some(DOCTOR_HELP),
@@ -643,5 +686,31 @@ mod tests {
         let findings_help = Command::format_command_help("findings").unwrap();
         assert!(findings_help.contains("loct findings"));
         assert!(Command::format_command_help("unknown").is_none());
+    }
+
+    #[test]
+    fn w4_01_banner_uses_package_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let help = Command::format_help();
+        assert!(
+            help.contains(version),
+            "format_help must show CARGO_PKG_VERSION {version}: {help}"
+        );
+        assert!(
+            !help.contains("v0.8.x"),
+            "format_help must not leak the stale v0.8.x banner"
+        );
+        assert!(
+            LOCT_USAGE.contains(version),
+            "LOCT_USAGE must embed CARGO_PKG_VERSION {version}: {LOCT_USAGE}"
+        );
+        assert!(
+            LOCT_USAGE.contains(&format!("(v{version})")),
+            "LOCT_USAGE banner must be '(v{{CARGO_PKG_VERSION}})', got: {LOCT_USAGE}"
+        );
+        assert!(
+            !LOCT_USAGE.contains("v0.8.x"),
+            "LOCT_USAGE must not leak the stale v0.8.x banner"
+        );
     }
 }
