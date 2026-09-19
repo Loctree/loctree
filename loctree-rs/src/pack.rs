@@ -29,11 +29,12 @@ use crate::aicx::{
     AicxClient, IntentAuthority, ScopeKeywords, SemanticReadiness, authority_for_intent,
     is_aicx_available, score_intent, summarize_entry,
 };
+use crate::aicx::redact::redact_secrets;
 use crate::analyzer::classify::{ArtifactClass, artifact_class};
 use crate::analyzer::env_truth::source_reads::collect_source_env_reads;
 use crate::cli::command::GlobalOptions;
 use crate::cli::dispatch::DispatchResult;
-use crate::context_render::chunk_ref;
+use crate::context_render::{aicx_read_chunk_footer, chunk_ref};
 use crate::context_scope::{
     ResolvedScope, ScopeMode, ScopeReport, TaskReport, resolve_scope_with_mode,
 };
@@ -899,6 +900,7 @@ pub(crate) fn compose_context_pack_with_global(
         dedup_authority(&mut pack.authority);
     }
     pack.memory.overlay = overlay_state;
+    scrub_context_pack(&mut pack);
     apply_scope_cache_marker(&mut pack);
 
     // Spec: when --with-aicx is requested but the binary is missing, log the
@@ -1024,6 +1026,7 @@ pub fn compose_context_pack_from_snapshot(
         dedup_authority(&mut pack.authority);
     }
     pack.memory.overlay = overlay_state;
+    scrub_context_pack(&mut pack);
     apply_scope_cache_marker(&mut pack);
 
     Ok(pack)
@@ -4028,6 +4031,37 @@ fn compose_bare_overlay_state(
     ))
 }
 
+/// Fail-closed scrub of AICX overlay/memory before a pack is marked commitable.
+/// Count is written once onto the receipt so compose+render never double-count.
+fn scrub_context_pack(pack: &mut ContextPack) {
+    let mut count = 0u32;
+    for entry in &mut pack.memory.entries {
+        scrub_field(&mut entry.text, &mut count);
+        scrub_field(&mut entry.source_chunk, &mut count);
+    }
+    for chunk in &mut pack.memory.source_chunks {
+        scrub_field(chunk, &mut count);
+    }
+    if let Some(overlay) = pack.memory.overlay.as_mut() {
+        for thesis in &mut overlay.theses {
+            scrub_field(thesis, &mut count);
+        }
+        for path in &mut overlay.scope_paths {
+            scrub_field(path, &mut count);
+        }
+        scrub_field(&mut overlay.refresh_command, &mut count);
+    }
+    pack.receipt.redactions = count;
+}
+
+fn scrub_field(value: &mut String, count: &mut u32) {
+    let result = redact_secrets(value);
+    if result.count > 0 {
+        *count += result.count;
+        *value = result.text;
+    }
+}
+
 pub fn compose_default_scope(
     snapshot: &Snapshot,
     opts: &ContextOptions,
@@ -4720,6 +4754,11 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
 ",
         pack.receipt.binary_id
     ));
+    md.push_str(&format!(
+        "- **Redactions**: {}
+",
+        pack.receipt.redactions
+    ));
     for diagnostic in &pack.receipt.diagnostics {
         md.push_str(&format!(
             "- **Diagnostic**: {}
@@ -5185,12 +5224,8 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
 
 ",
             );
-            md.push_str(&format!(
-                "_{n} unique chunk(s) reachable via `aicx open <chunk:ref>` (resolved against the operator's local aicx store; absolute paths intentionally redacted to keep this context-pack commitable)._
-
-",
-                n = pack.memory.source_chunks.len(),
-            ));
+            md.push_str(&aicx_read_chunk_footer(pack.memory.source_chunks.len()));
+            md.push_str("\n\n");
             for chunk in &pack.memory.source_chunks {
                 let opaque = chunk_ref(chunk);
                 md.push_str(&format!(
@@ -8215,6 +8250,120 @@ python_version = "3.12"
         assert!(!json.contains("retrieval_mode"), "{json}");
         assert!(!json.contains("low_lexical_match"), "{json}");
         assert!(json.contains("\"relevance\":1"));
+    }
+
+    fn w5_01_leaky_overlay() -> crate::aicx::overlay::OverlayRenderState {
+        crate::aicx::overlay::OverlayRenderState {
+            schema_version: "loctree.overlay.intent.v1".to_string(),
+            repo_id: "loctree-suite".to_string(),
+            store_revision: format!("sr1:{}", "a".repeat(64)),
+            overlay_revision: format!("ov1:{}", "b".repeat(64)),
+            snapshot_commit: "abc1234".to_string(),
+            anchor_catalog_revision: format!("acr1:{}", "c".repeat(64)),
+            producer_version: "aicx 0.12.2-test".to_string(),
+            freshness: crate::aicx::overlay::OverlayFreshness::Fresh,
+            key_transition: None,
+            theses: vec![
+                "token sk-test_abcdefghijklmnopqrstuvwxyz12".to_string(),
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK8=\n-----END RSA PRIVATE KEY-----"
+                    .to_string(),
+                "wrote /Users/alice/.ssh/id_rsa".to_string(),
+            ],
+            scope_paths: Vec::new(),
+            refresh_command: "aicx overlay --repo /tmp/loctree --format json".to_string(),
+            refresh_recommended: false,
+        }
+    }
+
+    #[test]
+    fn w5_01_aicx_overlay_redacts_secrets() {
+        let mut pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some("/tmp/proj".to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: None,
+        });
+        pack.memory.entries.push(MemoryEntry {
+            kind: "decision".to_string(),
+            text: "token sk-test_abcdefghijklmnopqrstuvwxyz12 pem -----BEGIN RSA PRIVATE KEY----- MIIBOgIBAAJBAK8= -----END RSA PRIVATE KEY----- path /Users/alice/.ssh/id_rsa".to_string(),
+            authority: AuthorityLabel::AicxOperator,
+            source_chunk: "/tmp/aicx/store/s1.md".to_string(),
+            agent: "claude".to_string(),
+            date: "2026-09-19".to_string(),
+            timestamp: None,
+            session_id: "s1".to_string(),
+            project: "loctree-suite".to_string(),
+            relevance: 9,
+            retrieval_score: None,
+            retrieval_label: None,
+            retrieval_mode: None,
+            low_lexical_match: false,
+        });
+        pack.memory.overlay = Some(w5_01_leaky_overlay());
+        scrub_context_pack(&mut pack);
+
+        let md = format_context_pack_markdown(&pack);
+        eprintln!(
+            "W5-01 runtime proof: redactions={} markdown has [redacted]={}",
+            pack.receipt.redactions,
+            md.contains("[redacted]")
+        );
+        assert!(
+            pack.receipt.redactions >= 3,
+            "receipt must count overlay+entry redactions, got {}",
+            pack.receipt.redactions
+        );
+        assert!(
+            md.contains("[redacted]"),
+            "pack markdown must show [redacted]: {md}"
+        );
+        assert!(
+            md.contains("**Redactions**:"),
+            "receipt markdown must list the redaction count: {md}"
+        );
+        assert!(
+            !md.contains("sk-test_"),
+            "fake token must not survive pack markdown: {md}"
+        );
+        assert!(
+            !md.contains("BEGIN RSA"),
+            "PEM material must not survive pack markdown: {md}"
+        );
+        assert!(
+            !md.contains("/Users/alice"),
+            "abs home path must not survive pack markdown: {md}"
+        );
+        let overlay = pack.memory.overlay.as_ref().expect("overlay");
+        let joined = overlay.theses.join("\n");
+        assert!(joined.contains("[redacted]"), "{joined}");
+        assert!(!joined.contains("sk-test_"), "{joined}");
+        assert!(!joined.contains("BEGIN RSA"), "{joined}");
+        assert!(!joined.contains("/Users/alice"), "{joined}");
+        assert_eq!(
+            overlay.store_revision,
+            format!("sr1:{}", "a".repeat(64)),
+            "hex overlay revision must not be treated as base64"
+        );
+    }
+
+    #[test]
+    fn w5_01_pack_advertises_aicx_read_only() {
+        let mut pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some("/tmp/proj".to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: None,
+        });
+        pack.memory.source_chunks = vec!["/tmp/aicx/store/s1.md".to_string()];
+        let md = format_context_pack_markdown(&pack);
+        assert!(
+            md.contains("`aicx read <chunk:ref>`"),
+            "pack must advertise aicx read: {md}"
+        );
+        assert!(
+            !md.contains("aicx open"),
+            "pack must not advertise aicx open: {md}"
+        );
     }
 
     #[cfg(unix)]

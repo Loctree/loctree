@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use crate::aicx::summarize_entry;
-use crate::context_render::chunk_ref;
+use crate::context_render::{aicx_read_chunk_footer, chunk_ref};
 use crate::pack::{
     AuthorityLabel, AuthoritySlice, ContextPack, MemoryEntry, MemorySlice, RiskCacheScope,
     RiskSlice, RuntimeIdiomTag, RuntimeSlice,
@@ -987,10 +987,10 @@ fn render_memory(input: &PillInput<'_>) -> Section {
             }
             if !input.pack.memory.source_chunks.is_empty() {
                 buf.push_str("### Source chunk pointers\n\n");
-                buf.push_str(&format!(
-                    "_{n} unique chunk(s) reachable via `aicx open <chunk:ref>` (resolved against the operator's local aicx store; absolute paths intentionally redacted to keep this context-pack commitable)._\n\n",
-                    n = input.pack.memory.source_chunks.len()
+                buf.push_str(&aicx_read_chunk_footer(
+                    input.pack.memory.source_chunks.len(),
                 ));
+                buf.push_str("\n\n");
             }
         }
     }
