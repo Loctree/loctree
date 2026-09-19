@@ -488,10 +488,10 @@ fn expand_variables(spec: &str, vars: &HashMap<String, String>) -> (String, bool
 fn format_resolved_path(path: &Path, root: &Path) -> String {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !root.as_os_str().is_empty() {
-        if let Ok(canon_root) = root.canonicalize() {
-            if let Ok(rel) = canon.strip_prefix(&canon_root) {
-                return rel.to_string_lossy().to_string();
-            }
+        if let Ok(canon_root) = root.canonicalize()
+            && let Ok(rel) = canon.strip_prefix(&canon_root)
+        {
+            return rel.to_string_lossy().to_string();
         }
         if let Ok(rel) = canon.strip_prefix(root) {
             return rel.to_string_lossy().to_string();
