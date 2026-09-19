@@ -101,6 +101,7 @@ pub fn default_analyzer_exts() -> HashSet<String> {
         "snap",
         "sha256",
         "template",
+        "sql",
     ]
     .iter()
     .map(|s| s.to_string())
