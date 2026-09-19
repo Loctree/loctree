@@ -1692,8 +1692,20 @@ struct CarrierGuard: PayloadMatching {
 "#,
             "Sources/App/CarrierGuard.swift".to_string(),
         );
+        let ext = analyze_swift_file(
+            r#"
+struct PanelWitness {
+    func unusedPanel() {}
+}
+extension PanelWitness: PayloadMatching {
+    func matchesPayload(_ raw: String) -> Bool { true }
+    var glyph: String { "y" }
+}
+"#,
+            "Sources/App/PanelWitness.swift".to_string(),
+        );
 
-        let files = [proto, impls];
+        let files = [proto, impls, ext];
         let credits = protocol_witness_credits(&files);
         let credited = credits
             .get("Sources/App/CarrierGuard.swift")
@@ -1709,6 +1721,21 @@ struct CarrierGuard: PayloadMatching {
         assert!(
             !credited.contains("unusedHelper"),
             "non-requirement helpers must not ride the witness credit"
+        );
+        let ext_credited = credits
+            .get("Sources/App/PanelWitness.swift")
+            .expect("extension conformance file must receive discovered-requirement credits");
+        assert!(
+            ext_credited.contains("matchesPayload"),
+            "extension X: P must credit P's func requirement"
+        );
+        assert!(
+            ext_credited.contains("glyph"),
+            "extension X: P must credit P's property requirement"
+        );
+        assert!(
+            !ext_credited.contains("unusedPanel"),
+            "non-requirement helpers on the type must not ride extension witness credit"
         );
 
         let dead = crate::analyzer::dead_parrots::find_dead_exports(
@@ -1736,6 +1763,18 @@ struct CarrierGuard: PayloadMatching {
         assert!(
             dead_of("CarrierGuard.swift", "unusedHelper"),
             "non-requirement helper must stay a dead candidate; got {dead:?}"
+        );
+        assert!(
+            !dead_of("PanelWitness.swift", "matchesPayload"),
+            "extension-conformance witness matchesPayload must not be dead; got {dead:?}"
+        );
+        assert!(
+            !dead_of("PanelWitness.swift", "glyph"),
+            "extension-conformance requirement property glyph must not be dead; got {dead:?}"
+        );
+        assert!(
+            dead_of("PanelWitness.swift", "unusedPanel"),
+            "non-requirement helper on extension-conforming type must stay dead; got {dead:?}"
         );
     }
 
