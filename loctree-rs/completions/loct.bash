@@ -27,7 +27,7 @@ _loct_completions() {
             return 0
             ;;
         dead|unused)
-            local opts="--json --root --confidence --full"
+            local opts="--json --root --confidence --full --workspace-closed"
             COMPREPLY=( $(compgen -W "${opts}" -- ${cur}) )
             return 0
             ;;

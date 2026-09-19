@@ -322,9 +322,10 @@ SCOPES:
     post/observe pairs and @selector targets (Heuristic provenance).
 
 OPTIONS:
-    --handler <NAME>     Handler name for trace scope
-    --limit <N>          Global result bound across aggregate output families
-    --help, -h           Show this help message
+    --handler <NAME>        Handler name for trace scope
+    --limit <N>             Global result bound across aggregate output families
+    --workspace-closed      Treat pub in library crates as crate-internal (dead)
+    --help, -h              Show this help message
 
 EXAMPLES:
     loct follow
@@ -519,6 +520,7 @@ OPTIONS:
     --with-tests         Include test files
     --with-helpers       Include helper files
     --with-shadows       Detect shadow exports (same symbol, multiple files)
+    --workspace-closed   Treat pub in library crates as crate-internal
     --help, -h           Show this help message
 
 EXAMPLES:

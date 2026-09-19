@@ -30,13 +30,15 @@ OPTIONS:
     --with-tests           Include test files in analysis
     --exclude-tests        Exclude test files (default)
     --with-helpers         Include helper/utility files
+    --workspace-closed     Treat pub in library crates as crate-internal
     --help, -h             Show this help message
 
 EXAMPLES:
     loct dead                          # All dead exports
     loct dead --confidence high        # Only high-confidence
     loct dead --path src/components/   # Dead exports in components
-    loct dead --top 50                 # Top 50 dead exports"
+    loct dead --top 50                 # Top 50 dead exports
+    loct dead --workspace-closed       # Flag unused pub in lib crates"
             .to_string());
     }
 
@@ -93,6 +95,10 @@ EXAMPLES:
             }
             "--with-dynamic" | "--include-dynamic" => {
                 opts.with_dynamic = true;
+                i += 1;
+            }
+            "--workspace-closed" => {
+                opts.workspace_closed = true;
                 i += 1;
             }
             _ if !arg.starts_with('-') => {
@@ -1041,6 +1047,17 @@ mod tests {
         let result = parse_dead_command(&args).unwrap();
         if let Command::Dead(opts) = result {
             assert_eq!(opts.confidence, Some("high".into()));
+            assert!(!opts.workspace_closed);
+        } else {
+            panic!("Expected Dead command");
+        }
+    }
+
+    #[test]
+    fn w1_02_parse_dead_workspace_closed() {
+        let result = parse_dead_command(&["--workspace-closed".into()]).unwrap();
+        if let Command::Dead(opts) = result {
+            assert!(opts.workspace_closed);
         } else {
             panic!("Expected Dead command");
         }

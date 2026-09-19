@@ -934,6 +934,7 @@ mod tests {
             with_shadows: false,
             with_ambient: false,
             with_dynamic: false,
+            workspace_closed: false,
         });
         let global = GlobalOptions {
             json: true,

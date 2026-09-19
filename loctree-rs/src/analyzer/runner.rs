@@ -527,6 +527,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: dead_ok_globs.clone(),
             },
         );
@@ -669,6 +670,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: dead_ok_globs.clone(),
             },
         );
@@ -884,6 +886,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs,
             },
         );

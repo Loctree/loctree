@@ -36,6 +36,7 @@ pub fn handle_follow_command(opts: &FollowOptions, global: &GlobalOptions) -> Di
             &DeadOptions {
                 roots,
                 top: opts.limit,
+                workspace_closed: opts.workspace_closed,
                 ..Default::default()
             },
             global,
@@ -384,6 +385,7 @@ pub fn handle_dead_command(opts: &DeadOptions, global: &GlobalOptions) -> Dispat
             include_ambient: opts.with_ambient,
             include_dynamic: opts.with_dynamic,
             dead_ok_globs,
+            workspace_closed: opts.workspace_closed,
         },
         high_confidence,
     );
@@ -2138,6 +2140,7 @@ pub fn handle_zombie_command(opts: &ZombieOptions, global: &GlobalOptions) -> Di
             python_library_mode: global.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs,
         },
         false,
@@ -2422,6 +2425,7 @@ pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> Di
             python_library_mode: global.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs,
         },
         false,
@@ -2865,6 +2869,7 @@ pub fn handle_doctor_command(opts: &DoctorOptions, global: &GlobalOptions) -> Di
             python_library_mode: global.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs,
         },
         false,

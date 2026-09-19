@@ -1159,8 +1159,9 @@ pub(crate) fn analyze_rust_file(
     // This reduces false positives by ~15% for Rust codebases
     extract_type_alias_qualified_paths(content, &analysis.imports, &mut analysis.local_uses);
 
-    // Detect bare function calls like `func_name(...)` in the same file
-    // This catches local function calls without path qualification
+    // Detect bare function calls like `func_name(...)` in the same file.
+    // Definition sites (`fn foo(`) are excluded inside the extractor so a
+    // Rust `pub fn` does not count as its own callsite.
     extract_bare_function_calls(&production_content, &mut analysis.local_uses);
 
     // Detect type names used in struct/enum field definitions
@@ -1320,6 +1321,48 @@ fn call_local() {
         assert!(
             analysis.symbol_usages.iter().any(|u| u.name == "helper"),
             "helper should appear in symbol_usages"
+        );
+    }
+
+    #[test]
+    fn w1_02_rust_pub_fn_without_callers_is_dead() {
+        let content = r#"
+pub fn orphan() {}
+pub fn live() {}
+fn caller() {
+    live();
+}
+"#;
+        let analysis = analyze_rust_file(content, "src/helpers.rs".to_string(), &[]);
+        assert!(
+            analysis.exports.iter().any(|e| e.name == "orphan"),
+            "orphan must be an export: {:?}",
+            analysis.exports
+        );
+        assert!(
+            !analysis.local_uses.iter().any(|n| n == "orphan"),
+            "pub fn definition must not count as its own callsite: {:?}",
+            analysis.local_uses
+        );
+        assert!(
+            analysis.local_uses.iter().any(|n| n == "live"),
+            "live must remain a local use: {:?}",
+            analysis.local_uses
+        );
+
+        let dead = crate::analyzer::dead_parrots::find_dead_exports(
+            std::slice::from_ref(&analysis),
+            false,
+            None,
+            crate::analyzer::dead_parrots::DeadFilterConfig::default(),
+        );
+        assert!(
+            dead.iter().any(|d| d.symbol == "orphan"),
+            "orphan pub fn with no callers must be dead: {dead:?}"
+        );
+        assert!(
+            !dead.iter().any(|d| d.symbol == "live"),
+            "called pub fn must not be dead: {dead:?}"
         );
     }
 
