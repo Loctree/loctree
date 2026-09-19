@@ -247,6 +247,7 @@ OPTIONS:
                                         inside 'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file                     (literal) Add a per-file occurrence rollup ('by_file')
     --count-only, --slim                (literal) Suppress the full occurrence list, keep counters only
+    --no-generated                      (literal/regex) Filter out generated and minified artifact files from results
     --compact                           (literal) Terse path:line human output
     --offset <N>                        (literal) Zero-based occurrence offset for paged output
     --root <PATH>, --project <PATH>     Project root to scan (default: current directory)
@@ -367,6 +368,10 @@ EXAMPLES:
             }
             "--whole-token" => {
                 opts.whole_token = true;
+                i += 1;
+            }
+            "--no-generated" => {
+                opts.no_generated = true;
                 i += 1;
             }
             "--group-by-file" => {
@@ -618,6 +623,7 @@ OPTIONS:
                          (same engine, coverage line and paging as 'find --regex')
     --whole-token        Treat '-' as token-internal: 'backdrop' no longer matches inside
                          'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
+    --no-generated       Filter out generated and minified artifact files from results
     --group-by-file      Add a per-file occurrence rollup ('by_file')
     --count-only, --slim Suppress the full occurrence list, keep counters only ('slim')
     --compact            Human output only: print path:line plus one context line per hit
@@ -667,6 +673,10 @@ EXAMPLES:
             }
             "--whole-token" => {
                 opts.whole_token = true;
+                i += 1;
+            }
+            "--no-generated" => {
+                opts.no_generated = true;
                 i += 1;
             }
             "--group-by-file" => {
@@ -1650,5 +1660,29 @@ mod tests {
             err.contains("loct context --markdown") || err.contains("--json"),
             "impact --markdown must point at context --markdown or --json: {err}"
         );
+    }
+
+    #[test]
+    fn test_parse_find_no_generated_flag() {
+        let cmd = parse_find_command(&["foo".into(), "--no-generated".into()])
+            .expect("parse find --no-generated");
+        match cmd {
+            Command::Find(opts) => {
+                assert!(opts.no_generated);
+            }
+            other => panic!("expected Command::Find, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_occurrences_no_generated_flag() {
+        let cmd = parse_occurrences_command(&["foo".into(), "--no-generated".into()])
+            .expect("parse occurrences --no-generated");
+        match cmd {
+            Command::Occurrences(opts) => {
+                assert!(opts.no_generated);
+            }
+            other => panic!("expected Command::Occurrences, got {other:?}"),
+        }
     }
 }

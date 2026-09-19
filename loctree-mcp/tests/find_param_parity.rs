@@ -35,6 +35,7 @@ fn find_param_parity_literal_options_document_role_contract_shape() {
         "mode": "literal",
         "file": "src/scribe.rs",
         "whole_token": true,
+        "no_generated": true,
         "group_by_file": true,
         "count_only": true,
         "offset": 2,
@@ -43,6 +44,7 @@ fn find_param_parity_literal_options_document_role_contract_shape() {
 
     assert_eq!(raw["mode"], "literal");
     assert_eq!(raw["whole_token"], true);
+    assert_eq!(raw["no_generated"], true);
     assert_eq!(raw["group_by_file"], true);
     assert_eq!(raw["count_only"], true);
     assert_eq!(raw["offset"], 2);

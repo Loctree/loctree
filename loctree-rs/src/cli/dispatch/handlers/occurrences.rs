@@ -17,7 +17,8 @@ use super::super::{DispatchResult, GlobalOptions, load_or_create_query_snapshot_
 use crate::analyzer::occurrences::{
     FileScope, FileScopeResolution, LiteralOccurrence, MatchMode, OccurrenceResults, ReportOptions,
     ScanOptions, attach_near_matches, enrich_with_snapshot, expand_literal_patterns,
-    positional_dot_query_error, scan_files_multi_literal, scan_files_with, scan_files_with_regex,
+    positional_dot_query_error, scan_files_multi_literal, scan_files_with,
+    scan_files_with_regex_opts,
 };
 use crate::analyzer::search::{FuzzySuggestion, literal_fuzzy_suggestions};
 use crate::snapshot::Snapshot;
@@ -65,6 +66,7 @@ pub fn handle_occurrences_command(
         &patterns,
         ScanOptions {
             whole_token: opts.whole_token,
+            no_generated: opts.no_generated,
         },
         FileScope::default(),
     );
@@ -76,6 +78,7 @@ pub fn handle_occurrences_command(
                 pattern,
                 ScanOptions {
                     whole_token: opts.whole_token,
+                    no_generated: opts.no_generated,
                 },
             );
             attach_near_matches(&mut probe, &snapshot.files);
@@ -167,7 +170,50 @@ fn handle_occurrences_regex(
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect::<Vec<_>>();
-    let mut results = scan_files_with_regex(borrowed, &re, FileScope::default());
+    let mut results = scan_files_with_regex_opts(
+        borrowed,
+        &re,
+        FileScope::default(),
+        ScanOptions {
+            whole_token: false,
+            no_generated: opts.no_generated,
+        },
+    );
+    if opts.no_generated {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in results.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = results.generated_skipped {
+                    *n += newly_skipped;
+                }
+                results.occurrences = kept;
+                results.total = results.occurrences.len();
+                results.emitted = results.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &results.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                results.files_matched = seen.len();
+                results.refresh_coverage_line();
+            } else {
+                results.occurrences = kept;
+            }
+        }
+    }
     results.declare_snapshot_universe(&snapshot, FileScope::default());
     results.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
@@ -259,6 +305,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
         &patterns,
         ScanOptions {
             whole_token: opts.whole_token,
+            no_generated: opts.no_generated,
         },
         scan_scope,
     );
@@ -270,6 +317,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
                 pattern,
                 ScanOptions {
                     whole_token: opts.whole_token,
+                    no_generated: opts.no_generated,
                 },
             );
             attach_near_matches(&mut probe, &snapshot.files);
@@ -449,7 +497,50 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
         .map(FileScopeResolution::scan_scope)
         .unwrap_or_default();
 
-    let mut matches = scan_files_with_regex(borrowed, &re, scan_scope);
+    let mut matches = scan_files_with_regex_opts(
+        borrowed,
+        &re,
+        scan_scope,
+        ScanOptions {
+            whole_token: false,
+            no_generated: opts.no_generated,
+        },
+    );
+    if opts.no_generated {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in matches.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = matches.generated_skipped {
+                    *n += newly_skipped;
+                }
+                matches.occurrences = kept;
+                matches.total = matches.occurrences.len();
+                matches.emitted = matches.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &matches.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                matches.files_matched = seen.len();
+                matches.refresh_coverage_line();
+            } else {
+                matches.occurrences = kept;
+            }
+        }
+    }
     // No enrich_with_snapshot: a regex pattern is not a symbol name, so symbol
     // resolution against it would be meaningless. Matches stay raw-text truth.
     matches.declare_snapshot_universe(&snapshot, scan_scope);

@@ -55,7 +55,7 @@ use loctree::analyzer::cycles::find_cycles;
 use loctree::analyzer::dead_parrots::{DeadFilterConfig, find_dead_exports};
 use loctree::analyzer::occurrences::{
     FileScope, OccurrenceResults, ReportOptions, ScanOptions, scan_files_for_literal_query,
-    scan_files_with_regex,
+    scan_files_with_regex_opts,
 };
 use loctree::analyzer::pipelines::build_pipeline_summary;
 use loctree::analyzer::root_scan::scan_results_from_snapshot;
@@ -598,6 +598,9 @@ struct FindParams {
     /// default boundary is unchanged. Ignored outside `mode="literal"`.
     #[serde(default)]
     whole_token: bool,
+    /// (literal/regex mode) Filter out generated and minified artifact files from results. Opt-in.
+    #[serde(default)]
+    no_generated: bool,
     /// (literal mode) Attach a per-file occurrence rollup (`by_file`).
     #[serde(default)]
     group_by_file: bool,
@@ -765,7 +768,43 @@ fn scan_literal_occurrences(
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect::<Vec<_>>();
-    scan_files_for_literal_query(&borrowed, ident, opts, scope)
+    let mut results = scan_files_for_literal_query(&borrowed, ident, opts, scope);
+    if opts.no_generated {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in results.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = results.generated_skipped {
+                    *n += newly_skipped;
+                }
+                results.occurrences = kept;
+                results.total = results.occurrences.len();
+                results.emitted = results.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &results.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                results.files_matched = seen.len();
+                results.refresh_coverage_line();
+            } else {
+                results.occurrences = kept;
+            }
+        }
+    }
+    results
 }
 
 /// Regex counterpart to the literal scan: compile the caller's pattern, read
@@ -776,6 +815,7 @@ fn scan_regex_occurrences(
     snapshot: &Snapshot,
     base: &Path,
     pattern: &str,
+    opts: ScanOptions,
     scope: FileScope<'_>,
 ) -> Result<OccurrenceResults, regex::Error> {
     let re = regex::Regex::new(pattern)?;
@@ -798,7 +838,43 @@ fn scan_regex_occurrences(
         .iter()
         .map(|(path, body)| (path.as_str(), body.as_str()))
         .collect::<Vec<_>>();
-    Ok(scan_files_with_regex(borrowed, &re, scope))
+    let mut matches = scan_files_with_regex_opts(borrowed, &re, scope, opts);
+    if opts.no_generated {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in matches.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = matches.generated_skipped {
+                    *n += newly_skipped;
+                }
+                matches.occurrences = kept;
+                matches.total = matches.occurrences.len();
+                matches.emitted = matches.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &matches.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                matches.files_matched = seen.len();
+                matches.refresh_coverage_line();
+            } else {
+                matches.occurrences = kept;
+            }
+        }
+    }
+    Ok(matches)
 }
 
 /// Materialize a throwaway worktree at `reference`, scan it, then remove the
@@ -2528,7 +2604,7 @@ impl LoctreeServer {
     /// Find symbol definitions (supports multi-query: "foo|bar|baz")
     #[tool(
         name = "find",
-        description = "Find symbols, trace imports, or explore features. Modes: 'symbols' (default) — symbol/param search with regex. 'who-imports' — what files import this file (reverse deps). 'where-symbol' — where is this symbol defined. 'tagmap' — unified keyword search (files + crowd + dead). 'crowd' — functional clustering around a keyword. 'literal' — exact identifier-boundary occurrences over the indexed universe; coverage stated per query; 'not found' means not found, with fuzzy hints kept strictly separate. At parity with `loct occurrences` / `loct find --literal`. Multi-literal OR: pass simple identifiers as `NameA|NameB` (pipe) for exact-union (`match_mode: multi_literal`) — prefer this over shell grep for agent multi-pattern search. Literal-mode tuning (all opt-in, ignored otherwise): every occurrence carries a language-aware `occurrence_kind` (css_property, class_token, custom_property, comment, string_literal, data_attribute, identifier, plus the Rust role shapes; `unknown` only as honest fallback); `whole_token=true` treats '-' as token-internal so e.g. 'backdrop' stops matching inside 'overlay-backdrop'/'--vista-z-overlay-backdrop'; `group_by_file=true` adds a per-file `by_file` count rollup; `count_only`/`slim=true` suppresses the full occurrence list (keeping `total`/`files_matched`/`by_file`) for token economy."
+        description = "Find symbols, trace imports, or explore features. Modes: 'symbols' (default) — symbol/param search with regex. 'who-imports' — what files import this file (reverse deps). 'where-symbol' — where is this symbol defined. 'tagmap' — unified keyword search (files + crowd + dead). 'crowd' — functional clustering around a keyword. 'literal' — exact identifier-boundary occurrences over the indexed universe; coverage stated per query; 'not found' means not found, with fuzzy hints kept strictly separate. At parity with `loct occurrences` / `loct find --literal`. Multi-literal OR: pass simple identifiers as `NameA|NameB` (pipe) for exact-union (`match_mode: multi_literal`) — prefer this over shell grep for agent multi-pattern search. Literal-mode tuning (all opt-in, ignored otherwise): every occurrence carries a language-aware `occurrence_kind` (css_property, class_token, custom_property, comment, string_literal, data_attribute, identifier, plus the Rust role shapes; `unknown` only as honest fallback); `whole_token=true` treats '-' as token-internal so e.g. 'backdrop' stops matching inside 'overlay-backdrop'/'--vista-z-overlay-backdrop'; `no_generated=true` filters out generated/minified artifact files from results; `group_by_file=true` adds a per-file `by_file` count rollup; `count_only`/`slim=true` suppresses the full occurrence list (keeping `total`/`files_matched`/`by_file`) for token economy."
     )]
     async fn find(&self, Parameters(params): Parameters<FindParams>) -> String {
         touch_activity();
@@ -2868,6 +2944,10 @@ impl LoctreeServer {
                 &snapshot,
                 &project,
                 &params.name,
+                ScanOptions {
+                    whole_token: false,
+                    no_generated: params.no_generated,
+                },
                 FileScope {
                     file: params.file.as_deref(),
                 },
@@ -2925,6 +3005,7 @@ impl LoctreeServer {
                 &params.name,
                 ScanOptions {
                     whole_token: params.whole_token,
+                    no_generated: params.no_generated,
                 },
                 FileScope {
                     file: params.file.as_deref(),
@@ -3215,6 +3296,7 @@ impl LoctreeServer {
                     let payload = serde_json::json!({
                         "file": params.file,
                         "project": project.display().to_string(),
+                        "depth": params.depth,
                         "risk_level": "unknown",
                         "direct_consumers": {
                             "count": 0,
@@ -5427,6 +5509,7 @@ pub fn public_entry() {
                 similar: None,
                 file: None,
                 whole_token: false,
+                no_generated: false,
                 group_by_file: false,
                 count_only: false,
                 offset: 0,
@@ -5489,6 +5572,7 @@ pub fn public_entry() {
                 similar: None,
                 file: None,
                 whole_token: false,
+                no_generated: false,
                 group_by_file: false,
                 count_only: false,
                 offset: 0,
@@ -5562,6 +5646,7 @@ pub fn public_entry() {
                 similar: None,
                 file: Some("src/handler.rs".to_string()),
                 whole_token: false,
+                no_generated: false,
                 group_by_file: false,
                 count_only: false,
                 offset: 0,
@@ -5629,6 +5714,7 @@ pub fn public_entry() {
                 similar: None,
                 file: None,
                 whole_token: false,
+                no_generated: false,
                 group_by_file: false,
                 count_only: false,
                 offset: 0,
@@ -5795,6 +5881,7 @@ pub fn public_entry() {
                 similar: None,
                 file: Some("src/styles.css".to_string()),
                 whole_token: false,
+                no_generated: false,
                 group_by_file: false,
                 count_only: false,
                 offset: 0,
@@ -5854,6 +5941,7 @@ pub fn public_entry() {
                 similar: None,
                 file: None,
                 whole_token: false,
+                no_generated: false,
                 group_by_file: false,
                 count_only: false,
                 offset: 0,
@@ -5909,6 +5997,89 @@ pub fn public_entry() {
             value["literal_matches"]["total"].as_u64().unwrap(),
             expected.total as u64,
             "MCP total must match engine multi-literal total"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_literal_mode_no_generated_filters_minified_files() {
+        let project = fixture_project();
+        let server = LoctreeServer::new();
+
+        fs::write(
+            project.path().join("src/banner.rs"),
+            "pub fn banner_marker() {}\n",
+        )
+        .expect("write banner.rs");
+        fs::write(
+            project.path().join("src/mermaid.min.js"),
+            "function banner_marker() {}\n",
+        )
+        .expect("write mermaid.min.js");
+
+        let initial = server.context(Parameters(params_for(project.path()))).await;
+        serde_json::from_str::<serde_json::Value>(&initial).expect("prime snapshot");
+
+        // 1) Default (no_generated = false): both files matched
+        let output_default = server
+            .find(Parameters(FindParams {
+                project: project.path().display().to_string(),
+                force_no_git: true,
+                name: "banner_marker".to_string(),
+                mode: "literal".to_string(),
+                limit: 50,
+                lang: None,
+                exported_only: false,
+                dead_only: false,
+                min_score: None,
+                similar: None,
+                file: None,
+                whole_token: false,
+                no_generated: false,
+                group_by_file: false,
+                count_only: false,
+                offset: 0,
+            }))
+            .await;
+        let val_default: serde_json::Value =
+            serde_json::from_str(&output_default).expect("valid JSON");
+        assert_eq!(val_default["total"], 2);
+
+        // 2) Opt-in (no_generated = true): minified file filtered
+        let output_filtered = server
+            .find(Parameters(FindParams {
+                project: project.path().display().to_string(),
+                force_no_git: true,
+                name: "banner_marker".to_string(),
+                mode: "literal".to_string(),
+                limit: 50,
+                lang: None,
+                exported_only: false,
+                dead_only: false,
+                min_score: None,
+                similar: None,
+                file: None,
+                whole_token: false,
+                no_generated: true,
+                group_by_file: false,
+                count_only: false,
+                offset: 0,
+            }))
+            .await;
+        let val_filtered: serde_json::Value =
+            serde_json::from_str(&output_filtered).expect("valid JSON");
+        assert_eq!(val_filtered["total"], 1);
+        let occurrences = val_filtered["literal_matches"]["occurrences"]
+            .as_array()
+            .expect("occurrences");
+        assert_eq!(occurrences.len(), 1);
+        assert_eq!(occurrences[0]["file"], "src/banner.rs");
+        assert_eq!(val_filtered["literal_matches"]["generated_skipped"], 1);
+        let cov = val_filtered["literal_matches"]["coverage_line"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cov.contains("generated_skipped: 1"),
+            "coverage line must include generated_skipped: 1, got {cov}"
         );
     }
 
