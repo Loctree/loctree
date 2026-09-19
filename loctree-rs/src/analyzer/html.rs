@@ -695,6 +695,167 @@ mod tests {
     }
 
     #[test]
+    fn w2_06_fixture_tauri_conf_zero_gaps_shows_tauri_surface() {
+        // Acceptance fixture 1: projekt z tauri.conf.json i zero gapów → Tauri surface widoczna
+        let tauri_tmp = tempdir().expect("tauri tmp dir");
+        let tauri_root = tauri_tmp.path();
+        fs::write(
+            tauri_root.join("tauri.conf.json"),
+            r#"{"build":{},"tauri":{"bundle":{"identifier":"com.test.app"}}}"#,
+        )
+        .expect("write tauri.conf.json");
+        let tauri_out = tauri_root.join("report.html");
+
+        let tauri_section = ReportSection {
+            root: tauri_root.display().to_string(),
+            files_analyzed: 10,
+            total_loc: 500,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 10,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: Vec::new(),
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (0, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        };
+
+        let tauri_sections = [tauri_section];
+        render_html_report(&tauri_out, &tauri_sections).expect("render tauri report");
+        let tauri_html = fs::read_to_string(&tauri_out).expect("read tauri html");
+        let tauri_detected = super::detect_tauri_for_report(&tauri_out, &tauri_sections);
+
+        assert!(
+            tauri_detected,
+            "tauri-clean fixture must detect Tauri from tauri.conf.json"
+        );
+        assert!(
+            tauri_html.contains("Tauri coverage"),
+            "tauri-clean fixture with zero gaps must display Tauri surface in HTML"
+        );
+        assert!(
+            tauri_html.contains("data-tab=\"commands\""),
+            "tauri-clean fixture must include commands tab"
+        );
+    }
+
+    #[test]
+    fn w2_06_fixture_nontauri_repo_with_gaps_has_no_tauri_gate() {
+        use crate::analyzer::report::CommandGap;
+
+        // Acceptance fixture 2: non-Tauri repo z gapami → brak Tauri gate
+        let nontauri_tmp = tempdir().expect("nontauri tmp dir");
+        let nontauri_root = nontauri_tmp.path();
+        fs::write(
+            nontauri_root.join("package.json"),
+            r#"{"name":"nontauri-app","dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .expect("write package.json");
+        let nontauri_out = nontauri_root.join("report.html");
+
+        let nontauri_section = ReportSection {
+            root: nontauri_root.display().to_string(),
+            files_analyzed: 5,
+            total_loc: 250,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 10,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: vec![
+                CommandGap {
+                    name: "reattach-workspace".to_string(),
+                    implementation_name: None,
+                    locations: vec![("src/frontend.js".to_string(), 42)],
+                    confidence: None,
+                    string_literal_matches: vec![],
+                },
+                CommandGap {
+                    name: "seek-to-timestamp".to_string(),
+                    implementation_name: None,
+                    locations: vec![("src/frontend.js".to_string(), 60)],
+                    confidence: None,
+                    string_literal_matches: vec![],
+                },
+            ],
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (2, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        };
+
+        let nontauri_sections = [nontauri_section];
+        render_html_report(&nontauri_out, &nontauri_sections).expect("render nontauri report");
+        let nontauri_html = fs::read_to_string(&nontauri_out).expect("read nontauri html");
+        let nontauri_detected = super::detect_tauri_for_report(&nontauri_out, &nontauri_sections);
+
+        assert!(
+            !nontauri_detected,
+            "nontauri-gaps fixture must not detect Tauri when no manifest exists"
+        );
+        assert!(
+            !nontauri_html.contains("Tauri coverage"),
+            "nontauri-gaps fixture must NOT display Tauri surface in HTML"
+        );
+        assert!(
+            !nontauri_html.contains("data-tab=\"commands\""),
+            "nontauri-gaps fixture must NOT include commands tab"
+        );
+    }
+
+    #[test]
     fn w2_06_tauri_detection_not_derived_from_gaps() {
         use crate::analyzer::report::CommandGap;
 
