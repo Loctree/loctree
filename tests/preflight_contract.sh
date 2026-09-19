@@ -143,6 +143,12 @@ codeql_java_build_step="$(awk '
   flag && /^      - name: / { exit }
   flag { print }
 ' "$CODEQL_WORKFLOW")"
+codeql_java_matrix_entry="$(awk '
+  /- language: java-kotlin/ { flag=1; print; next }
+  flag && /^          - language: / { exit }
+  flag && /^    steps:/ { exit }
+  flag { print }
+' "$CODEQL_WORKFLOW")"
 if ! grep -Fq 'name: Analyze (${{ matrix.language }})' "$CODEQL_WORKFLOW"; then
   echo "CodeQL workflow does not keep per-language analyze jobs" >&2
   exit 1
@@ -151,7 +157,7 @@ if ! grep -Fq "language: java-kotlin" "$CODEQL_WORKFLOW"; then
   echo "CodeQL workflow does not analyze the JetBrains Kotlin surface" >&2
   exit 1
 fi
-if ! grep -Fq "build-mode: manual" "$CODEQL_WORKFLOW"; then
+if ! printf '%s\n' "$codeql_java_matrix_entry" | grep -Fq "build-mode: manual"; then
   echo "CodeQL workflow does not opt Java/Kotlin into an explicit build" >&2
   exit 1
 fi
