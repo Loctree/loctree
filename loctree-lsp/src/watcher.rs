@@ -18,7 +18,7 @@
 //! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders ⓒ 2025-2026 Vetcoders
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +67,149 @@ pub struct ScanProgress {
     /// Optional message — populated on `failed` to carry the cause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Stable class of a failed rescan: `enospc` or `other`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Class of a failed workspace rescan, named on `loctree/scanProgress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanFailureReason {
+    /// POSIX ENOSPC / `ErrorKind::StorageFull` / "no space left on device".
+    Enospc,
+    /// Any other rescan or snapshot-reload error.
+    Other,
+}
+
+impl RescanFailureReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Enospc => "enospc",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_message(message: &str) -> Self {
+        if looks_like_enospc(message) {
+            Self::Enospc
+        } else {
+            Self::Other
+        }
+    }
+
+    pub fn from_io(err: &std::io::Error) -> Self {
+        if err.kind() == std::io::ErrorKind::StorageFull {
+            return Self::Enospc;
+        }
+        #[cfg(unix)]
+        {
+            if err.raw_os_error() == Some(libc::ENOSPC) {
+                return Self::Enospc;
+            }
+        }
+        Self::from_message(&err.to_string())
+    }
+
+    pub fn from_error(err: &(dyn std::error::Error + 'static)) -> Self {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(cause) = current {
+            if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+                && Self::from_io(io_err) == Self::Enospc
+            {
+                return Self::Enospc;
+            }
+            if Self::from_message(&cause.to_string()) == Self::Enospc {
+                return Self::Enospc;
+            }
+            current = cause.source();
+        }
+        Self::Other
+    }
+}
+
+fn looks_like_enospc(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("enospc")
+        || lower.contains("no space left")
+        || lower.contains("not enough space")
+        || lower.contains("disk full")
+}
+
+/// Exponential backoff for repeated event-driven rescan failures.
+///
+/// The watcher keeps collecting filesystem events; this type only
+/// decides whether `run_scan` is eligible. A successful rescan resets it.
+#[derive(Debug, Clone, Default)]
+pub struct RescanBackoff {
+    consecutive_failures: u32,
+    next_eligible: Option<Instant>,
+    last_reason: Option<RescanFailureReason>,
+}
+
+impl RescanBackoff {
+    pub const BASE_DELAY: Duration = Duration::from_millis(250);
+    pub const MAX_DELAY: Duration = Duration::from_secs(30);
+
+    pub fn delay_for_attempt(attempt: u32) -> Duration {
+        if attempt == 0 {
+            return Duration::ZERO;
+        }
+        let exp = (attempt - 1).min(7);
+        Self::BASE_DELAY
+            .saturating_mul(1u32 << exp)
+            .min(Self::MAX_DELAY)
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    pub fn last_reason(&self) -> Option<RescanFailureReason> {
+        self.last_reason
+    }
+
+    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+        let deadline = self.next_eligible?;
+        let wait = deadline.checked_duration_since(now)?;
+        if wait.is_zero() { None } else { Some(wait) }
+    }
+
+    pub fn allow(&self, now: Instant) -> bool {
+        match self.next_eligible {
+            None => true,
+            Some(deadline) => now >= deadline,
+        }
+    }
+
+    pub fn record_failure(&mut self, now: Instant, reason: RescanFailureReason) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.last_reason = Some(reason);
+        let delay = Self::delay_for_attempt(self.consecutive_failures);
+        self.next_eligible = Some(now + delay);
+        delay
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn deferred_progress(&self, now: Instant) -> Option<ScanProgress> {
+        let remaining = self.remaining(now)?;
+        let reason = self.last_reason.unwrap_or(RescanFailureReason::Other);
+        Some(ScanProgress::failed_with_reason(
+            format!(
+                "rescan deferred: {} (retry in {}ms)",
+                reason.as_str(),
+                remaining.as_millis()
+            ),
+            reason,
+        ))
+    }
+
+    pub fn failure_progress(&self, detail: impl Into<String>) -> ScanProgress {
+        let reason = self.last_reason.unwrap_or(RescanFailureReason::Other);
+        ScanProgress::failed_with_reason(format!("{}: {}", reason.as_str(), detail.into()), reason)
+    }
 }
 
 /// Count summary for a completed scan.
@@ -84,6 +227,7 @@ impl ScanProgress {
             total_files: 0,
             eta_seconds: None,
             message: None,
+            reason: None,
         }
     }
 
@@ -94,16 +238,24 @@ impl ScanProgress {
             total_files: stats.total_files,
             eta_seconds: None,
             message: None,
+            reason: None,
         }
     }
 
-    pub fn failed(reason: impl Into<String>) -> Self {
+    pub fn failed(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let kind = RescanFailureReason::from_message(&message);
+        Self::failed_with_reason(message, kind)
+    }
+
+    pub fn failed_with_reason(message: impl Into<String>, reason: RescanFailureReason) -> Self {
         Self {
             phase: ScanPhase::Failed.as_str().into(),
             files_processed: 0,
             total_files: 0,
             eta_seconds: None,
-            message: Some(reason.into()),
+            message: Some(message.into()),
+            reason: Some(reason.as_str().into()),
         }
     }
 }
@@ -377,5 +529,103 @@ mod tests {
     #[test]
     fn loctree_scan_progress_method_name_matches_contract() {
         assert_eq!(LoctreeScanProgress::METHOD, "loctree/scanProgress");
+    }
+
+    #[test]
+    fn w4_05_lsp_rescan_backs_off_on_enospc() {
+        let t0 = Instant::now();
+        let mut backoff = RescanBackoff::default();
+        assert!(backoff.allow(t0));
+        assert!(backoff.deferred_progress(t0).is_none());
+
+        let enospc = std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "ENOSPC: No space left on device",
+        );
+        assert_eq!(
+            RescanFailureReason::from_io(&enospc),
+            RescanFailureReason::Enospc
+        );
+        #[cfg(unix)]
+        {
+            let raw = std::io::Error::from_raw_os_error(libc::ENOSPC);
+            assert_eq!(
+                RescanFailureReason::from_io(&raw),
+                RescanFailureReason::Enospc
+            );
+            assert_eq!(
+                RescanFailureReason::from_error(&raw),
+                RescanFailureReason::Enospc
+            );
+        }
+
+        let mut delays = Vec::new();
+        let mut now = t0;
+        for _ in 0..3 {
+            assert!(
+                backoff.allow(now),
+                "rescan must be eligible when recording the next ENOSPC failure"
+            );
+            let delay = backoff.record_failure(now, RescanFailureReason::from_io(&enospc));
+            delays.push(delay);
+
+            let progress = backoff.failure_progress(enospc.to_string());
+            assert_eq!(progress.reason.as_deref(), Some("enospc"));
+            let message = progress.message.as_deref().unwrap_or_default();
+            assert!(
+                message.contains("enospc"),
+                "failed diagnostics must name enospc, got {message:?}"
+            );
+
+            assert!(
+                !backoff.allow(now),
+                "immediate retry after ENOSPC must be deferred"
+            );
+            let deferred = backoff
+                .deferred_progress(now)
+                .expect("deferred diagnostic while backoff is in force");
+            assert_eq!(deferred.reason.as_deref(), Some("enospc"));
+            assert!(
+                deferred
+                    .message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("enospc")),
+                "deferred diagnostics must name enospc, got {:?}",
+                deferred.message
+            );
+            now += delay;
+        }
+
+        assert_eq!(delays[0], RescanBackoff::BASE_DELAY);
+        assert_eq!(delays[1], RescanBackoff::BASE_DELAY.saturating_mul(2));
+        assert_eq!(delays[2], RescanBackoff::BASE_DELAY.saturating_mul(4));
+        assert!(
+            delays[1] > delays[0] && delays[2] > delays[1],
+            "backoff must grow across three ENOSPC failures, got {delays:?}"
+        );
+
+        backoff.reset();
+        assert!(backoff.allow(now));
+        assert_eq!(backoff.consecutive_failures(), 0);
+        assert!(backoff.last_reason().is_none());
+        assert!(backoff.deferred_progress(now).is_none());
+
+        let other = std::io::Error::other("permission denied");
+        assert_eq!(
+            RescanFailureReason::from_io(&other),
+            RescanFailureReason::Other
+        );
+        backoff.record_failure(now, RescanFailureReason::from_io(&other));
+        let other_progress = backoff.failure_progress(other.to_string());
+        assert_eq!(other_progress.reason.as_deref(), Some("other"));
+        assert!(
+            !other_progress
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("enospc"),
+            "non-ENOSPC diagnostics must not be named enospc, got {:?}",
+            other_progress.message
+        );
     }
 }
