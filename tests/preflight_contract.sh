@@ -161,3 +161,7 @@ if ! grep -Fq "./gradlew --no-daemon classes testClasses" "$CODEQL_WORKFLOW"; th
   echo "CodeQL workflow does not compile the JetBrains Gradle sources before analysis" >&2
   exit 1
 fi
+if ! grep -Fq 'category: "/language:${{ matrix.language }}"' "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not separate per-language SARIF categories" >&2
+  exit 1
+fi
