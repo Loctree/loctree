@@ -6,7 +6,7 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
-## [0.14.5-dev0] - 2026-09-19
+## [0.14.5-rc1] - 2026-09-19
 
 ### Fixed
 - pin npm trusted-publishing toolchain (#76)

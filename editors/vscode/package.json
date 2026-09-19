@@ -2,7 +2,7 @@
   "name": "loctree",
   "displayName": "Loctree",
   "description": "One-shot full repository context for AI agents: literal occurrences, symbol bodies, context packs, and blast-radius navigation powered by loctree",
-  "version": "0.14.5-dev0",
+  "version": "0.14.5-rc1",
   "publisher": "libraxis",
   "license": "MIT",
   "repository": {

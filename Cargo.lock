@@ -2031,7 +2031,7 @@ dependencies = [
 
 [[package]]
 name = "loctree"
-version = "0.14.5-dev0"
+version = "0.14.5-rc1"
 dependencies = [
  "aicx",
  "anyhow",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "loctree-ast"
-version = "0.14.5-dev0"
+version = "0.14.5-rc1"
 dependencies = [
  "thiserror 2.0.18",
  "tree-sitter",
@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "loctree-lsp"
-version = "0.14.5-dev0"
+version = "0.14.5-rc1"
 dependencies = [
  "anyhow",
  "base64",
@@ -2129,7 +2129,7 @@ dependencies = [
 
 [[package]]
 name = "loctree-mcp"
-version = "0.14.5-dev0"
+version = "0.14.5-rc1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3322,7 +3322,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "report-leptos"
-version = "0.14.5-dev0"
+version = "0.14.5-rc1"
 dependencies = [
  "leptos",
  "pretty_assertions",
@@ -3332,7 +3332,7 @@ dependencies = [
 
 [[package]]
 name = "report-wasm"
-version = "0.14.5-dev0"
+version = "0.14.5-rc1"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
