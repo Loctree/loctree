@@ -474,6 +474,8 @@ pub fn audit_json_report(findings: &AuditFindings, limit: Option<usize>) -> Valu
     crowds.insert("total".to_string(), json!(findings.crowds.len()));
     insert_audit_collection(&mut crowds, "clusters", &findings.crowds, limit);
 
+    let health = audit_health(findings);
+
     Value::Object(Map::from_iter([
         ("cycles".to_string(), Value::Object(cycles)),
         ("dead_exports".to_string(), Value::Object(dead_exports)),
@@ -501,7 +503,8 @@ pub fn audit_json_report(findings: &AuditFindings, limit: Option<usize>) -> Valu
             json!({
                 "total_files": findings.total_files,
                 "total_loc": findings.total_loc,
-                "health_score": audit_health(findings).health,
+                "health_score": health.health,
+                "health_reason": health.reason,
             }),
         ),
     ]))
@@ -733,7 +736,7 @@ mod tests {
         let summary = findings_summary_report(&snapshot, FindingsReportOptions::default());
 
         assert_eq!(summary.files, 2);
-        assert!(summary.health_score <= 100);
+        assert!(summary.health_score.is_some_and(|h| h <= 100));
     }
 
     #[test]

@@ -216,8 +216,8 @@ pub fn generate_markdown_report(findings: &AuditFindings, limit: Option<usize>) 
     .unwrap();
     writeln!(
         out,
-        "| Health Score (audit basis) | {}/100 |",
-        health.health
+        "| Health Score (audit basis) | {} |",
+        health.format_score()
     )
     .unwrap();
     writeln!(out).unwrap();
@@ -840,7 +840,8 @@ mod tests {
         let findings = AuditFindings::default();
         let report = generate_markdown_report(&findings, None);
         assert!(report.contains("# Codebase Audit Report"));
-        assert!(report.contains("Health Score (audit basis) | 100/100"));
+        assert!(report.contains("Health Score (audit basis) | unknown (no files analyzed)"));
+        assert!(!report.contains("100/100"));
     }
 
     #[test]
@@ -1142,12 +1143,12 @@ mod tests {
         let collision_score = audit_health(&collisions).health;
         let exact_score = audit_health(&exact).health;
         assert_eq!(
-            collision_score, 100,
+            collision_score, Some(100),
             "NAME_COLLISION is informational and must not move health"
         );
         assert!(
             exact_score < collision_score,
-            "10 EXACT twins must score worse than 267 collisions: exact={exact_score} collisions={collision_score}"
+            "10 EXACT twins must score worse than 267 collisions: exact={exact_score:?} collisions={collision_score:?}"
         );
         let report = generate_markdown_report(&collisions, None);
         assert!(

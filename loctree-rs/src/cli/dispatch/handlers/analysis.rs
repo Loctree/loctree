@@ -2730,7 +2730,7 @@ pub fn handle_audit_command(opts: &AuditOptions, global: &GlobalOptions) -> Disp
         println!("\n{}\n", p.header("Audit Summary"));
         let health = crate::analyzer::audit_report::audit_health(&findings);
         println!(
-            "  Files: {}  |  LOC: {}  |  Actionable: {}  |  Health: {}/100",
+            "  Files: {}  |  LOC: {}  |  Actionable: {}  |  Health: {}",
             p.number(findings.total_files),
             p.number(findings.total_loc),
             if total_issues > 0 {
@@ -2738,7 +2738,7 @@ pub fn handle_audit_command(opts: &AuditOptions, global: &GlobalOptions) -> Disp
             } else {
                 p.ok(&total_issues.to_string())
             },
-            p.number(health.health as usize)
+            health.format_score()
         );
 
         if high_risk_cycles > 0 {

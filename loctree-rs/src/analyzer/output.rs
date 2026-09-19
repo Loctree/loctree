@@ -1553,7 +1553,7 @@ Top duplicate exports (showing {} actionable, {} cross-lang silenced):",
             .metrics();
 
             let score = calculate_health_score(&metrics);
-            Some(score.health)
+            score.health
         };
 
         let mut section = ReportSection {

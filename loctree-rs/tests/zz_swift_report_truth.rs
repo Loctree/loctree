@@ -295,7 +295,8 @@ fn clean_score_for(summary: &Value) -> u64 {
         loc: u64_at(summary, "/loc") as usize,
         ..HealthMetrics::default()
     })
-    .health as u64
+    .health
+    .expect("nonempty fixture must remain scorable") as u64
 }
 
 /// Unresolved and entry-point dead candidates stay on the sensor and off the score.
@@ -644,7 +645,7 @@ fn crowds_not_in_health_metrics() {
         ..HealthMetrics::default()
     });
     assert_eq!(
-        clean.health, 100,
+        clean.health, Some(100),
         "a repository with zero issues scores 100 — no crowd count can move it"
     );
 

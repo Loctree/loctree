@@ -50,9 +50,9 @@ pub struct RiskItem {
 /// `loctree/health` response payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
-    /// Overall health score, 0-100 (higher is better).
-    pub health_score: u8,
-    /// `green` (≥80), `yellow` (50-79), `red` (<50).
+    /// Overall health score, 0-100 (higher is better). `null` when unknown.
+    pub health_score: Option<u8>,
+    /// `green` (≥80), `yellow` (50-79), `red` (<50), `unknown` (no files).
     pub status: String,
     /// Cycle count from `analysis_reports::HealthReport`.
     pub cycles: usize,
@@ -157,7 +157,10 @@ pub fn build_response(
 
     HealthResponse {
         health_score: score.health,
-        status: status_label(score.health).to_string(),
+        status: match score.health {
+            Some(value) => status_label(value).to_string(),
+            None => "unknown".to_string(),
+        },
         cycles: report.cycles.total,
         dead_exports: report.dead_exports.total,
         twins: report.twins.total,
@@ -231,7 +234,7 @@ fn top_hotspot_files(snapshot: &Snapshot, n: usize) -> Vec<(String, usize)> {
         .collect()
 }
 
-fn recommend_actions(report: &HealthReport, stale: bool, score: u8) -> Vec<String> {
+fn recommend_actions(report: &HealthReport, stale: bool, score: Option<u8>) -> Vec<String> {
     let mut actions: Vec<String> = Vec::new();
     if stale {
         actions.push("Run `loct scan --full-scan` — snapshot is stale".into());
@@ -245,8 +248,12 @@ fn recommend_actions(report: &HealthReport, stale: bool, score: u8) -> Vec<Strin
     if report.twins.total > 10 {
         actions.push("Audit twin groups (`loct twins --json`)".into());
     }
-    if score < 50 {
-        actions.push("Block destructive refactors until score ≥ 50".into());
+    match score {
+        None => actions.push("Scan files before treating health as HEALTHY — no files analyzed".into()),
+        Some(value) if value < 50 => {
+            actions.push("Block destructive refactors until score ≥ 50".into());
+        }
+        Some(_) => {}
     }
     actions
 }
@@ -299,19 +306,19 @@ mod tests {
 
     #[test]
     fn recommend_actions_silent_on_clean_repo() {
-        let actions = recommend_actions(&empty_report(), false, 100);
+        let actions = recommend_actions(&empty_report(), false, Some(100));
         assert!(actions.is_empty(), "clean repo should yield no actions");
     }
 
     #[test]
     fn recommend_actions_flags_stale_snapshot() {
-        let actions = recommend_actions(&empty_report(), true, 90);
+        let actions = recommend_actions(&empty_report(), true, Some(90));
         assert!(actions.iter().any(|a| a.contains("snapshot is stale")));
     }
 
     #[test]
     fn recommend_actions_hard_block_under_fifty() {
-        let actions = recommend_actions(&empty_report(), false, 30);
+        let actions = recommend_actions(&empty_report(), false, Some(30));
         assert!(
             actions
                 .iter()
