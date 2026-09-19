@@ -1125,14 +1125,54 @@ pub(crate) fn collect_declared_entrypoints(summary: &ManifestSummary) -> Vec<Dec
     }
 
     if let Some(py) = &summary.pyproject_toml {
-        for script in &py.scripts {
-            declared.push(DeclaredEntrypoint {
-                source: "pyproject.toml:scripts".to_string(),
-                path: script.clone(),
-                exists: false,
-                resolved: false,
-                note: Some("script entry (no path mapping)".to_string()),
-            });
+        for entry in &py.script_entries {
+            let source = format!("pyproject.toml:scripts:{}", entry.key);
+            let (mod_part, _sym) = entry.path.split_once(':').unwrap_or((&entry.path, ""));
+            let mod_part = mod_part.trim();
+            let mod_rel = mod_part.replace('.', "/");
+
+            let mut resolved_path = None;
+            for cand in [
+                format!("{}.py", mod_rel),
+                format!("{}/__init__.py", mod_rel),
+                format!("src/{}.py", mod_rel),
+                format!("src/{}/__init__.py", mod_rel),
+            ] {
+                if root.join(&cand).exists() {
+                    resolved_path = Some(cand);
+                    break;
+                }
+            }
+
+            if let Some(path) = resolved_path {
+                declared.push(DeclaredEntrypoint {
+                    source,
+                    path,
+                    exists: true,
+                    resolved: true,
+                    note: None,
+                });
+            } else {
+                declared.push(DeclaredEntrypoint {
+                    source,
+                    path: entry.path.clone(),
+                    exists: false,
+                    resolved: false,
+                    note: Some("unresolved script module".to_string()),
+                });
+            }
+        }
+
+        if py.script_entries.is_empty() {
+            for script in &py.scripts {
+                declared.push(DeclaredEntrypoint {
+                    source: "pyproject.toml:scripts".to_string(),
+                    path: script.clone(),
+                    exists: false,
+                    resolved: false,
+                    note: Some("script entry (no path mapping)".to_string()),
+                });
+            }
         }
         for entry in &py.entry_points {
             declared.push(DeclaredEntrypoint {
@@ -1410,6 +1450,8 @@ pub struct PyProjectSummary {
     pub scripts: Vec<String>,
     #[serde(default)]
     pub entry_points: Vec<String>,
+    #[serde(default)]
+    pub script_entries: Vec<ManifestEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
