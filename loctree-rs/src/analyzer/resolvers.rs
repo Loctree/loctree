@@ -1066,6 +1066,83 @@ fn load_vite_aliases(root: &Path) -> HashMap<String, PathBuf> {
     result
 }
 
+pub(crate) fn resolve_rust_filesystem_path(
+    source: &str,
+    file_path: &Path,
+    crate_root: &Path,
+    root: &Path,
+) -> Option<String> {
+    let path_str = if let Some(stripped) = source.strip_prefix("include::") {
+        stripped
+    } else {
+        source
+    };
+
+    let is_fs_path = path_str.starts_with('.')
+        || path_str.starts_with('/')
+        || path_str.starts_with('\\')
+        || path_str.contains('/')
+        || path_str.contains('\\')
+        || (path_str.contains('.') && !path_str.contains("::"))
+        || path_str.starts_with("env:CARGO_MANIFEST_DIR");
+
+    if !is_fs_path {
+        return None;
+    }
+
+    let clean_path = if let Some(stripped) = path_str.strip_prefix("env:CARGO_MANIFEST_DIR") {
+        stripped.trim_start_matches('/').trim_start_matches('\\')
+    } else {
+        path_str
+    };
+
+    let parent = file_path.parent().unwrap_or(root);
+
+    let candidates = [
+        parent.join(clean_path),
+        crate_root.join(clean_path),
+        root.join(clean_path),
+    ];
+
+    let current_canon = canonical_rel(file_path, root);
+
+    for candidate in &candidates {
+        if candidate.exists() {
+            let target_path = if candidate.is_dir() {
+                let main_rs = candidate.join("src/main.rs");
+                if main_rs.exists() {
+                    main_rs
+                } else {
+                    let lib_rs = candidate.join("src/lib.rs");
+                    if lib_rs.exists() {
+                        lib_rs
+                    } else {
+                        let cargo_toml = candidate.join("Cargo.toml");
+                        if cargo_toml.exists() {
+                            cargo_toml
+                        } else {
+                            candidate.clone()
+                        }
+                    }
+                }
+            } else {
+                candidate.clone()
+            };
+
+            if let Some(rel) =
+                canonical_rel(&target_path, root).or_else(|| canonical_abs(&target_path))
+            {
+                if Some(&rel) == current_canon.as_ref() {
+                    continue;
+                }
+                return Some(rel);
+            }
+        }
+    }
+
+    None
+}
+
 pub(crate) fn resolve_rust_import(
     source: &str,
     file_path: &Path,
@@ -1130,6 +1207,11 @@ pub(crate) fn resolve_rust_import(
         };
 
         return module_path.and_then(|p| canonical_rel(&p, root).or_else(|| canonical_abs(&p)));
+    }
+
+    // W5-03: Handle filesystem paths (include_str!, include_bytes!, build.rs reads, rerun-if-changed)
+    if let Some(resolved) = resolve_rust_filesystem_path(source, file_path, crate_root, root) {
+        return Some(resolved);
     }
 
     if source.starts_with("std::")

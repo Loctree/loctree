@@ -347,7 +347,7 @@ pub struct ImportEntry {
 }
 
 /// Type of import statement.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ImportKind {
     /// `import X from 'y'` or `from x import y`
     Static,

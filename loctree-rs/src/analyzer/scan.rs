@@ -82,6 +82,7 @@ const SOURCE_CODE_EXTENSIONS: &[&str] = &[
     "zig",
     "zon",
     "swift",
+    "sql",
 ];
 
 /// Check if a file is likely binary based on extension or magic bytes
@@ -593,21 +594,24 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
     // Resolve Rust imports and reexports
     if ext == "rs" {
         let crate_root = find_rust_crate_root(&canonical);
-        if let Some(ref crate_root) = crate_root {
-            // Resolve imports
-            for imp in analysis.imports.iter_mut() {
-                if imp.resolved_path.is_none() {
-                    imp.resolved_path =
-                        resolve_rust_import(&imp.source, &canonical, crate_root, ctx.root_canon);
-                }
+        let fallback_root = canonical.parent().unwrap_or(ctx.root_canon);
+        let crate_root_ref = crate_root.as_deref().unwrap_or(fallback_root);
+        // Resolve imports
+        for imp in analysis.imports.iter_mut() {
+            if imp.resolved_path.is_none() {
+                imp.resolved_path =
+                    resolve_rust_import(&imp.source, &canonical, crate_root_ref, ctx.root_canon);
             }
-            // Resolve reexports (pub use statements)
-            // This is critical for dead code detection - reexported symbols are NOT dead
-            for re in analysis.reexports.iter_mut() {
-                if re.resolved.is_none() {
-                    re.resolved =
-                        resolve_rust_import(&re.source, &canonical, crate_root, ctx.root_canon);
-                }
+            if imp.resolved_path.is_some() {
+                imp.resolution = crate::types::ImportResolutionKind::Local;
+            }
+        }
+        // Resolve reexports (pub use statements)
+        // This is critical for dead code detection - reexported symbols are NOT dead
+        for re in analysis.reexports.iter_mut() {
+            if re.resolved.is_none() {
+                re.resolved =
+                    resolve_rust_import(&re.source, &canonical, crate_root_ref, ctx.root_canon);
             }
         }
     }

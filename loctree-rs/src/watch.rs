@@ -503,7 +503,7 @@ fn patch_snapshot(
                                 .and_then(|r| r.resolve(&imp.source, infra.extensions.as_ref()))
                         }
                     }
-                    "rs" if imp.is_mod_declaration => {
+                    "rs" => {
                         resolve_rust_import(&imp.source, path, &infra.root_canon, &infra.root_canon)
                     }
                     _ => None,
