@@ -47,7 +47,7 @@ umask 022
 
 # Keep this default in lockstep with [workspace.package] version in Cargo.toml.
 # `scripts/sync-version.sh` updates it and `make version-assert` enforces it.
-VERSION="${LOCTREE_VERSION:-0.14.4}"
+VERSION="${LOCTREE_VERSION:-0.14.5-dev0}"
 INSTALL_DIR="${INSTALL_DIR:-"$HOME/.local/bin"}"
 CARGO_HOME="${CARGO_HOME:-"$HOME/.cargo"}"
 CARGO_BIN="$CARGO_HOME/bin"

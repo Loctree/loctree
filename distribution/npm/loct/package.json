@@ -1,6 +1,6 @@
 {
   "name": "@loctree/loctree",
-  "version": "0.14.4",
+  "version": "0.14.5-dev0",
   "description": "Loctree — structural code intelligence for AI agents. One runtime (loctree), one npm install. MCP and editor (LSP) modes run through `loct watch`.",
   "keywords": [
     "loctree",
@@ -50,9 +50,9 @@
     "node": ">=14.0.0"
   },
   "optionalDependencies": {
-    "@loctree/loctree-darwin-arm64": "0.14.4",
-    "@loctree/loctree-darwin-x64": "0.14.4",
-    "@loctree/loctree-linux-x64-gnu": "0.14.4",
-    "@loctree/loctree-win32-x64-msvc": "0.14.4"
+    "@loctree/loctree-darwin-arm64": "0.14.5-dev0",
+    "@loctree/loctree-darwin-x64": "0.14.5-dev0",
+    "@loctree/loctree-linux-x64-gnu": "0.14.5-dev0",
+    "@loctree/loctree-win32-x64-msvc": "0.14.5-dev0"
   }
 }
