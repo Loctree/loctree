@@ -160,6 +160,9 @@ pub struct SliceOptions {
 
     /// Force rescan before slicing (includes uncommitted files)
     pub rescan: bool,
+
+    /// Scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
 }
 
 impl Default for SliceOptions {
@@ -170,6 +173,7 @@ impl Default for SliceOptions {
             consumers: true,
             depth: None,
             rescan: false,
+            include_untracked: false,
         }
     }
 }
@@ -262,6 +266,9 @@ pub struct FindOptions {
 
     /// Find where a symbol is defined/exported
     pub where_symbol: bool,
+
+    /// Scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
 }
 
 impl FindOptions {
@@ -314,6 +321,9 @@ pub struct OccurrencesOptions {
 
     /// Maximum number of occurrences to return in the current page.
     pub limit: Option<usize>,
+
+    /// Scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
 }
 
 /// Options for the `findings` command.

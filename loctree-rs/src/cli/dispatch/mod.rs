@@ -191,6 +191,7 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
             parsed.slice_target = Some(opts.target.clone());
             parsed.slice_consumers = opts.consumers;
             parsed.slice_rescan = opts.rescan;
+            parsed.include_untracked = opts.include_untracked;
             parsed.root_list = if let Some(ref root) = opts.root {
                 vec![root.clone()]
             } else {
@@ -269,6 +270,7 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
             parsed.search_exported_only = opts.exported_only;
             parsed.search_lang = opts.lang.clone();
             parsed.search_limit = opts.limit;
+            parsed.include_untracked = opts.include_untracked;
             // Discover / Mode::Search must honor find --root/--project (same as
             // literal/regex). Hardcoding cwd silently searched the wrong universe.
             parsed.root_list = opts.scan_roots();
@@ -1015,6 +1017,7 @@ mod tests {
             consumers: true,
             depth: None,
             rescan: false,
+            include_untracked: false,
         });
         let global = GlobalOptions {
             json: true,

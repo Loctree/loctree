@@ -9,6 +9,7 @@
 //! `--regex` switches the same command to pattern evaluation over raw file
 //! text, sharing the engine, coverage line and paging with `find --regex`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::super::super::command::{FindOptions, OccurrencesOptions};
@@ -54,7 +55,7 @@ pub fn handle_occurrences_command(
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -94,6 +95,7 @@ pub fn handle_occurrences_command(
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut results, overlay);
 
     if global.json {
         match serde_json::to_string_pretty(&results) {
@@ -156,7 +158,7 @@ fn handle_occurrences_regex(
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -169,6 +171,7 @@ fn handle_occurrences_regex(
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut results, overlay);
 
     if global.json {
         match serde_json::to_string_pretty(&results) {
@@ -219,7 +222,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -275,6 +278,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut literal_matches, overlay);
 
     // SECONDARY (strictly separate): fuzzy name-similarity hints, labeled
     // `source: "fuzzy"`. Never merged into `literal_matches`.
@@ -403,7 +407,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -432,6 +436,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut matches, overlay);
 
     let absence = absence_trust(
         &matches.universe,
@@ -714,6 +719,16 @@ fn print_zero_hit_absence(results: &OccurrenceResults, mode: AbsenceMode, looks_
             AbsenceMode::Literal => "not found — literal ",
         };
         println!("  ({prefix}{caveat})");
+        if results
+            .universe
+            .exclusions
+            .iter()
+            .any(|entry| entry.kind == "untracked")
+        {
+            println!(
+                "  (pass --include-untracked to scan fresh untracked files without a full rescan)"
+            );
+        }
         return;
     }
     match mode {
@@ -790,6 +805,79 @@ fn read_snapshot_contents(snapshot: &Snapshot, base: &Path) -> Vec<(String, Stri
         }
     }
     contents
+}
+
+struct UntrackedOverlay {
+    count: usize,
+    included: bool,
+    scanned: usize,
+    known: bool,
+}
+
+fn apply_untracked_overlay(results: &mut OccurrenceResults, overlay: UntrackedOverlay) {
+    if overlay.known {
+        results.declare_untracked_overlay(overlay.count, overlay.included, overlay.scanned);
+    }
+}
+
+/// Snapshot bytes plus optional in-memory untracked overlay.
+///
+/// Untracked files never mutate the snapshot. `--include-untracked` only
+/// appends their contents to this scan.
+fn read_literal_contents(
+    snapshot: &Snapshot,
+    base: &Path,
+    include_untracked: bool,
+) -> (Vec<(String, String)>, UntrackedOverlay) {
+    let mut contents = read_snapshot_contents(snapshot, base);
+    let Some(paths) = crate::snapshot::git_untracked_source_paths(base) else {
+        return (
+            contents,
+            UntrackedOverlay {
+                count: 0,
+                included: include_untracked,
+                scanned: 0,
+                known: false,
+            },
+        );
+    };
+    let indexed: HashSet<String> = snapshot
+        .files
+        .iter()
+        .map(|file| {
+            file.path
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string()
+        })
+        .collect();
+    let extra: Vec<String> = paths
+        .into_iter()
+        .filter(|path| {
+            let normalized = path.replace('\\', "/").trim_start_matches("./").to_string();
+            !indexed.contains(&normalized)
+        })
+        .collect();
+    let count = extra.len();
+    let mut scanned = 0;
+    if include_untracked {
+        for path in &extra {
+            let resolved = resolve_path(base, path);
+            if let Ok(text) = std::fs::read_to_string(&resolved) {
+                contents.push((path.clone(), text));
+                scanned += 1;
+            }
+        }
+    }
+    (
+        contents,
+        UntrackedOverlay {
+            count,
+            included: include_untracked,
+            scanned,
+            known: true,
+        },
+    )
 }
 
 /// Resolve a snapshot-relative path against the scan root. Falls back to the
@@ -1167,5 +1255,243 @@ mod tests {
                 "plain literal {literal:?} must not be flagged as regex-like"
             );
         }
+    }
+
+    fn git_init_with_file(root: &std::path::Path, rel: &str, body: &str) {
+        let parent = std::path::PathBuf::from(rel);
+        let parent = parent.parent().unwrap_or(root);
+        std::fs::create_dir_all(root.join(parent)).unwrap();
+        std::fs::write(root.join(rel), body).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "t@t.com"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-m", "seed"]);
+    }
+
+    /// W2-01: tracked `.kdl` layouts must land in the snapshot so literal
+    /// find and slice can see executable argv they carry.
+    #[test]
+    #[serial_test::serial]
+    fn w2_01_kdl_files_indexed() {
+        let (_cache_dir, _cache_env) = crate::snapshot::test_env::isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_init_with_file(
+            root,
+            "layout.kdl",
+            "layout W2_01_KDL_LAYOUT_ARGV {\n    argv \"cargo test\"\n}\n",
+        );
+
+        let snapshot = super::load_or_create_query_snapshot_for_roots(
+            std::slice::from_ref(&root.to_path_buf()),
+            &super::query_global_options(&super::GlobalOptions {
+                quiet: true,
+                force_non_git: false,
+                ..Default::default()
+            }),
+        )
+        .expect("scan fixture with tracked layout.kdl");
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("layout.kdl")),
+            "tracked layout.kdl must be in the snapshot; files={:?}",
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let (contents, overlay) = super::read_literal_contents(&snapshot, root, false);
+        assert!(overlay.known);
+        let borrowed: Vec<(&str, &str)> = contents
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let mut hits = crate::analyzer::occurrences::scan_files_with(
+            borrowed,
+            "W2_01_KDL_LAYOUT_ARGV",
+            crate::analyzer::occurrences::ScanOptions::default(),
+        );
+        hits.declare_snapshot_universe(
+            &snapshot,
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        super::apply_untracked_overlay(&mut hits, overlay);
+        assert!(
+            hits.total > 0,
+            "find --literal must see the token in tracked layout.kdl; coverage={}",
+            hits.coverage_line
+        );
+        assert!(
+            hits.occurrences
+                .iter()
+                .any(|hit| hit.file.ends_with("layout.kdl")),
+            "literal hit must name layout.kdl; got {:?}",
+            hits.occurrences
+                .iter()
+                .map(|hit| hit.file.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let slice = crate::slicer::HolographicSlice::from_path(
+            &snapshot,
+            "layout.kdl",
+            &crate::slicer::SliceConfig::default(),
+        )
+        .expect("slice must bind tracked layout.kdl");
+        assert!(
+            slice
+                .core
+                .iter()
+                .any(|file| file.path.ends_with("layout.kdl")),
+            "slice core must include layout.kdl; target={}",
+            slice.target
+        );
+    }
+
+    /// W2-01: a fresh untracked source file is invisible to literal find
+    /// until `--include-untracked`; coverage must keep indexed vs untracked
+    /// distinct, and the zero-hit path must name the flag.
+    #[test]
+    #[serial_test::serial]
+    fn w2_01_include_untracked_finds_new_file() {
+        let (_cache_dir, _cache_env) = crate::snapshot::test_env::isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_init_with_file(root, "src/lib.rs", "pub fn already_indexed() {}\n");
+
+        let snapshot = super::load_or_create_query_snapshot_for_roots(
+            std::slice::from_ref(&root.to_path_buf()),
+            &super::query_global_options(&super::GlobalOptions {
+                quiet: true,
+                force_non_git: false,
+                ..Default::default()
+            }),
+        )
+        .expect("scan seed");
+        let indexed = snapshot.files.len();
+        assert!(indexed > 0, "seed src/lib.rs must be indexed");
+
+        std::fs::write(
+            root.join("src/fresh.rs"),
+            "pub fn W2_01_UNTRACKED_TOKEN() {}\n",
+        )
+        .unwrap();
+
+        let (contents, overlay) = super::read_literal_contents(&snapshot, root, false);
+        assert!(overlay.known);
+        assert!(
+            overlay.count >= 1,
+            "git must report the untracked .rs file; count={}",
+            overlay.count
+        );
+        assert!(!overlay.included);
+        let borrowed: Vec<(&str, &str)> = contents
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let mut hidden = crate::analyzer::occurrences::scan_files_with(
+            borrowed,
+            "W2_01_UNTRACKED_TOKEN",
+            crate::analyzer::occurrences::ScanOptions::default(),
+        );
+        hidden.declare_snapshot_universe(
+            &snapshot,
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        let untracked_count = overlay.count;
+        super::apply_untracked_overlay(&mut hidden, overlay);
+        assert_eq!(
+            hidden.total, 0,
+            "without --include-untracked the fresh file must be a zero-hit"
+        );
+        assert!(
+            hidden
+                .suggested_next
+                .iter()
+                .any(|next| next.command.contains("--include-untracked")),
+            "zero-hit must suggest --include-untracked; got {:?}",
+            hidden.suggested_next
+        );
+        assert!(
+            hidden.coverage_line.contains("untracked="),
+            "coverage must distinguish untracked from indexed; line={}",
+            hidden.coverage_line
+        );
+        assert_eq!(
+            hidden.universe.indexed_files, indexed,
+            "indexed universe must not absorb the untracked file"
+        );
+        assert_eq!(hidden.universe.untracked.files, Some(untracked_count));
+        assert!(
+            hidden.universe.scan_complete,
+            "scan_complete is an indexed-universe claim and must stay true"
+        );
+
+        let (included_contents, included_overlay) =
+            super::read_literal_contents(&snapshot, root, true);
+        assert!(included_overlay.included);
+        let included_borrowed: Vec<(&str, &str)> = included_contents
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let mut shown = crate::analyzer::occurrences::scan_files_with(
+            included_borrowed,
+            "W2_01_UNTRACKED_TOKEN",
+            crate::analyzer::occurrences::ScanOptions::default(),
+        );
+        shown.declare_snapshot_universe(
+            &snapshot,
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        let included_count = included_overlay.count;
+        super::apply_untracked_overlay(&mut shown, included_overlay);
+        assert!(
+            shown.total > 0,
+            "with --include-untracked the fresh token must hit; coverage={}",
+            shown.coverage_line
+        );
+        assert!(
+            shown
+                .occurrences
+                .iter()
+                .any(|hit| hit.file.contains("fresh.rs")),
+            "hit must name the untracked file; got {:?}",
+            shown
+                .occurrences
+                .iter()
+                .map(|hit| hit.file.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            shown.universe.indexed_files, indexed,
+            "including untracked must not rewrite indexed_files"
+        );
+        assert_eq!(shown.universe.untracked.files, Some(included_count));
+        assert!(
+            shown.universe.scan_complete,
+            "indexed scan_complete must stay true after the overlay"
+        );
+        assert!(
+            shown.coverage_line.contains("untracked="),
+            "coverage must still name untracked after include; line={}",
+            shown.coverage_line
+        );
     }
 }

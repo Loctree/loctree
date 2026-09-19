@@ -400,6 +400,10 @@ fn scan_single_root(
             "xml",
             "svg",
             "txt",
+            "kdl",
+            "snap",
+            "sha256",
+            "template",
         ] {
             set.insert(lang_ext.to_string());
         }

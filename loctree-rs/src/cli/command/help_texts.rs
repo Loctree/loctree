@@ -224,6 +224,7 @@ OPTIONS:
     --depth <N>        Maximum dependency depth to traverse
     --root <PATH>      Project root for resolving imports
     --rescan           Force snapshot update (includes new/uncommitted files)
+    --include-untracked Slice an untracked file in-memory without a full rescan
     --help, -h         Show this help message
 
 EXAMPLES:
@@ -388,6 +389,7 @@ OPTIONS:
     --group-by-file      In literal mode, include a per-file rollup
     --count-only, --slim In literal mode, return counters without occurrences
     --compact            In literal mode, terse path:line human output
+    --include-untracked  Scan git-untracked sources in-memory (no full rescan)
     --offset <N>         In literal mode, zero-based page offset
     --root <PATH>        Project root to scan (default: current directory)
     --project <PATH>     Alias for --root (parity with context --project)
@@ -475,6 +477,7 @@ OPTIONS:
     --group-by-file      Include a per-file occurrence rollup
     --count-only, --slim Return counters without the occurrence list
     --compact            Human output: terse path:line plus one context line
+    --include-untracked  Scan git-untracked sources in-memory (no full rescan)
     --limit <N>          Maximum occurrences in this page
     --offset <N>         Zero-based offset for paged output
     --json               Emit JSON (file, line, column, matched_text, context, source)

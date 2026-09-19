@@ -24,6 +24,7 @@ OPTIONS:
     --depth <N>          Maximum dependency depth to traverse (default: unlimited)
     --root <PATH>        Project root for resolving relative imports
     --rescan             Force snapshot update before slicing
+    --include-untracked  Slice a fresh untracked file without a full rescan
     --help, -h           Show this help message
 
 EXAMPLES:
@@ -62,6 +63,10 @@ EXAMPLES:
             }
             "--rescan" => {
                 opts.rescan = true;
+                i += 1;
+            }
+            "--include-untracked" => {
+                opts.include_untracked = true;
                 i += 1;
             }
             _ if !arg.starts_with('-') => {

@@ -84,6 +84,8 @@ pub struct ParsedArgs {
     pub slice_consumers: bool,
     /// Force rescan before slicing (for uncommitted files)
     pub slice_rescan: bool,
+    /// Slice/find: scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
     pub trace_handler: Option<String>,
     /// Unified search query
     pub search_query: Option<String>,
@@ -210,6 +212,7 @@ impl Default for ParsedArgs {
             slice_target: None,
             slice_consumers: true,
             slice_rescan: false,
+            include_untracked: false,
             trace_handler: None,
             search_query: None,
             search_queries: Vec::new(),

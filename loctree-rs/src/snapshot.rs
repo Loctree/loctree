@@ -456,7 +456,43 @@ fn should_rescan_for_unindexed_dirty_path(path: &str) -> bool {
             | "yaml"
             | "zig"
             | "config"
+            | "kdl"
+            | "snap"
+            | "sha256"
+            | "template"
     )
+}
+
+/// Git porcelain `??` paths that look like scan-eligible sources.
+///
+/// Used by `--include-untracked` so a fresh file is visible to literal/slice
+/// without mutating the snapshot. `-uall` lists files inside new directories
+/// instead of collapsing them to a single `?? dir/` entry.
+pub(crate) fn git_untracked_source_paths(root: &Path) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !line.starts_with("?? ") || line.len() < 4 {
+            continue;
+        }
+        let path = unquote_git_status_path(line[3..].trim());
+        if path.ends_with('/') || is_loctree_artifact_path(&path) {
+            continue;
+        }
+        if should_rescan_for_unindexed_dirty_path(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Some(paths)
 }
 
 /// First-scan hygiene: make sure `.loctree/` is gitignored in `root`.
@@ -1863,6 +1899,13 @@ impl Snapshot {
             let saved_hashes = parse_reuse_fence_file_hashes(&saved);
             let indexed_paths: HashSet<_> =
                 self.files.iter().map(|file| file.path.as_str()).collect();
+            // Untracked sources are overlay-eligible via `--include-untracked`.
+            // They must not fail the indexed reuse fence or every find pays a
+            // full rescan for a file that is not in the snapshot universe.
+            let untracked: HashSet<String> = git_untracked_source_paths(root)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             for dirty_path in dirty_paths {
                 if indexed_paths.contains(dirty_path.as_str()) {
                     let Some(saved_hash) = saved_hashes.get(dirty_path.as_str()) else {
@@ -1871,6 +1914,8 @@ impl Snapshot {
                     if &hash_file_state(root, &dirty_path)? != saved_hash {
                         return Ok(false);
                     }
+                } else if untracked.contains(&dirty_path) {
+                    continue;
                 } else if should_rescan_for_unindexed_dirty_path(&dirty_path) {
                     return Ok(false);
                 }

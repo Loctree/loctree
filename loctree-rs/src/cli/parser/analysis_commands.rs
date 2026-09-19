@@ -242,6 +242,7 @@ OPTIONS:
     --compact                           (literal) Terse path:line human output
     --offset <N>                        (literal) Zero-based occurrence offset for paged output
     --root <PATH>, --project <PATH>     Project root to scan (default: current directory)
+    --include-untracked                 Scan fresh untracked files in-memory (does not mutate snapshot)
     --path <PATTERN>                    Alias for --file (path/suffix scope in literal mode)
     --or                                Combine multiple QUERY args with OR (legacy behavior)
     --symbol <PATTERN>, -s <PATTERN>    Search for symbols matching regex
@@ -324,6 +325,10 @@ EXAMPLES:
             }
             "--compact" => {
                 opts.compact = true;
+                i += 1;
+            }
+            "--include-untracked" => {
+                opts.include_untracked = true;
                 i += 1;
             }
             "--impact" => {
@@ -594,6 +599,7 @@ DESCRIPTION:
 
 OPTIONS:
     --root <PATH>        Project root to scan (default: current directory)
+    --include-untracked  Scan fresh untracked files in-memory (does not mutate snapshot)
     --regex              Evaluate <IDENT> as a regular expression over raw file text
                          (same engine, coverage line and paging as 'find --regex')
     --whole-token        Treat '-' as token-internal: 'backdrop' no longer matches inside
@@ -636,6 +642,10 @@ EXAMPLES:
                     .ok_or_else(|| format!("{flag} requires a path"))?;
                 opts.roots.push(PathBuf::from(value));
                 i += 2;
+            }
+            "--include-untracked" => {
+                opts.include_untracked = true;
+                i += 1;
             }
             "--regex" => {
                 opts.regex = true;

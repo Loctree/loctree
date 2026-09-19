@@ -94,6 +94,13 @@ pub fn default_analyzer_exts() -> HashSet<String> {
         "xml",
         "svg",
         "txt",
+        // W2-01: vc-frame `.kdl` layouts carry executable argv, and tracked
+        // snapshot/hash/template sidecars are literal truth — they must sit
+        // in the indexed universe, not only on disk.
+        "kdl",
+        "snap",
+        "sha256",
+        "template",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -1024,6 +1031,21 @@ mod tests {
             assert!(
                 exts.contains(ext),
                 "{ext} must be in default analyzer extensions so design assets land in the snapshot; got {:?}",
+                exts
+            );
+        }
+    }
+
+    /// W2-01: vc-frame `.kdl` layouts carry executable argv, and tracked
+    /// snapshot/hash/template sidecars are literal truth — they must sit in
+    /// the indexed universe, not only on disk.
+    #[test]
+    fn default_analyzer_exts_includes_kdl_and_tracked_sidecars() {
+        let exts = default_analyzer_exts();
+        for ext in ["kdl", "snap", "sha256", "template"] {
+            assert!(
+                exts.contains(ext),
+                "{ext} must be in default analyzer extensions so tracked layouts/sidecars land in tree/focus/slice; got {:?}",
                 exts
             );
         }
