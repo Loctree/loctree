@@ -24,17 +24,20 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use fs4::fs_std::FileExt;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::ServerInfo;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 mod args;
 mod auth;
@@ -865,6 +868,7 @@ impl SnapshotLoadOptions {
 /// Render a failure as `{"error": "…"}` so a tool that fails still returns
 /// parseable JSON rather than a bare string the client cannot deserialize.
 fn json_error(err: impl std::fmt::Display) -> String {
+    touch_activity();
     serde_json::json!({ "error": err.to_string() }).to_string()
 }
 
@@ -928,6 +932,7 @@ const MCP_RESPONSE_BUDGET_PROTOCOL: &str = "loctree.mcp.response_budget.v1";
 /// tool returns through here, so the cap is a property of the surface rather
 /// than of individual handlers.
 fn tool_json_response(tool: &str, project: Option<&Path>, value: serde_json::Value) -> String {
+    touch_activity();
     match serde_json::to_string_pretty(&value) {
         Ok(raw) => budget_tool_response(tool, project, raw),
         Err(e) => format!("Serialization error: {e}"),
@@ -2047,6 +2052,7 @@ impl LoctreeServer {
         description = "Get a complete Agent Context Pack with structural, runtime, risk, action, authority, and optional AICX memory context. Start here for onboarding."
     )]
     async fn context(&self, Parameters(params): Parameters<ContextParams>) -> String {
+        touch_activity();
         // Server-side deadline keeps loctree-mcp ahead of the typical 120s MCP
         // client timeout so operators always receive a structured payload —
         // either the full response or a `deadline_exceeded` hint with a
@@ -2217,6 +2223,7 @@ impl LoctreeServer {
         description = "Get a compact repository overview: file count, LOC, languages, health summary, top hubs, and quick wins."
     )]
     async fn repo_view(&self, Parameters(params): Parameters<ForAiParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return format!("Error: {}", e),
@@ -2375,6 +2382,7 @@ impl LoctreeServer {
         description = "Get file context: the file + all its imports + all files that depend on it. USE THIS BEFORE modifying any file. One call = complete understanding of a file's role."
     )]
     async fn slice(&self, Parameters(params): Parameters<SliceParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return format!("Error: {}", e),
@@ -2483,6 +2491,7 @@ impl LoctreeServer {
         description = "Return the bounded source body/range for a symbol. Uses the same loctree::body query as the CLI and reports extent/truncation metadata. Use after find(where-symbol), without falling back to offset-based file reads."
     )]
     async fn body(&self, Parameters(params): Parameters<BodyParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(project) => project,
             Err(err) => return json_error(err),
@@ -2522,6 +2531,7 @@ impl LoctreeServer {
         description = "Find symbols, trace imports, or explore features. Modes: 'symbols' (default) — symbol/param search with regex. 'who-imports' — what files import this file (reverse deps). 'where-symbol' — where is this symbol defined. 'tagmap' — unified keyword search (files + crowd + dead). 'crowd' — functional clustering around a keyword. 'literal' — exact identifier-boundary occurrences over the indexed universe; coverage stated per query; 'not found' means not found, with fuzzy hints kept strictly separate. At parity with `loct occurrences` / `loct find --literal`. Multi-literal OR: pass simple identifiers as `NameA|NameB` (pipe) for exact-union (`match_mode: multi_literal`) — prefer this over shell grep for agent multi-pattern search. Literal-mode tuning (all opt-in, ignored otherwise): every occurrence carries a language-aware `occurrence_kind` (css_property, class_token, custom_property, comment, string_literal, data_attribute, identifier, plus the Rust role shapes; `unknown` only as honest fallback); `whole_token=true` treats '-' as token-internal so e.g. 'backdrop' stops matching inside 'overlay-backdrop'/'--vista-z-overlay-backdrop'; `group_by_file=true` adds a per-file `by_file` count rollup; `count_only`/`slim=true` suppresses the full occurrence list (keeping `total`/`files_matched`/`by_file`) for token economy."
     )]
     async fn find(&self, Parameters(params): Parameters<FindParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return format!("Error: {}", e),
@@ -3156,6 +3166,7 @@ impl LoctreeServer {
         description = "What breaks if you change or delete this file? Shows direct and transitive consumers. USE THIS BEFORE deleting or major refactor."
     )]
     async fn impact(&self, Parameters(params): Parameters<ImpactParams>) -> String {
+        touch_activity();
         let bundle = bundle_diagnostic();
         if bundle.status != BundleCompatibility::Compatible {
             return tool_json_response(
@@ -3291,6 +3302,7 @@ impl LoctreeServer {
         description = "Compare the current live project snapshot with a git ref such as HEAD~1. Materializes the base through the shared snapshot/diff library, includes dirty working-tree structure in the current side, and returns file/graph/export/impact changes."
     )]
     async fn diff(&self, Parameters(params): Parameters<DiffParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(project) => project,
             Err(err) => return json_error(err),
@@ -3362,6 +3374,7 @@ impl LoctreeServer {
         description = "Get directory structure with LOC counts. Depth is unlimited when omitted, matching CLI. Supports paths, files_only/files, path_filter/match regex, summary, top, show_hidden, show_ignored, and find_artifacts."
     )]
     async fn tree(&self, Parameters(params): Parameters<TreeParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return format!("Error: {}", e),
@@ -3494,6 +3507,7 @@ impl LoctreeServer {
         description = "Focus on a directory: files, exports, dependencies and optional consumers. Supports depth and consumers/no_consumers, matching CLI traversal controls."
     )]
     async fn focus(&self, Parameters(params): Parameters<FocusParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return format!("Error: {}", e),
@@ -3599,6 +3613,7 @@ impl LoctreeServer {
         description = "Pursue structural signals at field level. Scopes: 'dead' — unused exports with nearest consumers. 'cycles' — circular imports with weakest link. 'twins' — duplicate exports plus route-level twins (CLI `loct twins` parity). 'hotspots' — high-importer files. 'trace' — trace a Tauri/IPC handler end-to-end (requires handler param). 'commands' — Tauri FE<->BE handler coverage. 'events' — event emit/listen flow analysis. 'pipelines' — pipeline summary (events + commands + risks). 'all' — dead + cycles + twins (incl. route_twins) + hotspots."
     )]
     async fn follow(&self, Parameters(params): Parameters<FollowParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return format!("Error: {}", e),
@@ -4056,6 +4071,7 @@ impl LoctreeServer {
         description = "Source-side silencer inventory. LITERAL-ONLY detection (free-tier scope): surfaces every Rust #[allow(...)], Rust #[ignore], Rust unsafe { ... } (with Rust 2024 env-var boilerplate triaged as 'unsafe-env-var'), Semgrep nosemgrep comments, TypeScript @ts-ignore, @ts-expect-error, @ts-nocheck, ESLint eslint-disable, Python # noqa, Python # type: ignore, Python # pylint: disable, Python # mypy:, Shell # shellcheck disable. Returns structured JSON: { matches: [{ kind, file, line, snippet, rule_id }], counts: { kind: count }, files_per_kind: { kind: file_count }, total, total_files }. Filter with kinds=[...]. NO semantic enrichment — semantic classification (suspicious/stale/similar-to-fixed) is paid-tier Wave 7+ delta and explicitly out of scope here. Distinct from .loctree/suppressions.toml (that's loctree's OWN finding-suppression file; different concept, similar name)."
     )]
     async fn suppressions(&self, Parameters(params): Parameters<SuppressionsParams>) -> String {
+        touch_activity();
         let project = match Self::resolve_project(&params.project, params.force_no_git) {
             Ok(p) => p,
             Err(e) => return json_error(e),
@@ -4113,6 +4129,7 @@ impl LoctreeServer {
         description = "Score conceptual smear across two or more task framings. Composes one ContextPack per task, computes file overlap and Jaccard distance, and emits the canonical loctree.prism.v1 JSON schema (axes, band, recommendation, task summaries, overlap). Use when a feature feels like it lives in multiple places at once and you need to decide whether vc-polarize is warranted."
     )]
     async fn prism(&self, Parameters(params): Parameters<PrismParams>) -> String {
+        touch_activity();
         if params.task.len() < 2 {
             return json_error(
                 "prism requires at least two task framings; pass task=[\"a\", \"b\"]",
@@ -4227,6 +4244,7 @@ fn bundle_diagnostic() -> BundleDiagnostic<'static> {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LoctreeServer {
     fn get_info(&self) -> ServerInfo {
+        touch_activity();
         let mut capabilities = rmcp::model::ServerCapabilities::default();
         capabilities.tools = Some(rmcp::model::ToolsCapability {
             list_changed: Some(true),
@@ -4247,6 +4265,202 @@ impl ServerHandler for LoctreeServer {
                 build_identity_banner(),
                 TOOL_SURFACE_DIGEST
             ))
+    }
+}
+
+// ============================================================================
+// Activity Watchdog & Single-Instance Lock
+// ============================================================================
+
+static START_INSTANT: OnceLock<Instant> = OnceLock::new();
+static LAST_ACTIVITY_ELAPSED_MS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn touch_activity() {
+    let start = START_INSTANT.get_or_init(Instant::now);
+    let elapsed = start.elapsed().as_millis() as u64;
+    LAST_ACTIVITY_ELAPSED_MS.store(elapsed, Ordering::Relaxed);
+}
+
+pub(crate) fn time_since_last_activity() -> Duration {
+    let start = START_INSTANT.get_or_init(Instant::now);
+    let last = LAST_ACTIVITY_ELAPSED_MS.load(Ordering::Relaxed);
+    let now = start.elapsed().as_millis() as u64;
+    Duration::from_millis(now.saturating_sub(last))
+}
+
+pub(crate) fn idle_timeout_from_env() -> Option<Duration> {
+    const DEFAULT_IDLE_MINUTES: f64 = 30.0;
+    let minutes = match std::env::var("LOCT_MCP_IDLE_MIN") {
+        Ok(val) => match val.trim().parse::<f64>() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    "invalid LOCT_MCP_IDLE_MIN '{}': {}, using default {} min",
+                    val, e, DEFAULT_IDLE_MINUTES
+                );
+                DEFAULT_IDLE_MINUTES
+            }
+        },
+        Err(_) => DEFAULT_IDLE_MINUTES,
+    };
+    if minutes <= 0.0 {
+        None
+    } else {
+        Some(Duration::from_secs_f64(minutes * 60.0))
+    }
+}
+
+async fn run_idle_watchdog(idle_duration: Duration) {
+    let check_interval = Duration::from_millis(50).min(idle_duration / 2);
+    loop {
+        tokio::time::sleep(check_interval).await;
+        if time_since_last_activity() >= idle_duration {
+            info!(
+                "loctree-mcp idle timeout of {:.2?} reached with no requests; shutting down",
+                idle_duration
+            );
+            break;
+        }
+    }
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to install SIGTERM handler: {e}");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn lock_disabled() -> bool {
+    std::env::var("LOCT_MCP_NO_LOCK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+#[derive(Debug)]
+pub(crate) struct SingleInstanceLock {
+    file: std::fs::File,
+    lock_path: PathBuf,
+    pid_path: PathBuf,
+    project_root: PathBuf,
+}
+
+impl SingleInstanceLock {
+    pub(crate) fn acquire(project_root: &Path) -> Result<Self, anyhow::Error> {
+        let canonical = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        let cache_dir = loctree::snapshot::project_cache_dir(&canonical);
+        std::fs::create_dir_all(&cache_dir).with_context(|| {
+            format!(
+                "could not create project cache dir for lock at {}",
+                cache_dir.display()
+            )
+        })?;
+
+        let lock_path = cache_dir.join("mcp.lock");
+        let pid_path = cache_dir.join("mcp.pid");
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("could not open mcp lock file at {}", lock_path.display())
+            })?;
+
+        if !file.try_lock_exclusive().with_context(|| {
+            format!("could not lock mcp lock file at {}", lock_path.display())
+        })? {
+            // Lock is held by an active process!
+            let pid_str = std::fs::read_to_string(&pid_path)
+                .ok()
+                .or_else(|| {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut content = String::new();
+                    let _ = file.seek(SeekFrom::Start(0));
+                    let _ = file.read_to_string(&mut content);
+                    if content.trim().is_empty() {
+                        None
+                    } else {
+                        Some(content)
+                    }
+                });
+
+            let pid_display = pid_str
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("unknown");
+
+            anyhow::bail!(
+                "loctree-mcp is already running for project '{}' (pid {}); refusing to start a second instance. (hint: reuse the existing instance or terminate pid {})",
+                canonical.display(),
+                pid_display,
+                pid_display
+            );
+        }
+
+        // We acquired the flock!
+        let my_pid = std::process::id();
+        let pid_payload = format!("{}\n", my_pid);
+
+        if let Err(e) = std::fs::write(&pid_path, &pid_payload) {
+            warn!(
+                "failed to write pidfile at {}: {e}",
+                pid_path.display()
+            );
+        }
+
+        use std::io::{Seek, SeekFrom, Write};
+        let _ = file.set_len(0);
+        let _ = file.seek(SeekFrom::Start(0));
+        let _ = file.write_all(pid_payload.as_bytes());
+        let _ = file.flush();
+
+        Ok(Self {
+            file,
+            lock_path,
+            pid_path,
+            project_root: canonical,
+        })
+    }
+
+    pub(crate) fn pid_path(&self) -> &Path {
+        &self.pid_path
+    }
+
+    pub(crate) fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+
+    pub(crate) fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+}
+
+impl Drop for SingleInstanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.pid_path);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -4292,23 +4506,69 @@ async fn run_server() -> Result<()> {
         "Starting loctree-mcp v{} (git {}) (universal, snapshot cache capacity {})",
         BUILD_VERSION, GIT_DESCRIBE, args.snapshot_cache_capacity
     );
+    let project_dir = default_project();
     if args.root.is_some() {
-        info!("Default project root pinned to {}", default_project());
+        info!("Default project root pinned to {}", project_dir);
     }
 
+    let canonical_root = Path::new(&project_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&project_dir));
+
+    let _lock_guard = if lock_disabled() {
+        None
+    } else {
+        Some(SingleInstanceLock::acquire(&canonical_root)?)
+    };
+
+    if let Some(ref guard) = _lock_guard {
+        info!(
+            "Acquired single-instance lock for project '{}' (lockfile: {}, pidfile: {})",
+            guard.project_root().display(),
+            guard.lock_path().display(),
+            guard.pid_path().display()
+        );
+    }
+
+    touch_activity();
+
+    let idle_duration_opt = idle_timeout_from_env();
+    if let Some(idle_dur) = idle_duration_opt {
+        info!("Idle watchdog configured: {:.2?}", idle_dur);
+    }
+
+    let shutdown_signal = wait_for_shutdown_signal();
     let auth_settings = AuthSettings::from_args(&args);
 
-    match args.transport {
-        TransportKind::Stdio if args.exit_on_stdin_eof => Err(anyhow::anyhow!(
-            "--exit-on-stdin-eof is only valid with --transport http"
-        )),
-        TransportKind::Stdio => serve_stdio(args.snapshot_cache_capacity).await,
-        TransportKind::Http if args.exit_on_stdin_eof => {
-            serve_http_until_stdin_eof(&args.bind, args.snapshot_cache_capacity, &auth_settings)
-                .await
+    tokio::select! {
+        res = async {
+            match args.transport {
+                TransportKind::Stdio if args.exit_on_stdin_eof => Err(anyhow::anyhow!(
+                    "--exit-on-stdin-eof is only valid with --transport http"
+                )),
+                TransportKind::Stdio => serve_stdio(args.snapshot_cache_capacity).await,
+                TransportKind::Http if args.exit_on_stdin_eof => {
+                    serve_http_until_stdin_eof(&args.bind, args.snapshot_cache_capacity, &auth_settings)
+                        .await
+                }
+                TransportKind::Http => {
+                    http::serve_http(&args.bind, args.snapshot_cache_capacity, &auth_settings).await
+                }
+            }
+        } => res,
+        _ = async {
+            if let Some(dur) = idle_duration_opt {
+                run_idle_watchdog(dur).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            info!("loctree-mcp idle timeout reached; exiting cleanly");
+            Ok(())
         }
-        TransportKind::Http => {
-            http::serve_http(&args.bind, args.snapshot_cache_capacity, &auth_settings).await
+        _ = shutdown_signal => {
+            info!("loctree-mcp shutdown signal received; exiting cleanly");
+            Ok(())
         }
     }
 }
@@ -4398,6 +4658,52 @@ mod tests {
 
     fn cached_snapshot(root: &str) -> Arc<Snapshot> {
         Arc::new(Snapshot::new(vec![root.to_string()]))
+    }
+
+    #[test]
+    fn w4_03_activity_tracker_advances() {
+        touch_activity();
+        let elapsed1 = time_since_last_activity();
+        std::thread::sleep(Duration::from_millis(15));
+        let elapsed2 = time_since_last_activity();
+        assert!(elapsed2 >= elapsed1);
+
+        touch_activity();
+        let reset_elapsed = time_since_last_activity();
+        assert!(reset_elapsed <= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn w4_03_single_instance_lock_unit() {
+        let temp = TempDir::new().expect("tempdir");
+        let project = temp.path();
+
+        let lock1 = SingleInstanceLock::acquire(project).expect("acquire lock1");
+        assert!(lock1.pid_path().exists());
+        let pid_str = fs::read_to_string(lock1.pid_path()).expect("read pidfile");
+        assert_eq!(pid_str.trim(), std::process::id().to_string());
+
+        // Second acquire on the same project must fail
+        let lock2_err = SingleInstanceLock::acquire(project).unwrap_err();
+        let err_msg = lock2_err.to_string();
+        assert!(err_msg.contains("already running"), "{err_msg}");
+        assert!(err_msg.contains(&std::process::id().to_string()), "{err_msg}");
+
+        // Distinct project can acquire lock concurrently
+        let temp2 = TempDir::new().expect("tempdir2");
+        let lock_other = SingleInstanceLock::acquire(temp2.path()).expect("acquire other");
+        assert!(lock_other.pid_path().exists());
+
+        // Drop lock1: pidfile must be cleaned up
+        let pid_path1 = lock1.pid_path().to_path_buf();
+        drop(lock1);
+        assert!(!pid_path1.exists(), "pidfile must be removed on drop");
+
+        // Now acquire on project succeeds
+        let lock3 = SingleInstanceLock::acquire(project).expect("acquire lock3");
+        assert!(lock3.pid_path().exists());
+        drop(lock3);
+        drop(lock_other);
     }
 
     #[test]

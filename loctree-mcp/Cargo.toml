@@ -57,6 +57,7 @@ shellexpand = { workspace = true }
 
 reqwest = { workspace = true }
 tempfile = "3"
+fs4 = "0.13"
 
 # Logging
 tracing = "0.1"

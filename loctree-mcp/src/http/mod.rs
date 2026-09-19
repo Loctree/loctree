@@ -17,6 +17,14 @@ use tracing::info;
 use crate::LoctreeServer;
 use auth::{AuthSettings, HttpAuth};
 
+async fn activity_touch_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    crate::touch_activity();
+    next.run(request).await
+}
+
 /// Build and run the streamable-http axum server.
 ///
 /// The service factory builds a fresh [`LoctreeServer`] per session; sessions
@@ -57,7 +65,8 @@ pub async fn serve_http(
             "/context_pack",
             axum::routing::get(context_pack::context_pack_handler),
         )
-        .nest_service("/mcp", service);
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(activity_touch_middleware));
 
     // `Router::layer` wraps every route registered so far, so this single call
     // covers both `/mcp` and `/context_pack`. `/context_pack` matters just as
