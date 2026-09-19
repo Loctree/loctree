@@ -572,6 +572,7 @@ pub fn build_occurrences(
 pub fn scan_options(params: &SymbolContextParams) -> ScanOptions {
     ScanOptions {
         whole_token: params.whole_token,
+        no_generated: false,
     }
 }
 

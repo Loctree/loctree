@@ -264,6 +264,9 @@ pub struct FindOptions {
     /// Project roots to scan (`--root` / `--project`). Empty means cwd.
     pub roots: Vec<PathBuf>,
 
+    /// Filter out generated and minified artifact files from results. Opt-in.
+    pub no_generated: bool,
+
     /// Find where a symbol is defined/exported
     pub where_symbol: bool,
 
@@ -321,6 +324,9 @@ pub struct OccurrencesOptions {
 
     /// Maximum number of occurrences to return in the current page.
     pub limit: Option<usize>,
+
+    /// Filter out generated and minified artifact files from results. Opt-in.
+    pub no_generated: bool,
 
     /// Scan untracked files in-memory without mutating the snapshot.
     pub include_untracked: bool,

@@ -787,12 +787,18 @@ fn scan_literal_honors_whole_token_boundary() {
     let loose = scan_files_with(
         [("src/app.tsx", source)],
         "backdrop",
-        ScanOptions { whole_token: false },
+        ScanOptions {
+            whole_token: false,
+            ..Default::default()
+        },
     );
     let tight = scan_files_with(
         [("src/app.tsx", source)],
         "backdrop",
-        ScanOptions { whole_token: true },
+        ScanOptions {
+            whole_token: true,
+            ..Default::default()
+        },
     );
 
     assert_eq!(loose.total, 2);
@@ -837,7 +843,10 @@ fn scan_literal_matches_shared_scanner_on_disk() {
         &snapshot,
         Some(dir.path()),
         "utterance_id",
-        ScanOptions { whole_token: false },
+        ScanOptions {
+            whole_token: false,
+            ..Default::default()
+        },
         FileScope::default(),
     );
     let expected = scan_files([("src/scribe.rs", LITERAL_SOURCE)], "utterance_id");
@@ -871,7 +880,10 @@ fn literal_scan_cache_matches_direct_scan_and_invalidates_on_edit() {
             &snapshot,
             Some(dir.path()),
             "utterance_id",
-            ScanOptions { whole_token: false },
+            ScanOptions {
+                whole_token: false,
+                ..Default::default()
+            },
             FileScope::default(),
         )
     };
@@ -880,7 +892,10 @@ fn literal_scan_cache_matches_direct_scan_and_invalidates_on_edit() {
             &snapshot,
             Some(dir.path()),
             "utterance_id",
-            ScanOptions { whole_token: false },
+            ScanOptions {
+                whole_token: false,
+                ..Default::default()
+            },
             FileScope::default(),
         )
     };
@@ -981,7 +996,10 @@ fn scan_literal_expands_agent_pipe_or_to_multi_literal() {
         &snapshot,
         Some(dir.path()),
         "global_async_runtime|get_tokio_runtime",
-        ScanOptions { whole_token: false },
+        ScanOptions {
+            whole_token: false,
+            ..Default::default()
+        },
         FileScope::default(),
     );
     let expected = loctree::analyzer::occurrences::scan_files_for_literal_query(

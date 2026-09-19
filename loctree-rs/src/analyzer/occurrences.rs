@@ -975,6 +975,9 @@ pub struct OccurrenceResults {
     /// Detailed scope statistics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<LiteralScopeStats>,
+    /// Number of occurrences skipped in generated / minified artifact files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_skipped: Option<usize>,
     /// Required universe declaration. Unlike legacy `scope`, this names
     /// tracked/untracked/ignored policy and every known exclusion boundary.
     pub universe: IndexedUniverse,
@@ -1128,10 +1131,14 @@ pub fn merge_occurrence_results(
     let mut scope = parts[0].scope.clone();
     let mut near_matches = Vec::new();
     let mut file_scope = parts[0].file_scope.clone();
+    let mut generated_skipped: Option<usize> = None;
 
     for part in parts {
         if coverage_line.is_empty() && !part.coverage_line.is_empty() {
             coverage_line = part.coverage_line.clone();
+        }
+        if let Some(n) = part.generated_skipped {
+            *generated_skipped.get_or_insert(0) += n;
         }
         // Prefer the richest universe declaration.
         if part.universe.indexed_files >= universe.indexed_files {
@@ -1183,7 +1190,7 @@ pub fn merge_occurrence_results(
     let role = role_summary(&occurrences);
     let shape = hit_shape(&occurrences);
 
-    OccurrenceResults {
+    let mut res = OccurrenceResults {
         query: display_query.to_string(),
         query_kind: query_kind(display_query),
         match_mode: MatchMode::MultiLiteral,
@@ -1199,6 +1206,7 @@ pub fn merge_occurrence_results(
         source: "literal",
         coverage_line,
         scope,
+        generated_skipped,
         universe,
         file_scope,
         scope_classifications,
@@ -1207,7 +1215,11 @@ pub fn merge_occurrence_results(
         role_summary: role,
         file_context: Vec::new(),
         hit_shape: shape,
+    };
+    if res.generated_skipped.is_some() {
+        res.refresh_coverage_line();
     }
+    res
 }
 
 /// Scan one or more exact-literal patterns and merge into a single result set.
@@ -1281,7 +1293,11 @@ impl OccurrenceResults {
         }
     }
 
-    fn refresh_coverage_line(&mut self) {
+    pub fn refresh_coverage_line(&mut self) {
+        let skipped_part = match self.generated_skipped {
+            Some(n) => format!("; generated_skipped: {n}"),
+            None => String::new(),
+        };
         if let Some(stats) = &mut self.scope {
             stats.files_in_universe = self.universe.indexed_files;
             stats.files_scanned = self.universe.scanned_files;
@@ -1294,14 +1310,28 @@ impl OccurrenceResults {
                 templates: stats.templates,
             };
             self.coverage_line = format!(
-                "{}; {}",
+                "{}{}; {}",
                 coverage_line_for(stats.files_scanned, stats.files_in_universe, &artifacts),
+                skipped_part,
                 self.universe.summary_line()
             );
         } else {
-            self.coverage_line = self.universe.summary_line();
+            self.coverage_line = format!("{}{}", self.universe.summary_line(), skipped_part);
         }
     }
+}
+
+/// Determine whether a file path or content represents a generated or minified artifact.
+pub fn is_generated_or_minified_file(path: &str, content: Option<&str>) -> bool {
+    if scope_classification(path) == ScopeClassification::Generated {
+        return true;
+    }
+    let class = crate::analyzer::classify::artifact_class(path, content);
+    matches!(
+        class,
+        crate::analyzer::classify::ArtifactClass::Generated
+            | crate::analyzer::classify::ArtifactClass::Vendored
+    )
 }
 
 #[inline]
@@ -1322,6 +1352,8 @@ pub struct ScanOptions {
     /// Treat `-` as part of the token (tighter boundary). Opt-in, no default
     /// regression.
     pub whole_token: bool,
+    /// Exclude generated and minified artifact files from results. Opt-in.
+    pub no_generated: bool,
 }
 
 /// Output-shaping controls applied *after* scanning, shared by every surface so
@@ -2272,6 +2304,7 @@ where
     let mut occurrences = Vec::new();
     let mut files_scanned = 0;
     let mut stats = crate::analyzer::classify::ArtifactFenceStats::default();
+    let mut generated_skipped = 0;
 
     for (path, content) in files {
         if !scope.matches(path) {
@@ -2287,7 +2320,13 @@ where
             stats.record(class);
         }
         files_scanned += 1;
-        occurrences.extend(scan_text_with(path, content, ident, opts));
+        let is_gen = opts.no_generated && is_generated_or_minified_file(path, Some(content));
+        let hits = scan_text_with(path, content, ident, opts);
+        if is_gen {
+            generated_skipped += hits.len();
+        } else {
+            occurrences.extend(hits);
+        }
     }
     occurrences.sort_by(|a, b| {
         a.file
@@ -2303,9 +2342,15 @@ where
 
     let files_in_universe = files_scanned;
     let universe = IndexedUniverse::from_counts(files_in_universe, files_scanned, stats, 0);
+    let skipped_part = if opts.no_generated {
+        format!("; generated_skipped: {generated_skipped}")
+    } else {
+        String::new()
+    };
     let coverage_line = format!(
-        "{}; {}",
+        "{}{}; {}",
         coverage_line_for(files_scanned, files_in_universe, &stats),
+        skipped_part,
         universe.summary_line()
     );
 
@@ -2337,6 +2382,11 @@ where
             generated: stats.generated,
             templates: stats.templates,
         }),
+        generated_skipped: if opts.no_generated {
+            Some(generated_skipped)
+        } else {
+            None
+        },
         universe,
         file_scope: None,
         scope_classifications,
@@ -2406,9 +2456,22 @@ pub fn scan_files_with_regex<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
+    scan_files_with_regex_opts(files, re, scope, ScanOptions::default())
+}
+
+pub fn scan_files_with_regex_opts<'a, I>(
+    files: I,
+    re: &regex::Regex,
+    scope: FileScope<'_>,
+    opts: ScanOptions,
+) -> OccurrenceResults
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
     let mut occurrences = Vec::new();
     let mut files_scanned = 0;
     let mut stats = crate::analyzer::classify::ArtifactFenceStats::default();
+    let mut generated_skipped = 0;
 
     for (path, content) in files {
         if !scope.matches(path) {
@@ -2422,7 +2485,13 @@ where
             stats.record(class);
         }
         files_scanned += 1;
-        occurrences.extend(scan_text_regex(path, content, re));
+        let is_gen = opts.no_generated && is_generated_or_minified_file(path, Some(content));
+        let hits = scan_text_regex(path, content, re);
+        if is_gen {
+            generated_skipped += hits.len();
+        } else {
+            occurrences.extend(hits);
+        }
     }
     occurrences.sort_by(|a, b| {
         a.file
@@ -2438,9 +2507,15 @@ where
 
     let files_in_universe = files_scanned;
     let universe = IndexedUniverse::from_counts(files_in_universe, files_scanned, stats, 0);
+    let skipped_part = if opts.no_generated {
+        format!("; generated_skipped: {generated_skipped}")
+    } else {
+        String::new()
+    };
     let coverage_line = format!(
-        "{}; {}",
+        "{}{}; {}",
         coverage_line_for(files_scanned, files_in_universe, &stats),
+        skipped_part,
         universe.summary_line()
     );
 
@@ -2479,6 +2554,11 @@ where
             generated: stats.generated,
             templates: stats.templates,
         }),
+        generated_skipped: if opts.no_generated {
+            Some(generated_skipped)
+        } else {
+            None
+        },
         universe,
         file_scope: None,
         scope_classifications,
@@ -2499,6 +2579,46 @@ where
 /// present. Languages without symbol coverage keep the lexical role (never
 /// invent a definition).
 pub fn enrich_with_snapshot(results: &mut OccurrenceResults, snapshot: &Snapshot) {
+    if results.occurrences.is_empty() && results.generated_skipped.is_none() {
+        return;
+    }
+
+    if results.generated_skipped.is_some() {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in results.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = results.generated_skipped {
+                    *n += newly_skipped;
+                }
+                results.occurrences = kept;
+                results.total = results.occurrences.len();
+                results.emitted = results.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &results.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                results.files_matched = seen.len();
+                results.refresh_coverage_line();
+            } else {
+                results.occurrences = kept;
+            }
+        }
+    }
+
     if results.occurrences.is_empty() || results.query.is_empty() {
         return;
     }
@@ -4375,7 +4495,10 @@ class AgentConstraints {\n\
         let tight = scan_files_with(
             [("a.css", css)],
             "backdrop",
-            ScanOptions { whole_token: true },
+            ScanOptions {
+                whole_token: true,
+                ..Default::default()
+            },
         );
         assert_eq!(loose.total, 2, "default boundary keeps both hits");
         assert_eq!(
@@ -4740,5 +4863,116 @@ class AgentConstraints {\n\
             positional_dot_query_error(&[".".into()]).is_none(),
             "a single-query literal '.' stays a literal search"
         );
+    }
+
+    #[test]
+    fn w4_06_generated_files_filterable_in_literal_scan() {
+        let files = [
+            ("src/banner.rs", "fn banner_marker() {}\n"),
+            ("dist/bundle.js", "function banner_marker() {}\n"),
+            (
+                "tests/fixtures/mermaid.min.js",
+                "/* minified */ banner_marker();\n",
+            ),
+        ];
+
+        // 1) Default scan (opt-in flag not set): all 3 hits present, matches historical behavior
+        let default_res = scan_files_with(
+            files.iter().copied(),
+            "banner_marker",
+            ScanOptions::default(),
+        );
+        assert_eq!(default_res.total, 3, "default scan should include all 3 hits");
+        assert_eq!(default_res.files_matched, 3);
+        assert_eq!(default_res.generated_skipped, None);
+        assert!(
+            !default_res.coverage_line.contains("generated_skipped"),
+            "default coverage line should not mention generated_skipped"
+        );
+
+        // 2) Opt-in `--no-generated`: generated and minified files are skipped and counted
+        let no_gen_res = scan_files_with(
+            files.iter().copied(),
+            "banner_marker",
+            ScanOptions {
+                whole_token: false,
+                no_generated: true,
+            },
+        );
+        assert_eq!(no_gen_res.total, 1, "only production source should remain");
+        assert_eq!(no_gen_res.files_matched, 1);
+        assert_eq!(no_gen_res.occurrences[0].file, "src/banner.rs");
+        assert_eq!(
+            no_gen_res.generated_skipped,
+            Some(2),
+            "two generated/minified hits must be counted in generated_skipped"
+        );
+        assert!(
+            no_gen_res.coverage_line.contains("generated_skipped: 2"),
+            "coverage line must include generated_skipped: 2, got: {}",
+            no_gen_res.coverage_line
+        );
+    }
+
+    #[test]
+    fn w4_06_snapshot_records_generated_flag_used_in_enrichment() {
+        use crate::types::FileAnalysis;
+
+        let files = [
+            ("src/core.rs", "fn target_symbol() {}\n"),
+            ("src/custom_codegen.rs", "fn target_symbol() {}\n"),
+        ];
+
+        let mut res = scan_files_with(
+            files.iter().copied(),
+            "target_symbol",
+            ScanOptions {
+                whole_token: false,
+                no_generated: true,
+            },
+        );
+        let mut snapshot = Snapshot::new(vec![".".into()]);
+        let mut f1 = FileAnalysis::new("src/core.rs".into());
+        f1.is_generated = false;
+        let mut f2 = FileAnalysis::new("src/custom_codegen.rs".into());
+        f2.is_generated = true;
+        snapshot.files = vec![f1, f2];
+
+        enrich_with_snapshot(&mut res, &snapshot);
+        assert_eq!(res.total, 1);
+        assert_eq!(res.occurrences[0].file, "src/core.rs");
+        assert_eq!(res.generated_skipped, Some(1));
+        assert!(
+            res.coverage_line.contains("generated_skipped: 1"),
+            "coverage line must reflect snapshot-recorded generated hits, got: {}",
+            res.coverage_line
+        );
+    }
+
+    #[test]
+    fn w4_06_regex_scan_filters_generated_files() {
+        let files = [
+            ("src/banner.rs", "fn banner_marker_foo() {}\n"),
+            ("tests/fixtures/mermaid.min.js", "banner_marker_bar();\n"),
+        ];
+        let re = regex::Regex::new("banner_marker_\\w+").unwrap();
+
+        let default_res = scan_files_with_regex(files.iter().copied(), &re, FileScope::default());
+        assert_eq!(default_res.total, 2);
+        assert_eq!(default_res.generated_skipped, None);
+
+        let no_gen_res = scan_files_with_regex_opts(
+            files.iter().copied(),
+            &re,
+            FileScope::default(),
+            ScanOptions {
+                whole_token: false,
+                no_generated: true,
+            },
+        );
+        assert_eq!(no_gen_res.total, 1);
+        assert_eq!(no_gen_res.occurrences[0].file, "src/banner.rs");
+        assert_eq!(no_gen_res.generated_skipped, Some(1));
+        assert!(no_gen_res.coverage_line.contains("generated_skipped: 1"));
     }
 }

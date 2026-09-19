@@ -1519,6 +1519,7 @@ impl Backend {
                 &params.query,
                 loctree::analyzer::occurrences::ScanOptions {
                     whole_token: params.whole_token,
+                    no_generated: false,
                 },
                 loctree::analyzer::occurrences::FileScope {
                     file: params.file.as_deref(),
