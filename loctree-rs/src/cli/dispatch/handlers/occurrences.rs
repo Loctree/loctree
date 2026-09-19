@@ -95,6 +95,10 @@ pub fn handle_occurrences_command(
         limit: opts.limit,
     });
 
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     if global.json {
         match serde_json::to_string_pretty(&results) {
             Ok(json) => println!("{}", json),
@@ -104,7 +108,7 @@ pub fn handle_occurrences_command(
             }
         }
     } else {
-        print_human(&results, opts.compact);
+        print_human(&results, opts.compact, zero_hit_ctx);
     }
 
     DispatchResult::Exit(0)
@@ -170,6 +174,10 @@ fn handle_occurrences_regex(
         limit: opts.limit,
     });
 
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     if global.json {
         match serde_json::to_string_pretty(&results) {
             Ok(json) => println!("{}", json),
@@ -179,7 +187,7 @@ fn handle_occurrences_regex(
             }
         }
     } else {
-        print_human(&results, opts.compact);
+        print_human(&results, opts.compact, zero_hit_ctx);
     }
 
     DispatchResult::Exit(0)
@@ -294,12 +302,17 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
     // boundaries remain (outside_snapshot / unreadable / …).
     let multi = patterns.len() > 1 || literal_matches.match_mode == MatchMode::MultiLiteral;
     let looks_like_regex = !multi && query_has_regex_metachars(display_query.as_str());
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     let absence = absence_trust(
         &literal_matches.universe,
         file_scope_resolved,
         file_scoped,
         looks_like_regex,
         literal_matches.total,
+        named_zero_hit_exclusion(&literal_matches, zero_hit_ctx),
     );
 
     if global.json {
@@ -339,9 +352,14 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
             }
         }
     } else if opts.compact {
-        print_human(&literal_matches, true);
+        print_human(&literal_matches, true, zero_hit_ctx);
     } else {
-        print_literal_find_human(display_query.as_str(), &literal_matches, &fuzzy_suggestions);
+        print_literal_find_human(
+            display_query.as_str(),
+            &literal_matches,
+            &fuzzy_suggestions,
+            zero_hit_ctx,
+        );
     }
 
     DispatchResult::Exit(0)
@@ -433,12 +451,17 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
         limit: opts.limit,
     });
 
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     let absence = absence_trust(
         &matches.universe,
         file_scope_resolved,
         file_scoped,
         false,
         matches.total,
+        named_zero_hit_exclusion(&matches, zero_hit_ctx),
     );
 
     if global.json {
@@ -468,7 +491,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
             }
         }
     } else {
-        print_regex_find_human(pattern.trim(), &matches);
+        print_regex_find_human(pattern.trim(), &matches, zero_hit_ctx);
     }
 
     DispatchResult::Exit(0)
@@ -485,12 +508,20 @@ struct AbsenceTrust {
     exclusion_caveat: Option<String>,
 }
 
+/// Extra signals the zero-hit printer needs beyond the result payload.
+#[derive(Clone, Copy, Default)]
+struct ZeroHitCtx<'a> {
+    project_root: Option<&'a Path>,
+    snapshot_stale: bool,
+}
+
 fn absence_trust(
     universe: &crate::analyzer::occurrences::IndexedUniverse,
     file_scope_resolved: bool,
     file_scoped: bool,
     looks_like_regex_literal: bool,
     total: usize,
+    named_exclusion: Option<String>,
 ) -> AbsenceTrust {
     let for_scanned =
         file_scope_resolved && universe.scan_complete && (total > 0 || !looks_like_regex_literal);
@@ -505,10 +536,13 @@ fn absence_trust(
     } else {
         "scanned_universe"
     };
-    // Only surface the caveat when absolute trust is withheld — otherwise
-    // agents see a contradictory "absolute + caveat" pair.
+    // Named causes (unresolved / .loctignore path / stale snapshot) beat the
+    // generic outside_snapshot caveat. Only surface a caveat when absolute
+    // trust is withheld — otherwise agents see a contradictory pair.
     let exclusion_caveat = if absolute {
         None
+    } else if named_exclusion.is_some() {
+        named_exclusion
     } else {
         universe.absence_exclusion_caveat()
     };
@@ -520,10 +554,75 @@ fn absence_trust(
     }
 }
 
+fn file_scope_loctignore_hint(
+    project_root: Option<&Path>,
+    scope: Option<&FileScopeResolution>,
+) -> Option<String> {
+    let (root, scope) = (project_root?, scope?);
+    if scope.resolved {
+        return None;
+    }
+    crate::fs_utils::loctignore_exclusion_hint(root, &scope.requested)
+}
+
+/// Human zero-hit sentence that names the cause instead of a generic
+/// "absence is (not) trustworthy".
+fn zero_hit_absence_text(
+    results: &OccurrenceResults,
+    mode: AbsenceMode,
+    looks_like_regex: bool,
+    ctx: ZeroHitCtx<'_>,
+) -> String {
+    if !results.universe.scan_complete {
+        return "not found — absence is NOT trustworthy because at least one indexed path could not be scanned".to_string();
+    }
+
+    let file_scope = results.file_scope.as_ref();
+    let unresolved = file_scope.is_some_and(|scope| !scope.resolved);
+    if unresolved {
+        let requested = file_scope.map(|s| s.requested.as_str()).unwrap_or("");
+        let status = file_scope.map(|s| s.status).unwrap_or("unresolved");
+        if let Some(hint) = file_scope_loctignore_hint(ctx.project_root, file_scope) {
+            return format!(
+                "not found — file scope status={status}; excluded-by-.loctignore `{requested}` — {hint}"
+            );
+        }
+        if ctx.snapshot_stale {
+            return format!(
+                "not found — file scope status={status}; requested `{requested}` is not in this snapshot, and the snapshot is stale — absence is NOT trustworthy (rescan with `loct scan`)"
+            );
+        }
+        return format!(
+            "not found — file scope status={status}; requested `{requested}` did not resolve to an indexed path — absence is NOT trustworthy"
+        );
+    }
+
+    if matches!(mode, AbsenceMode::Literal) && looks_like_regex {
+        return "0 exact-string matches — NOT a trustworthy absence: the query contains regex metacharacters and `--literal` matches literally, so a pattern was never evaluated. For a regex search use a pattern-aware tool.".to_string();
+    }
+
+    if ctx.snapshot_stale {
+        return "not found — snapshot is stale; absence is NOT trustworthy (rescan with `loct scan`)".to_string();
+    }
+
+    let file_scoped = file_scope.is_some_and(|scope| scope.resolved);
+    if !file_scoped && let Some(caveat) = results.universe.absence_exclusion_caveat() {
+        let prefix = match mode {
+            AbsenceMode::Regex => "not found — pattern evaluated; ",
+            AbsenceMode::Literal => "not found — literal ",
+        };
+        return format!("{prefix}{caveat}");
+    }
+    match mode {
+        AbsenceMode::Regex => "not found — pattern evaluated; absence is trustworthy".to_string(),
+        AbsenceMode::Literal => "not found — literal absence is trustworthy".to_string(),
+    }
+}
+
 /// Human render for `find --regex`. Mirrors the literal printer's structure
 /// (coverage line, per-file rollup, page, per-hit role label) but labels the
 /// header as regex and never prints fuzzy suggestions (there are none).
-fn print_regex_find_human(pattern: &str, results: &OccurrenceResults) {
+fn print_regex_find_human(pattern: &str, results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) {
     println!(
         "Regex matches of /{}/ ({} in {} file(s)) [source: regex]",
         pattern, results.total, results.files_matched
@@ -533,7 +632,7 @@ fn print_regex_find_human(pattern: &str, results: &OccurrenceResults) {
     }
     print_file_scope(results);
     if results.total == 0 {
-        print_zero_hit_absence(results, AbsenceMode::Regex, false);
+        print_zero_hit_absence(results, AbsenceMode::Regex, false, ctx);
         return;
     }
     print_file_rollup(results);
@@ -676,54 +775,50 @@ enum AbsenceMode {
 /// guarantee for gitignored / unindexed surfaces (e.g. generated FFI
 /// bindings outside the snapshot). A resolved `--file` scope is absolute
 /// for that one path.
-fn print_zero_hit_absence(results: &OccurrenceResults, mode: AbsenceMode, looks_like_regex: bool) {
-    if !results.universe.scan_complete {
-        println!(
-            "  (not found — absence is NOT trustworthy because at least one indexed path could not be scanned)"
-        );
-        return;
+fn print_zero_hit_absence(
+    results: &OccurrenceResults,
+    mode: AbsenceMode,
+    looks_like_regex: bool,
+    ctx: ZeroHitCtx<'_>,
+) {
+    println!(
+        "  ({})",
+        zero_hit_absence_text(results, mode, looks_like_regex, ctx)
+    );
+}
+
+fn named_zero_hit_exclusion(results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) -> Option<String> {
+    if let Some(hint) = file_scope_loctignore_hint(ctx.project_root, results.file_scope.as_ref()) {
+        let requested = results
+            .file_scope
+            .as_ref()
+            .map(|s| s.requested.as_str())
+            .unwrap_or("");
+        return Some(format!("excluded-by-.loctignore `{requested}` — {hint}"));
     }
     if results
         .file_scope
         .as_ref()
         .is_some_and(|scope| !scope.resolved)
     {
-        println!(
-            "  (not found in scope — absence is NOT trustworthy because the requested file scope did not resolve to exactly one indexed path)"
-        );
-        return;
+        let requested = results
+            .file_scope
+            .as_ref()
+            .map(|s| s.requested.as_str())
+            .unwrap_or("");
+        let status = results
+            .file_scope
+            .as_ref()
+            .map(|s| s.status)
+            .unwrap_or("unresolved");
+        return Some(format!(
+            "unresolved file scope status={status} requested=`{requested}`"
+        ));
     }
-    if matches!(mode, AbsenceMode::Literal) && looks_like_regex {
-        // NOT a trustworthy absence: the query carries regex metacharacters,
-        // but `--literal` did an exact-string match and never evaluated it as
-        // a pattern. Printing "absence is trustworthy" here would be a FALSE
-        // CLEAN for a security/privacy audit.
-        println!("  (0 exact-string matches — NOT a trustworthy absence: the query contains");
-        println!("   regex metacharacters and `--literal` matches literally, so a pattern was");
-        println!("   never evaluated. For a regex search use a pattern-aware tool.)");
-        return;
+    if ctx.snapshot_stale {
+        return Some("stale snapshot".to_string());
     }
-    let file_scoped = results
-        .file_scope
-        .as_ref()
-        .is_some_and(|scope| scope.resolved);
-    // Repo-wide only: qualify when exclusion boundaries exist.
-    if !file_scoped && let Some(caveat) = results.universe.absence_exclusion_caveat() {
-        let prefix = match mode {
-            AbsenceMode::Regex => "not found — pattern evaluated; ",
-            AbsenceMode::Literal => "not found — literal ",
-        };
-        println!("  ({prefix}{caveat})");
-        return;
-    }
-    match mode {
-        AbsenceMode::Regex => {
-            println!("  (not found — pattern evaluated; absence is trustworthy)");
-        }
-        AbsenceMode::Literal => {
-            println!("  (not found — literal absence is trustworthy)");
-        }
-    }
+    None
 }
 
 /// Detect regex metacharacters that strongly imply the caller meant a *pattern*
@@ -806,9 +901,9 @@ fn resolve_path(base: &Path, rel: &str) -> PathBuf {
     joined
 }
 
-fn print_human(results: &OccurrenceResults, compact: bool) {
+fn print_human(results: &OccurrenceResults, compact: bool, ctx: ZeroHitCtx<'_>) {
     if compact {
-        print_compact(results);
+        print_compact(results, ctx);
         return;
     }
     // The header names the mode the scan actually ran in. Calling a `--regex`
@@ -834,7 +929,9 @@ fn print_human(results: &OccurrenceResults, compact: bool) {
         if regex_mode {
             // A compiled pattern that matched nothing is a trustworthy absence;
             // the literal wording ("no exact occurrences") would understate it.
-            print_zero_hit_absence(results, AbsenceMode::Regex, false);
+            print_zero_hit_absence(results, AbsenceMode::Regex, false, ctx);
+        } else if results.file_scope.is_some() {
+            print_zero_hit_absence(results, AbsenceMode::Literal, false, ctx);
         } else {
             print_no_exact_occurrences(results, "  ");
         }
@@ -855,10 +952,14 @@ fn print_human(results: &OccurrenceResults, compact: bool) {
     print_suggested_next(results);
 }
 
-fn print_compact(results: &OccurrenceResults) {
+fn print_compact(results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) {
     print_file_scope(results);
     if results.total == 0 {
-        print_no_exact_occurrences(results, "");
+        if results.file_scope.is_some() {
+            print_zero_hit_absence(results, AbsenceMode::Literal, false, ctx);
+        } else {
+            print_no_exact_occurrences(results, "");
+        }
         return;
     }
     if results.slim {
@@ -931,7 +1032,12 @@ fn print_page(results: &OccurrenceResults) {
 /// Human output for `find --literal`: literal matches as the primary block,
 /// then fuzzy suggestions in a clearly-labeled separate section that can never
 /// be mistaken for evidence.
-fn print_literal_find_human(query: &str, literal: &OccurrenceResults, fuzzy: &[FuzzySuggestion]) {
+fn print_literal_find_human(
+    query: &str,
+    literal: &OccurrenceResults,
+    fuzzy: &[FuzzySuggestion],
+    ctx: ZeroHitCtx<'_>,
+) {
     let looks_like_regex = query_has_regex_metachars(query);
     println!(
         "=== Literal Matches ({} in {} file(s)) [source: {}] ===",
@@ -942,7 +1048,7 @@ fn print_literal_find_human(query: &str, literal: &OccurrenceResults, fuzzy: &[F
     }
     print_file_scope(literal);
     if literal.total == 0 {
-        print_zero_hit_absence(literal, AbsenceMode::Literal, looks_like_regex);
+        print_zero_hit_absence(literal, AbsenceMode::Literal, looks_like_regex, ctx);
     } else {
         if looks_like_regex {
             println!(
@@ -1071,7 +1177,11 @@ fn print_file_context(results: &OccurrenceResults) {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_group_spans, more_cols_suffix, query_has_regex_metachars};
+    use super::{
+        AbsenceMode, ZeroHitCtx, line_group_spans, more_cols_suffix, query_has_regex_metachars,
+        zero_hit_absence_text,
+    };
+    use crate::analyzer::occurrences::{FileScopeResolution, ScanOptions, scan_files_with_scope};
 
     #[test]
     fn banner_line_hits_collapse_into_one_row() {
@@ -1167,5 +1277,91 @@ mod tests {
                 "plain literal {literal:?} must not be flagged as regex-like"
             );
         }
+    }
+
+    #[test]
+    fn w1_01_zero_hit_names_loctignore_exclusion() {
+        // G-LITERAL-SCOPE-BLIND / G-DOCS-IGNORE: a zero-hit on a path that
+        // exists but is parked by .loctignore must name that path, not hide
+        // behind generic outside_snapshot / "absence is trustworthy".
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("ignored_w1_01")).expect("mkdir ignored");
+        std::fs::write(
+            root.join("ignored_w1_01/secret.rs"),
+            "TOKEN_W1_01_IGNORED\n",
+        )
+        .expect("write ignored");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").expect("write src");
+        std::fs::write(root.join(".loctignore"), "ignored_w1_01/\n").expect("loctignore");
+
+        let ignored_scope = FileScopeResolution::resolve("ignored_w1_01", ["src/lib.rs"]);
+        assert!(!ignored_scope.resolved);
+        assert_eq!(ignored_scope.status, "unresolved");
+
+        let mut results = scan_files_with_scope(
+            [("src/lib.rs", "fn main() {}\n")],
+            "TOKEN_W1_01_IGNORED",
+            ScanOptions::default(),
+            ignored_scope.scan_scope(),
+        );
+        results.file_scope = Some(ignored_scope);
+
+        let text = zero_hit_absence_text(
+            &results,
+            AbsenceMode::Literal,
+            false,
+            ZeroHitCtx {
+                project_root: Some(root),
+                snapshot_stale: false,
+            },
+        );
+        assert!(
+            text.contains("excluded-by-.loctignore"),
+            "must name .loctignore exclusion, got: {text}"
+        );
+        assert!(
+            text.contains("`ignored_w1_01`"),
+            "must name the excluded path, got: {text}"
+        );
+        assert!(
+            !text.contains("outside_snapshot"),
+            "must not fall back to generic outside_snapshot, got: {text}"
+        );
+
+        let missing = FileScopeResolution::resolve("no/such/dir", ["src/lib.rs"]);
+        results.file_scope = Some(missing);
+        let unresolved_text = zero_hit_absence_text(
+            &results,
+            AbsenceMode::Literal,
+            false,
+            ZeroHitCtx {
+                project_root: Some(root),
+                snapshot_stale: false,
+            },
+        );
+        assert!(
+            unresolved_text.contains("unresolved"),
+            "missing scope must name unresolved, not 0 of 0, got: {unresolved_text}"
+        );
+        assert!(
+            unresolved_text.contains("`no/such/dir`"),
+            "must name the requested path, got: {unresolved_text}"
+        );
+
+        let stale_text = zero_hit_absence_text(
+            &results,
+            AbsenceMode::Literal,
+            false,
+            ZeroHitCtx {
+                project_root: Some(root),
+                snapshot_stale: true,
+            },
+        );
+        assert!(
+            stale_text.contains("stale"),
+            "stale snapshot must be named, got: {stale_text}"
+        );
     }
 }
