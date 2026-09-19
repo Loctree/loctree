@@ -174,7 +174,7 @@ pub fn handle_impact_command(
     DispatchResult::Exit(0)
 }
 
-/// Handle auto-scan-base diff: create worktree, scan, compare, cleanup
+/// Handle auto-scan-base diff: export the ref tree (no git worktree), scan, compare.
 pub fn handle_auto_scan_base_diff(
     opts: &DiffOptions,
     global: &GlobalOptions,
@@ -184,7 +184,6 @@ pub fn handle_auto_scan_base_diff(
     use crate::git::GitRepo;
     use crate::snapshot::Snapshot;
     use std::path::Path;
-    use tempfile::TempDir;
 
     // Discover git repository
     let git_repo = match GitRepo::discover(Path::new(".")) {
@@ -207,63 +206,60 @@ pub fn handle_auto_scan_base_diff(
     }
 
     if !global.quiet {
-        eprintln!("[loct] Creating temporary worktree for '{}'...", since_path);
+        eprintln!(
+            "[loct] Exporting tree of '{}' (no git worktree)...",
+            since_path
+        );
     }
 
-    // Create temporary directory for worktree
-    let temp_dir = match TempDir::new() {
-        Ok(dir) => dir,
-        Err(e) => {
-            eprintln!("[loct][error] Failed to create temp directory: {}", e);
+    let project_root = Path::new(".");
+    let cache_dir = crate::snapshot::project_cache_dir(project_root).join("export-tree");
+
+    // Hold the project cache lock only while writing/scanning the export.
+    // Drop it before load_or_create_snapshot(".") — that path takes the same lock.
+    let base_snapshot = {
+        let _cache_lock = match crate::snapshot::acquire_snapshot_cache_lock(project_root) {
+            Ok(lock) => lock,
+            Err(e) => {
+                eprintln!("[loct][error] Failed to lock snapshot cache: {}", e);
+                return DispatchResult::Exit(1);
+            }
+        };
+
+        let export_path = match git_repo.export_tree(since_path, &cache_dir) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!(
+                    "[loct][error] Failed to export tree for '{}': {}",
+                    since_path, e
+                );
+                eprintln!(
+                    "[loct][hint] Ensure the ref exists; baseline uses git plumbing, not a worktree"
+                );
+                return DispatchResult::Exit(1);
+            }
+        };
+
+        if !global.quiet {
+            eprintln!("[loct] Scanning exported tree...");
+        }
+
+        // The export is not a git checkout, so this internal scan opts into
+        // force_non_git. Unified scan args keep the same file universe as the
+        // current snapshot (detect-applied extensions + .loctignore).
+        let mut parsed = crate::snapshot::unified_scan_args(&export_path, global.verbose);
+        parsed.force_non_git = true;
+        let root_list = vec![export_path.clone()];
+
+        if let Err(e) = crate::snapshot::run_init_with_options(&root_list, &parsed, true) {
+            eprintln!("[loct][error] Failed to scan exported tree: {}", e);
             return DispatchResult::Exit(1);
         }
-    };
 
-    let worktree_path = temp_dir
-        .path()
-        .join(format!("loctree-diff-{}", since_path.replace('/', "-")));
-
-    // Create worktree
-    if let Err(e) = git_repo.create_worktree(since_path, &worktree_path) {
-        eprintln!("[loct][error] Failed to create worktree: {}", e);
-        eprintln!("[loct][hint] Ensure branch exists and worktree can be created");
-        return DispatchResult::Exit(1);
-    }
-
-    // Ensure cleanup happens even if we encounter errors
-    let cleanup = || {
-        if let Err(e) = git_repo.remove_worktree(&worktree_path)
-            && !global.quiet
-        {
-            eprintln!("[loct][warning] Failed to remove worktree: {}", e);
-        }
-    };
-
-    // Scan the worktree
-    if !global.quiet {
-        eprintln!("[loct] Scanning worktree...");
-    }
-
-    // Scan the worktree using run_init with the unified file universe so the
-    // diff compares the same file set as the current snapshot (detect-applied
-    // extensions + .loctignore), not a broader default-extension scan.
-    let worktree_snapshot = {
-        let parsed = crate::snapshot::unified_scan_args(&worktree_path, global.verbose);
-
-        let root_list = vec![worktree_path.clone()];
-
-        if let Err(e) = crate::snapshot::run_init(&root_list, &parsed) {
-            eprintln!("[loct][error] Failed to scan worktree: {}", e);
-            cleanup();
-            return DispatchResult::Exit(1);
-        }
-
-        // Load the snapshot we just created
-        match Snapshot::load(&worktree_path) {
+        match Snapshot::load(&export_path) {
             Ok(snap) => snap,
             Err(e) => {
-                eprintln!("[loct][error] Failed to load worktree snapshot: {}", e);
-                cleanup();
+                eprintln!("[loct][error] Failed to load exported-tree snapshot: {}", e);
                 return DispatchResult::Exit(1);
             }
         }
@@ -274,7 +270,6 @@ pub fn handle_auto_scan_base_diff(
         Ok(s) => s,
         Err(e) => {
             eprintln!("[loct][error] Failed to load current snapshot: {}", e);
-            cleanup();
             return DispatchResult::Exit(1);
         }
     };
@@ -296,20 +291,13 @@ pub fn handle_auto_scan_base_diff(
 
     // Compare snapshots (artifact fence default-on; --include-artifacts opts out)
     let diff = SnapshotDiff::compare_fenced(
-        &worktree_snapshot,
+        &base_snapshot,
         &current_snapshot,
         from_commit,
         to_commit,
         &changed_files,
         opts.include_artifacts,
     );
-
-    // Cleanup worktree
-    cleanup();
-
-    if !global.quiet {
-        eprintln!("[loct] Worktree cleaned up");
-    }
 
     // Output results
     if global.json || opts.jsonl {
@@ -334,7 +322,7 @@ pub fn handle_auto_scan_base_diff(
     } else {
         // Human-readable output
         println!("Snapshot Diff (auto-scanned):");
-        println!("  From: {} (scanned in worktree)", since_path);
+        println!("  From: {} (exported tree)", since_path);
         println!("  To:   (current)");
         println!();
         println!("Summary: {}", diff.impact.summary);
@@ -416,7 +404,7 @@ pub fn handle_diff_command(opts: &DiffOptions, global: &GlobalOptions) -> Dispat
         return DispatchResult::Exit(1);
     };
 
-    // Handle --auto-scan-base: create worktree, scan, compare, cleanup
+    // Handle --auto-scan-base: export ref tree (no worktree), scan, compare
     if opts.auto_scan_base {
         return handle_auto_scan_base_diff(opts, global, since_path);
     }
@@ -787,4 +775,94 @@ pub fn handle_problems_only_diff(
 
     // For JSON output, exit with non-zero if problems found
     DispatchResult::Exit(if total_problems > 0 { 1 } else { 0 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handle_auto_scan_base_diff;
+    use crate::cli::command::{DiffOptions, GlobalOptions};
+    use crate::cli::dispatch::DispatchResult;
+    use serial_test::serial;
+    use std::path::Path;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn git_worktree_list(repo: &Path) -> String {
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    struct CwdGuard(std::path::PathBuf);
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    /// Acceptance: `loct diff --since HEAD~3 --auto-scan-base` must not
+    /// register a git worktree.
+    #[test]
+    #[serial]
+    fn w5_02_auto_scan_base_does_not_register_worktree() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        for i in 0..4 {
+            std::fs::write(path.join("main.ts"), format!("export const n = {i};\n")).unwrap();
+            Command::new("git")
+                .args(["add", "."])
+                .current_dir(path)
+                .output()
+                .unwrap();
+            Command::new("git")
+                .args(["commit", "-m", &format!("c{i}")])
+                .current_dir(path)
+                .output()
+                .unwrap();
+        }
+
+        let before = git_worktree_list(path);
+        let _cwd = CwdGuard(std::env::current_dir().unwrap());
+        std::env::set_current_dir(path).unwrap();
+
+        let opts = DiffOptions {
+            since: Some("HEAD~3".into()),
+            auto_scan_base: true,
+            jsonl: false,
+            ..Default::default()
+        };
+        let global = GlobalOptions {
+            quiet: true,
+            json: true,
+            ..Default::default()
+        };
+        let result = handle_auto_scan_base_diff(&opts, &global, "HEAD~3");
+        assert!(
+            matches!(result, DispatchResult::Exit(0)),
+            "auto-scan-base should succeed on a tiny fixture"
+        );
+        let after = git_worktree_list(path);
+        assert_eq!(
+            before, after,
+            "auto-scan-base must not add a git worktree; before={before:?} after={after:?}"
+        );
+    }
 }

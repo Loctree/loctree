@@ -739,7 +739,7 @@ loct diff --since <SNAPSHOT> [--to <SNAPSHOT>] [OPTIONS]
 **Options:**
 - `--since <SNAPSHOT>` - Base snapshot to compare from (required)
 - `--to <SNAPSHOT>` - Target snapshot (default: current working tree)
-- `--auto-scan-base` - Auto-create git worktree and scan target branch
+- `--auto-scan-base` - Export the `--since` ref tree and scan it (no git worktree)
 - `--problems-only` - Show only regressions (new dead code, new cycles)
 - `--jsonl` - Output as JSONL (one line per change)
 

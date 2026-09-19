@@ -956,7 +956,7 @@ DESCRIPTION:
 OPTIONS:
     --since <SNAPSHOT>   Base snapshot to compare from (required)
     --to <SNAPSHOT>      Target snapshot (default: current working tree)
-    --auto-scan-base     Auto-create git worktree and scan target branch
+    --auto-scan-base     Export the --since ref tree and scan it (no git worktree)
     --changed-files      Show only the changed-file summary for <ref>..HEAD
     --problems-only      Show only regressions (new dead code, new cycles)
     --help, -h           Show this help message

@@ -350,8 +350,114 @@ impl GitRepo {
         Ok(files)
     }
 
-    /// Create a temporary worktree for a specific branch/commit
-    /// Returns the path to the worktree directory
+    /// Export the committed tree at `reference` into `cache_dir` without
+    /// creating a git worktree.
+    ///
+    /// Layout: `<cache_dir>/<oid>/` where `oid` is the resolved commit hash.
+    /// The directory is a plain blob checkout (git-archive / plumbing
+    /// equivalent). It is **not** registered with `git worktree`.
+    ///
+    /// Concurrent writers share an exclusive lock on `cache_dir/.lock`.
+    /// A complete prior export of the same oid is reused.
+    pub fn export_tree(&self, reference: &str, cache_dir: &Path) -> Result<PathBuf, GitError> {
+        let oid_str = self.resolve_ref(reference)?;
+        std::fs::create_dir_all(cache_dir)?;
+
+        let lock_path = cache_dir.join(".lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        fs4::fs_std::FileExt::lock_exclusive(&lock_file).map_err(|err| {
+            GitError::OperationFailed(format!("failed to lock export-tree cache: {err}"))
+        })?;
+
+        let dest = cache_dir.join(&oid_str);
+        let marker = cache_dir.join(format!("{oid_str}.complete"));
+        if dest.is_dir() && marker.is_file() {
+            return Ok(dest);
+        }
+
+        let staging = cache_dir.join(format!(".staging-{oid_str}"));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir_all(&staging)?;
+
+        self.write_tree_blobs(&oid_str, &staging)?;
+
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest)?;
+        }
+        std::fs::rename(&staging, &dest)?;
+        std::fs::write(&marker, oid_str.as_bytes())?;
+        drop(lock_file);
+        Ok(dest)
+    }
+
+    /// Write every blob from the commit tree to `dest` (git-archive plumbing).
+    fn write_tree_blobs(&self, oid_str: &str, dest: &Path) -> Result<(), GitError> {
+        let oid = Oid::from_str(oid_str)?;
+        let commit = self.repo.find_commit(oid)?;
+        let tree = commit.tree()?;
+
+        let mut blobs: Vec<(PathBuf, Oid, i32)> = Vec::new();
+        tree.walk(git2::TreeWalkMode::PreOrder, |dir, entry| {
+            if entry.kind() == Some(git2::ObjectType::Blob) {
+                let name = entry.name().unwrap_or("");
+                if !name.is_empty() {
+                    let rel = if dir.is_empty() {
+                        PathBuf::from(name)
+                    } else {
+                        PathBuf::from(dir).join(name)
+                    };
+                    blobs.push((rel, entry.id(), entry.filemode()));
+                }
+            }
+            git2::TreeWalkResult::Ok
+        })?;
+
+        const GIT_FILEMODE_LINK: i32 = 0o120000;
+        const GIT_FILEMODE_BLOB_EXECUTABLE: i32 = 0o100755;
+
+        for (rel, blob_oid, mode) in blobs {
+            let blob = self.repo.find_blob(blob_oid)?;
+            let path = dest.join(&rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if mode == GIT_FILEMODE_LINK {
+                #[cfg(unix)]
+                {
+                    let target = String::from_utf8_lossy(blob.content());
+                    if path.exists() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    std::os::unix::fs::symlink(target.as_ref(), &path)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&path, blob.content())?;
+                }
+            } else {
+                std::fs::write(&path, blob.content())?;
+                #[cfg(unix)]
+                if mode == GIT_FILEMODE_BLOB_EXECUTABLE {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a temporary worktree for a specific branch/commit.
+    ///
+    /// Legacy: read-only review (`loct diff --auto-scan-base`) uses
+    /// [`GitRepo::export_tree`] instead of registering a git worktree.
     pub fn create_worktree(&self, reference: &str, worktree_path: &Path) -> Result<(), GitError> {
         use std::process::Command;
 
@@ -694,6 +800,7 @@ impl GitRepo {
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -1297,6 +1404,114 @@ mod tests {
         assert_eq!(ChangeStatus::Modified, ChangeStatus::Modified);
         assert_eq!(ChangeStatus::Renamed, ChangeStatus::Renamed);
         assert_eq!(ChangeStatus::Copied, ChangeStatus::Copied);
+    }
+
+    fn git_worktree_list(repo_path: &Path) -> String {
+        let output = Command::new("git")
+            .args(["worktree", "list", "--porcelain"])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    fn git_blob_oid(repo_path: &Path, spec: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", spec])
+            .current_dir(repo_path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git_hash_object(file: &Path) -> String {
+        let output = Command::new("git")
+            .args(["hash-object"])
+            .arg(file)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// W5-02: `--since <ref>` baseline is an exported tree, not a git worktree.
+    /// File hashes of the export must match the blobs at that ref.
+    #[test]
+    #[serial]
+    fn w5_02_diff_since_ref_uses_export_tree() {
+        let (temp_dir, repo) = create_test_repo();
+        let path = temp_dir.path();
+        let first_oid = repo.resolve_ref("HEAD").unwrap();
+
+        std::fs::create_dir_all(path.join("nested")).unwrap();
+        std::fs::write(path.join("nested/leaf.ts"), "export const leaf = 1;\n").unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Add nested leaf"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        std::fs::write(
+            path.join("main.ts"),
+            "export function main() { return 2; }\n",
+        )
+        .unwrap();
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "Change main"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+
+        let before = git_worktree_list(path);
+        let cache = temp_dir.path().join("export-cache");
+        let exported = repo
+            .export_tree(&first_oid, &cache)
+            .expect("export_tree should materialize the ref without a worktree");
+
+        let after = git_worktree_list(path);
+        assert_eq!(
+            before, after,
+            "export_tree must not register a git worktree; before={before:?} after={after:?}"
+        );
+        assert!(
+            !after.contains(&exported.display().to_string()),
+            "exported path must not appear in git worktree list: {after}"
+        );
+        assert!(
+            !exported.join(".git").exists(),
+            "export must be a plain tree, not a git checkout"
+        );
+
+        let expected_main = git_blob_oid(path, &format!("{first_oid}:main.ts"));
+        let actual_main = git_hash_object(&exported.join("main.ts"));
+        assert_eq!(
+            actual_main, expected_main,
+            "exported main.ts blob hash must match the tree at {first_oid}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exported.join("main.ts")).unwrap(),
+            "export function main() {}",
+            "export must reflect the ref tree, not later commits"
+        );
+        assert!(
+            !exported.join("nested/leaf.ts").exists(),
+            "files added after the ref must not appear in the export"
+        );
+
+        let reused = repo.export_tree(&first_oid, &cache).unwrap();
+        assert_eq!(
+            reused, exported,
+            "complete export of the same oid is reused"
+        );
     }
 
     #[test]
