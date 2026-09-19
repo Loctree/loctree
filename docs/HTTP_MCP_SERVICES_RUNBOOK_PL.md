@@ -50,8 +50,8 @@ pliku tokena albo mechanizmu zmiennej/nagłówka danego klienta.
 
 * **Zarządzanie serwisem LaunchAgent:**
   ```bash
-  make install-service    # Instaluje i startuje LaunchAgent io.vetcoders.aicx.mcp
-  make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent io.vetcoders.aicx.mcp
+  make install-service    # Instaluje i startuje LaunchAgent com.loctree.aicx.mcp
+  make uninstall-service  # Zatrzymuje i wyrejestrowuje LaunchAgent com.loctree.aicx.mcp
   make install-schedule   # Legacy: osobny refresh tylko gdy nie działa serwer HTTP
   ```
 
@@ -313,7 +313,7 @@ Serwisy są zarejestrowane jako per-user LaunchAgents w `~/Library/LaunchAgents/
 
 | Identyfikator Serwisu | Polecenie | Domyślny Port | Cel Logowania |
 | :--- | :--- | :--- | :--- |
-| **`io.vetcoders.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
+| **`com.loctree.aicx.mcp`** | `aicx serve --transport http` | `8044` | `~/.aicx/logs/aicx-serve-http.log` |
 | **`com.loctree.loctree.mcp`** | `loctree-mcp --transport http` | `5174` | `~/.loctree/logs/loctree-serve-http.log` |
 
 Oba serwisy domyślnie bindują loopback i żaden nie terminuje TLS w procesie.
@@ -337,8 +337,8 @@ alias mcp-logs='tail -f ~/.aicx/logs/aicx-serve-http.log ~/.loctree/logs/loctree
 alias mcp-launchd='launchctl list | grep -E "vetcoders|loctree"'
 
 # Restart obu serwisów launchd
-alias mcp-restart='launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist 2>/dev/null; \
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.vetcoders.aicx.mcp.plist; \
+alias mcp-restart='launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.loctree.aicx.mcp.plist 2>/dev/null; \
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.loctree.aicx.mcp.plist; \
   launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.loctree.loctree.mcp.plist 2>/dev/null; \
   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.loctree.loctree.mcp.plist; \
   echo "🚀 Serwisy zrestartowane w launchd"'
