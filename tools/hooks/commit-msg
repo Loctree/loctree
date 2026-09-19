@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Vibecrafted commit-msg hook.
 #
-# Enforces the agent/runtime commit standard for agent-prefixed subjects:
+# Enforces the agent/runtime commit standard:
 #
 #   [codex/interactive] chore: Polish Makefile help output formatting
 #
@@ -9,11 +9,8 @@
 #
 #   Authored-By: codex <agents@vetcoders.io>
 #   session_id: 019e93be-379d-7303-9ad4-ffae468db99f
-#   date: 2026-06-04T15:36:27 MDT
-#   runtime: codex
-#
-# Human-authored commits may use a plain Conventional Commit subject. They do
-# not require agent provenance trailers because they do not claim agent origin.
+#   time: 2026-06-05T12:52:47-06:00
+#   runtime: iterm2
 
 set -euo pipefail
 
@@ -32,55 +29,57 @@ esac
 
 types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release'
 subject_max="${VIBECRAFTED_COMMIT_MSG_SUBJECT_MAX:-100}"
-agent_subject_pattern="^\\[([a-z][a-z0-9_-]*)/[a-z0-9][a-z0-9._-]*\\] (${types})(\\(.+\\))?: .{1,${subject_max}}$"
-human_subject_pattern="^(${types})(\\(.+\\))?: .{1,${subject_max}}$"
+subject_pattern="^\\[([a-z][a-z0-9_-]*)/[a-z0-9][a-z0-9._-]*\\] (${types})(\\(.+\\))?: .{1,${subject_max}}$"
 
 failures=()
 agent=""
-if [[ "$first_line" == \[* ]]; then
-    if [[ "$first_line" =~ $agent_subject_pattern ]]; then
-        agent="${BASH_REMATCH[1]}"
-    else
-        failures+=("agent subject must be: [<agent>/<runtime>] <type>(<scope>): <subject>")
-    fi
+if [[ "$first_line" =~ $subject_pattern ]]; then
+    agent="${BASH_REMATCH[1]}"
+else
+    failures+=("subject must be: [<agent>/<runtime>] <type>(<scope>): <subject>")
+fi
 
-    if [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
-        failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
-    elif [ -z "$agent" ] && ! grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$' "$msg_file"; then
-        failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
-    fi
+if grep -Eiq '(^Co-Authored-By:|noreply@|@anthropic\.com|@openai\.com)' "$msg_file"; then
+    failures+=("vendor footers are forbidden; use Authored-By only")
+fi
 
-    if ! grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$msg_file"; then
-        failures+=("missing session_id: <uuid>")
-    fi
+if [ -n "$agent" ] && ! grep -Eq "^Authored-By: ${agent} <agents@vetcoders\\.io>$" "$msg_file"; then
+    failures+=("missing Authored-By: ${agent} <agents@vetcoders.io>")
+elif [ -z "$agent" ] && ! grep -Eq '^Authored-By: [a-z][a-z0-9_-]* <agents@vetcoders\.io>$' "$msg_file"; then
+    failures+=("missing Authored-By: <agent> <agents@vetcoders.io>")
+fi
 
-    if ! grep -Eq '^date: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2}| [A-Za-z0-9_+-]+)$' "$msg_file" \
-        && ! grep -Eq '^timestamp: [0-9]{4}_[0-9]{4}_[0-9]{4}_[A-Za-z0-9_+-]+$' "$msg_file"; then
-        failures+=("missing date: YYYY-MM-DDTHH:MM:SS TZ")
-    fi
+if ! grep -Eq '^session_id: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$msg_file"; then
+    failures+=("missing session_id: <uuid>")
+fi
 
-    if ! grep -Eq '^runtime: .+' "$msg_file"; then
-        failures+=("missing runtime: <runtime name>")
-    fi
+if ! grep -Eq '^time: [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$' "$msg_file"; then
+    failures+=("missing time: YYYY-MM-DDTHH:MM:SS±HH:MM")
+fi
 
-    has_body=0
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line%$'\r'}"
-        case "$line" in
-            "$first_line"|"") continue ;;
-        esac
-        if printf '%s\n' "$line" | grep -Eq '^(Authored-By|Co-Authored-By|session_id|date|timestamp|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
-            continue
-        fi
-        has_body=1
-        break
-    done < "$msg_file"
+if grep -Eq '^timestamp:' "$msg_file"; then
+    failures+=("timestamp: is legacy; use time: <ISO-8601 offset>")
+fi
 
-    if [ "$has_body" -ne 1 ]; then
-        failures+=("agent commit message needs an explanatory body before trailers")
+if ! grep -Eq '^runtime: .+' "$msg_file"; then
+    failures+=("missing runtime: <runtime name>")
+fi
+
+has_body=0
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+        "$first_line"|"") continue ;;
+    esac
+    if printf '%s\n' "$line" | grep -Eq '^(Authored-By|session_id|time|runtime|Signed-off-by|Vibecrafted-Warn-Signature):'; then
+        continue
     fi
-elif [[ ! "$first_line" =~ $human_subject_pattern ]]; then
-    failures+=("human subject must be: <type>(<scope>): <subject>")
+    has_body=1
+    break
+done < "$msg_file"
+
+if [ "$has_body" -ne 1 ]; then
+    failures+=("commit message needs an explanatory body before trailers")
 fi
 
 if [ "${#failures[@]}" -ne 0 ]; then
@@ -93,8 +92,12 @@ if [ "${#failures[@]}" -ne 0 ]; then
     printf '  Refactors the help target to use structured printf output.\n\n' >&2
     printf '  Authored-By: codex <agents@vetcoders.io>\n' >&2
     printf '  session_id: 019e93be-379d-7303-9ad4-ffae468db99f\n' >&2
-    printf '  date: 2026-06-04T15:36:27 MDT\n' >&2
-    printf '  runtime: codex\n' >&2
+    printf '  time: 2026-06-05T12:52:47-06:00\n' >&2
+    printf '  runtime: iterm2\n' >&2
+    printf '\nSession id discovery:\n' >&2
+    # shellcheck disable=SC2016  # printed for the user to copy, not expanded here
+    printf '%s\n' '  echo "${CODEX_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${ATUIN_SESSION:-}}}"' >&2
+    printf '  or read the run meta under ~/.vibecrafted/artifacts/**/reports/*.meta.json\n' >&2
     exit 1
 fi
 
