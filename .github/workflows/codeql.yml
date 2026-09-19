@@ -3,7 +3,8 @@ name: CodeQL
 on:
   push:
     branches: [main, develop]
-  pull_request: {}
+  pull_request:
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
