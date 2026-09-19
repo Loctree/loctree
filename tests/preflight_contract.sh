@@ -145,12 +145,12 @@ if ! grep -Fq "build-mode: manual" "$CODEQL_WORKFLOW"; then
   echo "CodeQL workflow does not opt Java/Kotlin into an explicit build" >&2
   exit 1
 fi
-if ! grep -Fq "uses: actions/setup-java@v4" "$CODEQL_WORKFLOW"; then
-  echo "CodeQL workflow does not set up Java deterministically for the Kotlin lane" >&2
+if ! grep -Fq "name: Set up Java for JetBrains plugin analysis" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not declare a dedicated Java setup step for the Kotlin lane" >&2
   exit 1
 fi
-if ! grep -Fq 'java-version: "21"' "$CODEQL_WORKFLOW"; then
-  echo "CodeQL workflow does not pin the required Java toolchain for the Kotlin lane" >&2
+if ! grep -Fq "distribution: temurin" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not request the Temurin Java distribution for the Kotlin lane" >&2
   exit 1
 fi
 if ! grep -Fq "working-directory: editors/jetbrains" "$CODEQL_WORKFLOW"; then
