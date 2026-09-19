@@ -34,5 +34,6 @@ pub use options::{
     SuppressOptions, SuppressionsOptions, TagmapOptions, TraceOptions, TreeOptions, TwinsOptions,
     WatchMode, WatchOptions, ZombieOptions,
 };
+pub use help::LOCT_USAGE;
 pub use parsed::ParsedCommand;
 pub use types::Command;

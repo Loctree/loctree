@@ -638,20 +638,12 @@ pub fn dispatch_command(parsed_cmd: &ParsedCommand) -> DispatchResult {
         }
         Command::Help(opts) if opts.command.is_some() => {
             let cmd_name = opts.command.clone().unwrap();
-            if let Some(message) = Command::retired_command_message(&cmd_name) {
-                eprintln!("{}", message.trim_end());
-                return DispatchResult::Exit(1);
-            }
             if let Some(text) = Command::format_command_help(&cmd_name) {
                 println!("{}", text);
                 return DispatchResult::Exit(0);
-            } else {
-                eprintln!(
-                    "Unknown command '{}'. Run 'loct --help' for available commands.",
-                    cmd_name
-                );
-                return DispatchResult::Exit(1);
             }
+            eprintln!("{}", crate::cli::parser::format_unknown_help_topic(&cmd_name));
+            return DispatchResult::Exit(1);
         }
         Command::Help(_) => {
             return DispatchResult::ShowHelp;

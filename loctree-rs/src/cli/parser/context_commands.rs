@@ -8,6 +8,7 @@ use super::super::command::{
     Command, ContextOptions, CoverageOptions, FocusOptions, FollowOptions, HotspotsOptions,
     RepoViewOptions, SliceOptions, TraceOptions,
 };
+use super::helpers::format_unknown_analysis_option;
 use crate::context_scope::ScopeMode;
 
 /// Parse `loct slice <target> [options]` command - extract file + dependencies.
@@ -24,6 +25,7 @@ OPTIONS:
     --no-consumers       Hide reverse dependencies (old leaf-only behavior)
     --depth <N>          Maximum dependency depth to traverse (default: unlimited)
     --root <PATH>        Project root for resolving relative imports
+    --project <PATH>     Alias for --root (same spelling as context/find)
     --rescan             Force snapshot update before slicing
     --include-untracked  Slice a fresh untracked file without a full rescan
     --help, -h           Show this help message
@@ -55,10 +57,11 @@ EXAMPLES:
                 opts.depth = Some(value.parse().map_err(|_| "--depth requires a number")?);
                 i += 2;
             }
-            "--root" => {
+            "--root" | "--project" => {
+                let flag = arg.as_str();
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "--root requires a path".to_string())?;
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
                 opts.root = Some(PathBuf::from(value));
                 i += 2;
             }
@@ -82,7 +85,11 @@ EXAMPLES:
                 i += 1;
             }
             _ => {
-                return Err(format!("Unknown option '{}' for 'slice' command.", arg));
+                return Err(format_unknown_analysis_option(
+                    "slice",
+                    arg,
+                    "--consumers/-c, --no-consumers, --depth, --root, --project, --rescan, --include-untracked, --help",
+                ));
             }
         }
     }
@@ -912,5 +919,34 @@ mod tests {
         } else {
             panic!("Expected Hotspots command");
         }
+    }
+
+    #[test]
+    fn w4_01_slice_accepts_project_as_root_alias() {
+        let result = parse_slice_command(&[
+            "src/main.rs".into(),
+            "--project".into(),
+            "/tmp/sibling".into(),
+        ])
+        .unwrap();
+        if let Command::Slice(opts) = result {
+            assert_eq!(opts.target, "src/main.rs");
+            assert_eq!(opts.root, Some(std::path::PathBuf::from("/tmp/sibling")));
+        } else {
+            panic!("Expected Slice command");
+        }
+    }
+
+    #[test]
+    fn w4_01_slice_refuses_markdown_with_did_you_mean() {
+        let err = parse_slice_command(&["src/main.rs".into(), "--markdown".into()]).unwrap_err();
+        assert!(
+            err.contains("did you mean"),
+            "slice --markdown must refuse with did-you-mean: {err}"
+        );
+        assert!(
+            err.contains("loct context --markdown") || err.contains("--json"),
+            "slice --markdown must point at context --markdown or --json: {err}"
+        );
     }
 }

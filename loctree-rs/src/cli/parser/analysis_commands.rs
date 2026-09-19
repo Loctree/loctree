@@ -8,6 +8,7 @@ use super::super::command::{
     BodyOptions, Command, CyclesOptions, DeadOptions, FindOptions, ImpactCommandOptions,
     OccurrencesOptions, QueryKind, QueryOptions, TwinsOptions,
 };
+use super::helpers::format_unknown_analysis_option;
 use crate::analyzer::occurrences::positional_dot_query_error;
 
 /// Parse `loct dead [options]` command - detect unused exports.
@@ -934,6 +935,7 @@ USAGE:
 OPTIONS:
     --depth <N>          Limit traversal depth (default: unlimited)
     --root <PATH>        Project root (default: current directory)
+    --project <PATH>     Alias for --root (same spelling as context/find)
     --help, -h           Show this help message
 
 EXAMPLES:
@@ -955,10 +957,11 @@ EXAMPLES:
                 opts.depth = Some(value.parse().map_err(|_| "--depth requires a number")?);
                 i += 2;
             }
-            "--root" => {
+            "--root" | "--project" => {
+                let flag = arg.as_str();
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "--root requires a path".to_string())?;
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
                 opts.root = Some(PathBuf::from(value));
                 i += 2;
             }
@@ -974,7 +977,11 @@ EXAMPLES:
                 i += 1;
             }
             _ => {
-                return Err(format!("Unknown option '{}' for 'impact' command.", arg));
+                return Err(format_unknown_analysis_option(
+                    "impact",
+                    arg,
+                    "--depth/--max-depth, --root, --project, --help",
+                ));
             }
         }
     }
@@ -1614,5 +1621,34 @@ mod tests {
         } else {
             panic!("Expected Body command");
         }
+    }
+
+    #[test]
+    fn w4_01_impact_accepts_project_as_root_alias() {
+        let result = parse_impact_command(&[
+            "src/utils.ts".into(),
+            "--project".into(),
+            "/tmp/sibling".into(),
+        ])
+        .unwrap();
+        if let Command::Impact(opts) = result {
+            assert_eq!(opts.target, "src/utils.ts");
+            assert_eq!(opts.root, Some(PathBuf::from("/tmp/sibling")));
+        } else {
+            panic!("Expected Impact command");
+        }
+    }
+
+    #[test]
+    fn w4_01_impact_refuses_markdown_with_did_you_mean() {
+        let err = parse_impact_command(&["src/utils.ts".into(), "--markdown".into()]).unwrap_err();
+        assert!(
+            err.contains("did you mean"),
+            "impact --markdown must refuse with did-you-mean: {err}"
+        );
+        assert!(
+            err.contains("loct context --markdown") || err.contains("--json"),
+            "impact --markdown must point at context --markdown or --json: {err}"
+        );
     }
 }
