@@ -460,6 +460,9 @@ pub use refactor_plan::RiskLevel;
 /// ContextPack composition options.
 pub use pack::ContextOptions;
 
+/// How repeated `--scope` selectors combine (`all` / `any`).
+pub use context_scope::ScopeMode;
+
 /// Agent-ready context package.
 pub use pack::ContextPack;
 

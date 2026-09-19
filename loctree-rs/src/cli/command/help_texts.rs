@@ -244,7 +244,13 @@ USAGE:
 
 OPTIONS:
     --file <PATH>      Focus the context pack on a specific file
-    --scope <SELECTOR> Deterministic structural filter (repeatable; multiple = AND)
+    --scope <SELECTOR> Deterministic structural filter (repeatable).
+                       Default: multiple --scope flags are AND (intersection).
+                       Comma-joined selectors (`path:a,path:b`) are OR (union).
+                       Kinds: path, tag, import, reach. Unknown kinds fail loudly.
+    --scope-mode <all|any>
+                       Combine repeated --scope flags: all = AND (default),
+                       any = OR/union. Comma-joined values are always a union.
     --changed          Limit to files changed in the current git worktree
     --task <TEXT>      Semantic task hint; ranks within --scope when scope is present
     --with-aicx        Request AICX memory overlay (default; kept for scripts)
@@ -261,6 +267,8 @@ EXAMPLES:
     loct context
     loct context --file Cargo.toml
     loct context --scope \"path:loctree-rs/src/cli/\"
+    loct context --scope path:loctree-rs/src --scope path:loctree-mcp/src --scope-mode any
+    loct context --scope \"path:loctree-rs/src,path:loctree-mcp/src\"
     loct context --scope path:core --task \"hold-mods versus hands-off\"
     loct context --scope path:src/agent/ --task \"fix SSE retry behavior\" --full --markdown
     loct context --scope \"context-pipeline\"

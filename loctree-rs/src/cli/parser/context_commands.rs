@@ -8,6 +8,7 @@ use super::super::command::{
     Command, ContextOptions, CoverageOptions, FocusOptions, FollowOptions, HotspotsOptions,
     RepoViewOptions, SliceOptions, TraceOptions,
 };
+use crate::context_scope::ScopeMode;
 
 /// Parse `loct slice <target> [options]` command - extract file + dependencies.
 pub(super) fn parse_slice_command(args: &[String]) -> Result<Command, String> {
@@ -121,6 +122,13 @@ pub(super) fn parse_context_command(args: &[String]) -> Result<Command, String> 
                     .get(i + 1)
                     .ok_or_else(|| "--scope requires a selector or named scope".to_string())?;
                 opts.scopes.push(value.clone());
+                i += 2;
+            }
+            "--scope-mode" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--scope-mode requires a value (all or any)".to_string())?;
+                opts.scope_mode = ScopeMode::parse_cli(value)?;
                 i += 2;
             }
             "--with-aicx" => {
@@ -723,6 +731,25 @@ mod tests {
                     "tag:cli".to_string(),
                 ]
             );
+            assert_eq!(opts.scope_mode, crate::context_scope::ScopeMode::All);
+        } else {
+            panic!("Expected Context command");
+        }
+    }
+
+    #[test]
+    fn w2_02_parse_scope_mode_any() {
+        let args = vec![
+            "--scope".into(),
+            "path:a".into(),
+            "--scope".into(),
+            "path:b".into(),
+            "--scope-mode".into(),
+            "any".into(),
+        ];
+        let result = parse_context_command(&args).unwrap();
+        if let Command::Context(opts) = result {
+            assert_eq!(opts.scope_mode, crate::context_scope::ScopeMode::Any);
         } else {
             panic!("Expected Context command");
         }
