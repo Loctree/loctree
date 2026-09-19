@@ -331,6 +331,38 @@ fn handle_follow_all(
     DispatchResult::Exit(0)
 }
 
+/// Filter dead export candidates by path regex or substring.
+pub(crate) fn filter_dead_by_path(
+    dead_exports: &mut Vec<crate::analyzer::dead_parrots::DeadExport>,
+    path_filter: Option<&str>,
+    with_shadows: bool,
+) -> Result<(), String> {
+    let Some(filter) = path_filter else {
+        return Ok(());
+    };
+
+    if with_shadows {
+        return Err("--path filter is not supported with --with-shadows".to_string());
+    }
+
+    let clean_filter = if let Some(stripped) = filter.strip_prefix("./") {
+        stripped
+    } else {
+        filter
+    };
+
+    let re = regex::Regex::new(clean_filter)
+        .map_err(|e| format!("invalid --path regex '{}': {}", filter, e))?;
+
+    dead_exports.retain(|candidate| {
+        let norm_file = candidate.file.replace('\\', "/");
+        let norm_file = norm_file.trim_start_matches("./");
+        clean_filter.is_empty() || clean_filter == "." || re.is_match(norm_file)
+    });
+
+    Ok(())
+}
+
 /// Handle the dead command - detect dead exports
 pub fn handle_dead_command(opts: &DeadOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::dead_parrots::{
@@ -387,10 +419,30 @@ pub fn handle_dead_command(opts: &DeadOptions, global: &GlobalOptions) -> Dispat
         },
         high_confidence,
     );
-    let dead_exports = dead_truth.dead;
+    let mut dead_exports = dead_truth.dead;
+
+    if let Err(err) = filter_dead_by_path(
+        &mut dead_exports,
+        opts.path_filter.as_deref(),
+        opts.with_shadows,
+    ) {
+        if let Some(s) = spinner {
+            s.finish_error(&err);
+        } else {
+            eprintln!("[loct][error] {}", err);
+        }
+        return DispatchResult::Exit(1);
+    }
 
     if let Some(s) = spinner {
-        s.finish_success(&format!("Found {} dead export(s)", dead_exports.len()));
+        if let Some(filter) = &opts.path_filter {
+            s.finish_success(&format!(
+                "Found {} dead export(s) in {}",
+                dead_exports.len(), filter
+            ));
+        } else {
+            s.finish_success(&format!("Found {} dead export(s)", dead_exports.len()));
+        }
     }
 
     // Output results
@@ -399,6 +451,12 @@ pub fn handle_dead_command(opts: &DeadOptions, global: &GlobalOptions) -> Dispat
     } else {
         crate::types::OutputMode::Human
     };
+
+    if !global.json
+        && let Some(filter) = &opts.path_filter
+    {
+        println!("Coverage: path filter '{}' ({} matching)", filter, dead_exports.len());
+    }
 
     print_dead_exports(
         &dead_exports,
@@ -1689,7 +1747,40 @@ pub fn handle_focus_command(opts: &FocusOptions, global: &GlobalOptions) -> Disp
         max_depth: opts.depth.unwrap_or(2),
     };
 
-    let focus = match HolographicFocus::from_path(&snapshot, &opts.target, &config) {
+    let target = if opts.target == "."
+        || opts.target == "./"
+        || opts.target.is_empty()
+        || Path::new(&opts.target) == root
+    {
+        ".".to_string()
+    } else if let Ok(rel) = Path::new(&opts.target).strip_prefix(root) {
+        let rel_str = rel.to_string_lossy();
+        if rel_str.is_empty() || rel_str == "." {
+            ".".to_string()
+        } else {
+            rel_str.to_string()
+        }
+    } else if let (Ok(canon_target), Ok(canon_root)) = (
+        Path::new(&opts.target).canonicalize(),
+        root.canonicalize(),
+    ) {
+        if canon_target == canon_root {
+            ".".to_string()
+        } else if let Ok(rel) = canon_target.strip_prefix(&canon_root) {
+            let rel_str = rel.to_string_lossy();
+            if rel_str.is_empty() || rel_str == "." {
+                ".".to_string()
+            } else {
+                rel_str.to_string()
+            }
+        } else {
+            opts.target.clone()
+        }
+    } else {
+        opts.target.clone()
+    };
+
+    let focus = match HolographicFocus::from_path(&snapshot, &target, &config) {
         Some(f) => f,
         None => {
             // Distinguish a genuine wrong path from a correct path that is simply
@@ -3372,5 +3463,50 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(json["dead_exports"]["omitted"].as_u64(), Some(1));
         assert_eq!(json["dead_exports"]["truncated"].as_bool(), Some(true));
+    }
+
+    fn dead_export_with_file(file: &str, symbol: &str, line: usize) -> DeadExport {
+        DeadExport {
+            file: file.into(),
+            symbol: symbol.into(),
+            line: Some(line),
+            confidence: "high".into(),
+            reason: "unused export".into(),
+            open_url: None,
+            is_test: false,
+            action: "delete_candidate".to_string(),
+            entrypoint: false,
+        }
+    }
+
+    #[test]
+    fn w1_06_dead_path_filter_is_honored() {
+        use super::filter_dead_by_path;
+
+        let mut dead = vec![
+            dead_export_with_file("src/foo/a.rs", "sym_a", 10),
+            dead_export_with_file("src/foo/sub/b.rs", "sym_b", 20),
+            dead_export_with_file("src/other/c.rs", "sym_c", 30),
+            dead_export_with_file("distribution/script.sh", "func_d", 40),
+        ];
+
+        // Filter to src/foo subtree
+        let res = filter_dead_by_path(&mut dead, Some("src/foo"), false);
+        assert!(res.is_ok());
+        assert_eq!(dead.len(), 2);
+        assert_eq!(dead[0].file, "src/foo/a.rs");
+        assert_eq!(dead[1].file, "src/foo/sub/b.rs");
+
+        // Refusal when with_shadows is enabled
+        let mut dead2 = vec![dead_export_with_file("src/foo/a.rs", "sym_a", 10)];
+        let res_shadows = filter_dead_by_path(&mut dead2, Some("src/foo"), true);
+        assert!(res_shadows.is_err());
+        assert!(res_shadows.unwrap_err().contains("--with-shadows"));
+
+        // Refusal on invalid regex pattern
+        let mut dead3 = vec![dead_export_with_file("src/foo/a.rs", "sym_a", 10)];
+        let res_invalid = filter_dead_by_path(&mut dead3, Some("[invalid"), false);
+        assert!(res_invalid.is_err());
+        assert!(res_invalid.unwrap_err().contains("invalid --path regex"));
     }
 }

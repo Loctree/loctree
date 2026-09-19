@@ -102,15 +102,30 @@ fn strip_extension(path: &str) -> &str {
 
 /// Normalize a directory path for matching
 fn normalize_directory(path: &str) -> String {
-    let normalized = path.trim_start_matches("./").replace('\\', "/");
-    // Ensure no trailing slash for consistent matching
-    normalized.trim_end_matches('/').to_string()
+    let mut normalized = path.replace('\\', "/");
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed == "." || trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Check if a file path is within a directory
 fn is_in_directory(file_path: &str, dir_path: &str) -> bool {
-    let norm_file = file_path.trim_start_matches("./").replace('\\', "/");
+    let mut norm_file = file_path.replace('\\', "/");
+    while let Some(stripped) = norm_file.strip_prefix("./") {
+        norm_file = stripped.to_string();
+    }
+    let norm_file = norm_file.trim_start_matches('/');
     let norm_dir = normalize_directory(dir_path);
+
+    if norm_dir.is_empty() {
+        return !norm_file.is_empty();
+    }
 
     // Either exact match (unlikely for dir vs file) or starts with dir/
     norm_file == norm_dir || norm_file.starts_with(&format!("{}/", norm_dir))
@@ -353,13 +368,18 @@ impl HolographicFocus {
                 .then(a.line.cmp(&b.line))
                 .then(a.name.cmp(&b.name))
         });
+        let display_target = if normalized_target.is_empty() {
+            ".".to_string()
+        } else {
+            normalized_target.clone()
+        };
         let suggested_next = suggested_next_for_symbols(
-            format!("loct focus {}", shell_quote(&normalized_target)),
+            format!("loct focus {}", shell_quote(&display_target)),
             &core_symbols,
         );
 
         Some(Self {
-            target: normalized_target,
+            target: display_target,
             core,
             deps,
             consumers,
@@ -751,5 +771,29 @@ mod tests {
         assert!(!is_in_directory("src/other/bar.ts", "src/foo"));
         assert!(is_in_directory("./src/foo/bar.ts", "src/foo"));
         assert!(is_in_directory("src/foo/bar.ts", "./src/foo"));
+        assert!(is_in_directory("src/foo/bar.ts", "."));
+        assert!(is_in_directory("src/foo/bar.ts", "./"));
+        assert!(is_in_directory("src/foo/bar.ts", ""));
+        assert!(is_in_directory("bar.ts", "."));
+    }
+
+    #[test]
+    fn w1_06_focus_dot_resolves_repo_root() {
+        let snapshot = create_test_snapshot();
+        let config = FocusConfig::default();
+
+        let focus = HolographicFocus::from_path(&snapshot, ".", &config)
+            .expect("focus on '.' should resolve to repo root");
+
+        assert_eq!(focus.stats.core_files, snapshot.files.len());
+        assert_eq!(focus.target, ".");
+        assert_eq!(focus.stats.core_files, 6);
+        assert_eq!(focus.core.len(), snapshot.files.len());
+        assert!(focus.stats.internal_edges > 0);
+
+        let focus_slash = HolographicFocus::from_path(&snapshot, "./", &config)
+            .expect("focus on './' should resolve to repo root");
+        assert_eq!(focus_slash.stats.core_files, snapshot.files.len());
+        assert_eq!(focus_slash.target, ".");
     }
 }
