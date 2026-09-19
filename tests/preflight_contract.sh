@@ -131,3 +131,25 @@ if ! printf '%s\n' "$ci_executable" | grep -Eq \
   echo "self-hosted CI is not guarded from fork pull requests" >&2
   exit 1
 fi
+
+CODEQL_WORKFLOW="$ROOT_DIR/.github/workflows/codeql.yml"
+if ! grep -Fq 'name: Analyze (${{ matrix.language }})' "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not keep per-language analyze jobs" >&2
+  exit 1
+fi
+if ! grep -Fq "language: java-kotlin" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not analyze the JetBrains Kotlin surface" >&2
+  exit 1
+fi
+if ! grep -Fq "build-mode: manual" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not opt Java/Kotlin into an explicit build" >&2
+  exit 1
+fi
+if ! grep -Fq "working-directory: editors/jetbrains" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not build the JetBrains Gradle project in place" >&2
+  exit 1
+fi
+if ! grep -Fq "./gradlew --no-daemon classes testClasses" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not compile the JetBrains Gradle sources before analysis" >&2
+  exit 1
+fi
