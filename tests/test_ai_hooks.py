@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,8 +42,11 @@ class LoctreeFirstGuardTests(unittest.TestCase):
             "tool_name": "Bash",
             "tool_input": {"command": command},
         }
+        # Supervisor PATH may bind `python3` to a stub that exits 127
+        # unless VIBECRAFTED_PYTHON is set. Drive the guard with the same
+        # interpreter as the delivery-verifier.
         return subprocess.run(
-            ["python3", str(GUARD)],
+            [sys.executable, str(GUARD)],
             input=json.dumps(payload),
             text=True,
             capture_output=True,
@@ -66,6 +70,34 @@ class LoctreeFirstGuardTests(unittest.TestCase):
     def test_pipe_filter_is_not_policed(self):
         result = self.run_guard("git status --short | grep '^ M'")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_w2_05_guard_split_respects_quotes(self):
+        # [x] git commit -m "fix: grep && rg" is not blocked (quoted &&).
+        quoted = self.run_guard('git commit -m "fix: grep && rg"')
+        self.assertEqual(quoted.returncode, 0, quoted.stderr)
+
+        # [x] A heredoc whose body contains the word grep is not blocked.
+        heredoc = self.run_guard("cat <<'EOF'\ngrep -n main src/main.rs\nEOF")
+        self.assertEqual(heredoc.returncode, 0, heredoc.stderr)
+
+        escaped = self.run_guard("cat <<\\EOF\ngrep -n main src/main.rs\nEOF")
+        self.assertEqual(escaped.returncode, 0, escaped.stderr)
+
+        # [x] Real in-repo `grep -n` stays blocked; out-of-repo stays allowed.
+        real = self.run_guard("grep -n main src/main.rs")
+        self.assertEqual(real.returncode, 2, real.stderr)
+        self.assertIn("LOCTREE FIRST", real.stderr)
+
+        quoted_pattern = self.run_guard('grep -n "a && b" src/main.rs')
+        self.assertEqual(quoted_pattern.returncode, 2, quoted_pattern.stderr)
+
+        quoted_pipe = self.run_guard('grep -n "a | b" src/main.rs')
+        self.assertEqual(quoted_pipe.returncode, 2, quoted_pipe.stderr)
+
+        outside = self.root / "outside.txt"
+        outside.write_text("needle\n")
+        out_of_repo = self.run_guard(f"grep -n needle {outside}")
+        self.assertEqual(out_of_repo.returncode, 0, out_of_repo.stderr)
 
 
 class AiHooksInstallerTests(unittest.TestCase):
