@@ -3,11 +3,14 @@
 //! Regex-based parser that extracts public declarations (`class`, `struct`, `enum`, `protocol`, `func`, `var`, `let`, `extension`),
 //! `@import` / `import` statements, and symbol usages.
 
+use std::collections::{HashMap, HashSet};
+
 use once_cell::sync::Lazy;
 use regex::Regex;
 
 use crate::types::{
-    ExportSymbol, FileAnalysis, ImportEntry, ImportKind, ImportResolutionKind, SymbolUsage,
+    ExportSymbol, FileAnalysis, ImportEntry, ImportKind, ImportResolutionKind, LocalSymbol,
+    SymbolUsage,
 };
 
 // Public declarations:   public final class NAME / struct NAME / func NAME / protocol NAME / extension NAME
@@ -415,16 +418,349 @@ fn iter_swift_conformance_clauses(content: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Stored on `FileAnalysis::local_symbols` so a later snapshot-wide pass can
+/// credit witnesses whose protocol is declared in a different file.
+const SWIFT_PROTOCOL_REQUIREMENT_KIND: &str = "swift.protocol.requirement";
+const SWIFT_PROTOCOL_PARENT_KIND: &str = "swift.protocol.parent";
+const SWIFT_PROTOCOL_CONFORMANCE_KIND: &str = "swift.protocol.conformance";
+
+struct ProtocolIndex {
+    requirements: HashMap<String, Vec<String>>,
+    parents: HashMap<String, Vec<String>>,
+}
+
+fn protocol_base_name(piece: &str) -> Option<&str> {
+    let head = piece.split_whitespace().next()?;
+    let proto = head.split('<').next().unwrap_or(head);
+    let proto = proto.rsplit('.').next().unwrap_or(proto);
+    (!proto.is_empty()).then_some(proto)
+}
+
+fn parse_protocol_parent_list(clause: &str) -> Vec<String> {
+    let mut clause = clause.trim().to_string();
+    if let Some(idx) = clause.find(" where ") {
+        clause.truncate(idx);
+    } else if let Some(idx) = clause.find("\twhere ") {
+        clause.truncate(idx);
+    }
+    clause
+        .split(',')
+        .filter_map(protocol_base_name)
+        .map(str::to_string)
+        .collect()
+}
+
+fn brace_delta(text: &str) -> i32 {
+    let mut depth = 0i32;
+    for ch in text.chars() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn collect_protocol_requirement(line: &str, reqs: &mut Vec<String>) {
+    let Some(caps) = RE_SWIFT_DECL.captures(line) else {
+        return;
+    };
+    let keyword = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+    if !matches!(keyword, "func" | "var" | "let") {
+        return;
+    }
+    if let Some(name) = caps.get(2).map(|m| m.as_str())
+        && !name.is_empty()
+    {
+        reqs.push(name.to_string());
+    }
+}
+
+/// Discover protocol requirement names (and inheritance) from `protocol P { … }`
+/// declarations in this file. Framework protocols that never appear in the
+/// snapshot stay on the curated fallback lists.
+fn index_swift_protocols(content: &str) -> ProtocolIndex {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut requirements: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = strip_line_comment(lines[i]);
+        let Some(caps) = RE_SWIFT_DECL.captures(line) else {
+            i += 1;
+            continue;
+        };
+        if caps.get(1).map(|m| m.as_str()) != Some("protocol") {
+            i += 1;
+            continue;
+        }
+        let Some(name_m) = caps.get(2) else {
+            i += 1;
+            continue;
+        };
+        let name = name_m.as_str().to_string();
+        if name.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let mut tail = line[name_m.end()..].to_string();
+        let mut j = i;
+        while !tail.contains('{') && j + 1 < lines.len() {
+            let next = strip_line_comment(lines[j + 1]);
+            let trimmed = next.trim();
+            if trimmed.is_empty() {
+                j += 1;
+                continue;
+            }
+            if looks_like_swift_decl_start(trimmed) && !trimmed.starts_with('{') {
+                break;
+            }
+            tail.push(' ');
+            tail.push_str(trimmed);
+            j += 1;
+        }
+
+        if let Some(colon) = tail.find(':') {
+            let after = &tail[colon + 1..];
+            let until = after.find('{').unwrap_or(after.len());
+            let pars = parse_protocol_parent_list(&after[..until]);
+            if !pars.is_empty() {
+                parents.insert(name.clone(), pars);
+            }
+        }
+
+        let mut reqs: Vec<String> = Vec::new();
+        if let Some(brace_at) = tail.find('{') {
+            let mut depth = 1i32;
+            let remainder = &tail[brace_at + 1..];
+            if depth == 1 {
+                collect_protocol_requirement(remainder, &mut reqs);
+            }
+            depth += brace_delta(remainder);
+            j += 1;
+            while depth > 0 && j < lines.len() {
+                let body_line = strip_line_comment(lines[j]);
+                if depth == 1 {
+                    collect_protocol_requirement(body_line, &mut reqs);
+                }
+                depth += brace_delta(body_line);
+                j += 1;
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+
+        if !reqs.is_empty() {
+            let mut seen = HashSet::new();
+            reqs.retain(|r| seen.insert(r.clone()));
+            requirements.insert(name, reqs);
+        }
+    }
+    ProtocolIndex {
+        requirements,
+        parents,
+    }
+}
+
+fn requirement_names_for(
+    proto: &str,
+    index: &ProtocolIndex,
+    visiting: &mut HashSet<String>,
+) -> HashSet<String> {
+    if !visiting.insert(proto.to_string()) {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    if let Some(reqs) = index.requirements.get(proto) {
+        out.extend(reqs.iter().cloned());
+    }
+    if let Some(methods) = protocol_dispatch_requirement_methods(proto) {
+        out.extend(methods.iter().map(|m| (*m).to_string()));
+    }
+    if SWIFT_BODY_REQUIREMENT_PROTOCOLS.contains(&proto) {
+        out.insert("body".to_string());
+    }
+    if let Some(pars) = index.parents.get(proto) {
+        for parent in pars {
+            out.extend(requirement_names_for(parent, index, visiting));
+        }
+    }
+    visiting.remove(proto);
+    out
+}
+
+fn attach_protocol_index(
+    analysis: &mut FileAnalysis,
+    index: &ProtocolIndex,
+    conformances: &[String],
+) {
+    for (proto, reqs) in &index.requirements {
+        for req in reqs {
+            analysis.local_symbols.push(LocalSymbol {
+                name: req.clone(),
+                kind: SWIFT_PROTOCOL_REQUIREMENT_KIND.to_string(),
+                line: None,
+                context: proto.clone(),
+                is_exported: false,
+            });
+        }
+    }
+    for (proto, pars) in &index.parents {
+        for parent in pars {
+            analysis.local_symbols.push(LocalSymbol {
+                name: parent.clone(),
+                kind: SWIFT_PROTOCOL_PARENT_KIND.to_string(),
+                line: None,
+                context: proto.clone(),
+                is_exported: false,
+            });
+        }
+    }
+    for proto in conformances {
+        analysis.local_symbols.push(LocalSymbol {
+            name: proto.clone(),
+            kind: SWIFT_PROTOCOL_CONFORMANCE_KIND.to_string(),
+            line: None,
+            context: String::new(),
+            is_exported: false,
+        });
+    }
+}
+
+/// Snapshot-wide protocol-witness credits: `(file path → requirement names)`.
+///
+/// Same-file credit already lands in `local_uses`. This pass covers the
+/// remaining G-SWIFT-DEAD-FP shape: protocol `P` declared in one file,
+/// `struct S: P` / `extension S: P` implementing `P`'s requirements in
+/// another. Curated AppKit/SwiftUI lists remain a fallback for protocols
+/// that never appear in the snapshot.
+pub(crate) fn protocol_witness_credits(
+    analyses: &[FileAnalysis],
+) -> HashMap<String, HashSet<String>> {
+    let mut requirements: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+    for analysis in analyses {
+        if !analysis.path.ends_with(".swift") {
+            continue;
+        }
+        for sym in &analysis.local_symbols {
+            match sym.kind.as_str() {
+                SWIFT_PROTOCOL_REQUIREMENT_KIND if !sym.context.is_empty() => {
+                    requirements
+                        .entry(sym.context.clone())
+                        .or_default()
+                        .push(sym.name.clone());
+                }
+                SWIFT_PROTOCOL_PARENT_KIND if !sym.context.is_empty() => {
+                    parents
+                        .entry(sym.context.clone())
+                        .or_default()
+                        .push(sym.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    let index = ProtocolIndex {
+        requirements,
+        parents,
+    };
+
+    let mut credits: HashMap<String, HashSet<String>> = HashMap::new();
+    for analysis in analyses {
+        if !analysis.path.ends_with(".swift") {
+            continue;
+        }
+        let mut methods = HashSet::new();
+        for sym in &analysis.local_symbols {
+            if sym.kind == SWIFT_PROTOCOL_CONFORMANCE_KIND {
+                let mut visiting = HashSet::new();
+                methods.extend(requirement_names_for(&sym.name, &index, &mut visiting));
+            }
+        }
+        if methods.is_empty() {
+            continue;
+        }
+        let credited: HashSet<String> = analysis
+            .exports
+            .iter()
+            .filter(|exp| {
+                matches!(exp.kind.as_str(), "func" | "var" | "let") && methods.contains(&exp.name)
+            })
+            .map(|exp| exp.name.clone())
+            .collect();
+        if !credited.is_empty() {
+            credits.insert(analysis.path.clone(), credited);
+        }
+    }
+
+    // A protocol requirement declaration is live API once any snapshot file
+    // conforms to it — otherwise `protocol P { func f() }` looks unused
+    // even while `struct S: P { func f() }` is credited as a witness.
+    let conformed: HashSet<String> = analyses
+        .iter()
+        .flat_map(|analysis| {
+            analysis
+                .local_symbols
+                .iter()
+                .filter(|sym| sym.kind == SWIFT_PROTOCOL_CONFORMANCE_KIND)
+                .map(|sym| sym.name.clone())
+        })
+        .collect();
+    for analysis in analyses {
+        if !analysis.path.ends_with(".swift") {
+            continue;
+        }
+        let mut methods = HashSet::new();
+        let mut visiting_protos: HashSet<String> = HashSet::new();
+        for sym in &analysis.local_symbols {
+            if sym.kind == SWIFT_PROTOCOL_REQUIREMENT_KIND
+                && conformed.contains(&sym.context)
+                && visiting_protos.insert(sym.context.clone())
+            {
+                let mut visiting = HashSet::new();
+                methods.extend(requirement_names_for(
+                    &sym.context,
+                    &index,
+                    &mut visiting,
+                ));
+            }
+        }
+        if methods.is_empty() {
+            continue;
+        }
+        let extra: HashSet<String> = analysis
+            .exports
+            .iter()
+            .filter(|exp| {
+                matches!(exp.kind.as_str(), "func" | "var" | "let") && methods.contains(&exp.name)
+            })
+            .map(|exp| exp.name.clone())
+            .collect();
+        if !extra.is_empty() {
+            credits
+                .entry(analysis.path.clone())
+                .or_default()
+                .extend(extra);
+        }
+    }
+    credits
+}
+
 /// Credit framework-reached declarations the identifier scan cannot see
-/// (LCT-G01 class G false-dead family, W9-A + W9-B):
+/// (LCT-G01 class G false-dead family, W9-A + W9-B + W3-05):
 /// - a type conforming to [`SWIFT_ENUMERATED_CONFORMANCES`] plus its
 ///   requirement members (`previews`, `test*`/lifecycle methods),
 /// - `var body` when the file declares a conformance to a
 ///   [`SWIFT_BODY_REQUIREMENT_PROTOCOLS`] protocol (directly or via
 ///   `extension`),
-/// - `func` members matching curated requirements of AppKit/UIKit
-///   delegate/datasource protocols present in the same file
-///   ([`SWIFT_PROTOCOL_DISPATCH_REQUIREMENTS`]).
+/// - `func`/`var`/`let` members matching requirements of protocols
+///   declared in the snapshot (W3-05) **or** curated AppKit/UIKit
+///   delegate/datasource lists ([`SWIFT_PROTOCOL_DISPATCH_REQUIREMENTS`])
+///   as fallback when the protocol is outside the snapshot.
 ///
 /// Gating is file-level, matching the analyzer's line-oriented shape: a
 /// `body`/`previews`/delegate-requirement declaration is only credited when
@@ -433,22 +769,24 @@ fn iter_swift_conformance_clauses(content: &str) -> Vec<(String, String)> {
 /// clauses are folded (W9-B follow-up) so real AppKit controller headers are
 /// not half-blind. Crediting can only REMOVE a dead flag, never add one.
 fn apply_framework_conformance_credits(content: &str, analysis: &mut FileAnalysis) {
-    use std::collections::HashSet;
-
+    let index = index_swift_protocols(content);
     let mut credited: Vec<String> = Vec::new();
     let mut has_body_protocol = false;
     let mut has_preview = false;
     let mut has_xctest = false;
-    let mut protocol_dispatch_methods: HashSet<&'static str> = HashSet::new();
+    let mut protocol_dispatch_methods: HashSet<String> = HashSet::new();
+    let mut conformance_protos: Vec<String> = Vec::new();
+    let mut seen_conformances: HashSet<String> = HashSet::new();
 
     for (type_name, clause) in iter_swift_conformance_clauses(content) {
         for piece in clause.split(',') {
             // `View where T: Equatable` → `View`; `SwiftUI.App` → `App`.
-            let Some(head) = piece.split_whitespace().next() else {
+            let Some(proto) = protocol_base_name(piece) else {
                 continue;
             };
-            let proto = head.split('<').next().unwrap_or(head);
-            let proto = proto.rsplit('.').next().unwrap_or(proto);
+            if seen_conformances.insert(proto.to_string()) {
+                conformance_protos.push(proto.to_string());
+            }
             if SWIFT_ENUMERATED_CONFORMANCES.contains(&proto) {
                 if proto == "PreviewProvider" {
                     has_preview = true;
@@ -463,11 +801,12 @@ fn apply_framework_conformance_credits(content: &str, analysis: &mut FileAnalysi
             if SWIFT_BODY_REQUIREMENT_PROTOCOLS.contains(&proto) {
                 has_body_protocol = true;
             }
-            if let Some(methods) = protocol_dispatch_requirement_methods(proto) {
-                protocol_dispatch_methods.extend(methods.iter().copied());
-            }
+            let mut visiting = HashSet::new();
+            protocol_dispatch_methods.extend(requirement_names_for(proto, &index, &mut visiting));
         }
     }
+
+    attach_protocol_index(analysis, &index, &conformance_protos);
 
     if !(has_body_protocol || has_preview || has_xctest || !protocol_dispatch_methods.is_empty()) {
         return;
@@ -477,7 +816,9 @@ fn apply_framework_conformance_credits(content: &str, analysis: &mut FileAnalysi
         let name = exp.name.as_str();
         let dispatched = match exp.kind.as_str() {
             "var" | "let" => {
-                (has_body_protocol && name == "body") || (has_preview && name == "previews")
+                (has_body_protocol && name == "body")
+                    || (has_preview && name == "previews")
+                    || protocol_dispatch_methods.contains(name)
             }
             "func" => {
                 (has_xctest && is_xctest_dispatch_method(name))
@@ -1324,5 +1665,104 @@ import struct Module.MyStruct
         assert!(imports.contains(&"Foundation".to_string()));
         assert!(imports.contains(&"MyApp".to_string()));
         assert!(imports.contains(&"Module.MyStruct".to_string()));
+    }
+
+    #[test]
+    fn w3_05_swift_protocol_witness_not_dead() {
+        // Custom protocol is not on the curated AppKit/SwiftUI lists.
+        // Witness lives in a different file so same-file identifier
+        // coincidence (parse_local_uses seeing the impl as a "use" of the
+        // requirement name) cannot mask a missing conformance credit.
+        let proto = analyze_swift_file(
+            r#"
+protocol PayloadMatching {
+    func matchesPayload(_ raw: String) -> Bool
+    var glyph: String { get }
+}
+"#,
+            "Sources/App/PayloadMatching.swift".to_string(),
+        );
+        let impls = analyze_swift_file(
+            r#"
+struct CarrierGuard: PayloadMatching {
+    func matchesPayload(_ raw: String) -> Bool { true }
+    var glyph: String { "x" }
+    func unusedHelper() {}
+}
+"#,
+            "Sources/App/CarrierGuard.swift".to_string(),
+        );
+
+        let files = [proto, impls];
+        let credits = protocol_witness_credits(&files);
+        let credited = credits
+            .get("Sources/App/CarrierGuard.swift")
+            .expect("conformance file must receive discovered-requirement credits");
+        assert!(
+            credited.contains("matchesPayload"),
+            "custom protocol func requirement must be credited from the snapshot declaration"
+        );
+        assert!(
+            credited.contains("glyph"),
+            "custom protocol property requirement must be credited from the snapshot declaration"
+        );
+        assert!(
+            !credited.contains("unusedHelper"),
+            "non-requirement helpers must not ride the witness credit"
+        );
+
+        let dead = crate::analyzer::dead_parrots::find_dead_exports(
+            &files,
+            false,
+            None,
+            crate::analyzer::dead_parrots::DeadFilterConfig::default(),
+        );
+        let dead_of = |file: &str, symbol: &str| {
+            dead.iter()
+                .any(|d| d.file.contains(file) && d.symbol == symbol)
+        };
+        assert!(
+            !dead_of("CarrierGuard.swift", "matchesPayload"),
+            "custom protocol witness matchesPayload must not be dead; got {dead:?}"
+        );
+        assert!(
+            !dead_of("CarrierGuard.swift", "glyph"),
+            "custom protocol requirement property glyph must not be dead; got {dead:?}"
+        );
+        assert!(
+            !dead_of("PayloadMatching.swift", "matchesPayload"),
+            "protocol requirement matchesPayload is live API once a snapshot type conforms; got {dead:?}"
+        );
+        assert!(
+            dead_of("CarrierGuard.swift", "unusedHelper"),
+            "non-requirement helper must stay a dead candidate; got {dead:?}"
+        );
+    }
+
+    #[test]
+    fn w3_05_swift_same_module_call_not_dead() {
+        let callee = analyze_swift_file(
+            "func runtimePackMatchesCarrier(_ pack: String) -> Bool { true }\nfunc unusedScratch() {}\n",
+            "Sources/App/RuntimePackMenuPolicy.swift".to_string(),
+        );
+        let caller = analyze_swift_file(
+            "func bootPolicy() {\n    _ = runtimePackMatchesCarrier(\"x\")\n}\n",
+            "Sources/App/ProductUpdatePolicy.swift".to_string(),
+        );
+        let dead = crate::analyzer::dead_parrots::find_dead_exports(
+            &[callee, caller],
+            false,
+            None,
+            crate::analyzer::dead_parrots::DeadFilterConfig::default(),
+        );
+        let names: Vec<&str> = dead.iter().map(|d| d.symbol.as_str()).collect();
+        assert!(
+            !names.contains(&"runtimePackMatchesCarrier"),
+            "same-module Swift call must not be dead; got {names:?}"
+        );
+        assert!(
+            names.contains(&"unusedScratch"),
+            "unreferenced sibling must stay dead; got {names:?}"
+        );
     }
 }
