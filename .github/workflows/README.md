@@ -18,6 +18,7 @@ Loctree monorepo.
 | Workflow | Trigger | Purpose | Status |
 |----------|---------|---------|--------|
 | **ci.yml** | Selected long-lived pushes; all internal PR bases | Workspace fmt, clippy, hook contracts and tests on GitHub-hosted Linux and macOS | ✅ Active |
+| **codeql.yml** | Push, PR, manual dispatch | CodeQL scanning with Rust autobuild plus explicit Gradle build for the JetBrains Kotlin plugin | ✅ Active |
 | **loctree-ci.yml** | Push, PR | Self-analysis dogfooding on GitHub-hosted Linux + macOS | ✅ Active |
 | **semgrep.yml** | Push, PR | Security scanning on GitHub-hosted Linux | ✅ Active |
 
