@@ -824,6 +824,8 @@ OPTIONS:
     --max-lines <N>   Cap source lines returned per body (default: 200)
     --file <PATH>     Qualify an ambiguous symbol to one defining file
                       (exact repo-relative path or path suffix)
+    --root <PATH>     Project root to scan (default: current directory)
+    --project <PATH>  Alias for --root
     --json            Emit JSON (file, start/end line, language, source,
                       truncated, extent)
     --help, -h        Show this help message
@@ -832,13 +834,15 @@ EXAMPLES:
     loct body transcription_session
     loct body handle_query_command --max-lines 80
     loct body build --file src/beta.py
-    loct body query_where_symbol --json"
+    loct body query_where_symbol --json
+    loct body helper --root /path/to/project"
             .to_string());
     }
 
     let mut symbol: Option<String> = None;
     let mut line_cap: Option<usize> = None;
     let mut file: Option<String> = None;
+    let mut root: Option<PathBuf> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -856,6 +860,14 @@ EXAMPLES:
                     .get(i + 1)
                     .ok_or_else(|| "--file requires a path".to_string())?;
                 file = Some(value.clone());
+                i += 2;
+            }
+            "--root" | "--project" => {
+                let flag = args[i].as_str();
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
+                root = Some(PathBuf::from(value));
                 i += 2;
             }
             _ if !arg.starts_with('-') => {
@@ -883,6 +895,7 @@ EXAMPLES:
         symbol,
         line_cap,
         file,
+        root,
     }))
 }
 
@@ -1517,5 +1530,39 @@ mod tests {
             "twins must reject --strict; health hint must not suggest it"
         );
         assert!(result.unwrap_err().contains("Unknown option '--strict'"));
+    }
+
+    #[test]
+    fn test_parse_body_command_options() {
+        let args = vec![
+            "my_sym".into(),
+            "--root".into(),
+            "/some/path".into(),
+            "--file".into(),
+            "src/lib.rs".into(),
+            "--max-lines".into(),
+            "50".into(),
+        ];
+        let result = parse_body_command(&args).unwrap();
+        if let Command::Body(opts) = result {
+            assert_eq!(opts.symbol, "my_sym");
+            assert_eq!(opts.root, Some(PathBuf::from("/some/path")));
+            assert_eq!(opts.file, Some("src/lib.rs".into()));
+            assert_eq!(opts.line_cap, Some(50));
+        } else {
+            panic!("Expected Body command");
+        }
+
+        let args_project = vec![
+            "my_sym".into(),
+            "--project".into(),
+            "/other/path".into(),
+        ];
+        let result_project = parse_body_command(&args_project).unwrap();
+        if let Command::Body(opts) = result_project {
+            assert_eq!(opts.root, Some(PathBuf::from("/other/path")));
+        } else {
+            panic!("Expected Body command");
+        }
     }
 }

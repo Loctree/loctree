@@ -1220,6 +1220,9 @@ pub struct BodyOptions {
     /// Optional file qualification (repo-relative path or path suffix) to
     /// disambiguate a symbol defined in more than one file.
     pub file: Option<String>,
+
+    /// Project root to scan (defaults to current directory).
+    pub root: Option<PathBuf>,
 }
 
 /// Options for `loct prune-old-artifacts` — local `.loctree/` housekeeping.

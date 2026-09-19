@@ -80,7 +80,11 @@ pub fn handle_find_where_symbol_command(
 pub fn handle_body_command(opts: &BodyOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::body::query_symbol_body;
 
-    let roots = vec![std::path::PathBuf::from(".")];
+    let roots = opts
+        .root
+        .as_ref()
+        .map(|r| vec![r.clone()])
+        .unwrap_or_else(|| vec![std::path::PathBuf::from(".")]);
     let query_global = query_global_options(global);
     let snapshot = match load_or_create_query_snapshot_for_roots(&roots, &query_global) {
         Ok(s) => s,
@@ -146,7 +150,7 @@ pub fn handle_body_command(opts: &BodyOptions, global: &GlobalOptions) -> Dispat
             );
         }
         println!(
-            "  hint: qualify with --file <path>, or use a qualified symbol, e.g. Type::method."
+            "  hint: qualify with --file <path>, or use a qualified symbol, e.g. path::sym or Type::method."
         );
         return DispatchResult::Exit(1);
     }
@@ -743,5 +747,72 @@ mod project_root_tests {
         // Handler entry (where-symbol) returns 0 when scoped correctly
         let result = handle_find_where_symbol_command(&find_opts, &global);
         assert!(matches!(result, DispatchResult::Exit(0)));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn w2_03_body_root_flag_scopes_lookup() {
+        let (_cache_dir, _cache_env) = test_env::isolated_cache();
+        let base = tempfile::tempdir().unwrap();
+        let sibling_a = base.path().join("sibling-a");
+        let sibling_b = base.path().join("sibling-b");
+        fs::create_dir_all(sibling_a.join("src")).unwrap();
+        fs::create_dir_all(sibling_b.join("src")).unwrap();
+
+        git_init_with_file(
+            &sibling_a,
+            "src/lib.rs",
+            "pub fn UNIQUE_BODY_SYM_AAA() {\n    let val = 100;\n}\n",
+        );
+        git_init_with_file(
+            &sibling_b,
+            "src/lib.rs",
+            "pub fn OTHER_BODY_SYM_BBB() {\n    let val = 200;\n}\n",
+        );
+
+        let global = GlobalOptions {
+            quiet: true,
+            json: true,
+            force_non_git: false,
+            ..Default::default()
+        };
+
+        // loct body UNIQUE_BODY_SYM_AAA --root sibling-a succeeds
+        let body_opts_a = BodyOptions {
+            symbol: "UNIQUE_BODY_SYM_AAA".into(),
+            line_cap: None,
+            file: None,
+            root: Some(sibling_a.clone()),
+        };
+        let res_a = handle_body_command(&body_opts_a, &global);
+        assert!(
+            matches!(res_a, DispatchResult::Exit(0)),
+            "body command with root sibling-a must succeed"
+        );
+
+        // loct body UNIQUE_BODY_SYM_AAA --root sibling-b fails (not in sibling-b)
+        let body_opts_b = BodyOptions {
+            symbol: "UNIQUE_BODY_SYM_AAA".into(),
+            line_cap: None,
+            file: None,
+            root: Some(sibling_b.clone()),
+        };
+        let res_b = handle_body_command(&body_opts_b, &global);
+        assert!(
+            matches!(res_b, DispatchResult::Exit(1)),
+            "body command with root sibling-b must fail for UNIQUE_BODY_SYM_AAA"
+        );
+
+        // Also verify snapshot source reading: reading through query_symbol_body works with root
+        let snap_a = load_or_create_query_snapshot_for_roots(
+            std::slice::from_ref(&sibling_a),
+            &query_global_options(&global),
+        )
+        .expect("scan sibling-a");
+        let body_result = crate::body::query_symbol_body(&snap_a, "UNIQUE_BODY_SYM_AAA", None);
+        assert_eq!(body_result.bodies.len(), 1);
+        assert!(body_result.bodies[0].source.contains("let val = 100;"));
+        assert_eq!(body_result.bodies[0].extent, crate::body::EXTENT_BRACE);
+        assert!(!body_result.bodies[0].truncated);
     }
 }
