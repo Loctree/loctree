@@ -264,6 +264,14 @@ fn w4_03_mcp_single_instance_lock() {
         let _ = child3.kill();
     }
     let _ = child3.wait();
+    // Cross-process cleanup after SIGTERM is not atomic with wait() reaping:
+    // the child's handler runs its own teardown, and on Linux CI the pidfile
+    // removal lands after wait() returns. Poll with a deadline instead of
+    // racing (yield_now, not sleep — see the no-sleep-in-tests contract).
+    let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pid_file.exists() && std::time::Instant::now() < cleanup_deadline {
+        std::thread::yield_now();
+    }
     assert!(
         !pid_file.exists(),
         "pidfile must be cleaned up after instance 3 exit"
