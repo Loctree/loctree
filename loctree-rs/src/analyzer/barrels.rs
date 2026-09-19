@@ -601,34 +601,144 @@ mod tests {
         assert!(analysis.inconsistent_paths.is_empty());
     }
 
-    #[test]
-    fn w3_02_barrel_advice_respects_directory_language() {
-        use crate::snapshot::{GraphEdge, SnapshotMetadata};
-        use crate::types::FileAnalysis;
-
-        fn file(path: &str) -> FileAnalysis {
-            FileAnalysis {
-                path: path.to_string(),
-                ..Default::default()
-            }
+    fn file(path: &str) -> crate::types::FileAnalysis {
+        crate::types::FileAnalysis {
+            path: path.to_string(),
+            ..Default::default()
         }
+    }
 
-        fn edge(from: &str, to: &str) -> GraphEdge {
-            GraphEdge {
-                from: from.to_string(),
-                to: to.to_string(),
-                label: "import".to_string(),
-            }
+    fn edge(from: &str, to: &str) -> crate::snapshot::GraphEdge {
+        crate::snapshot::GraphEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            label: "import".to_string(),
         }
+    }
 
-        // Mixed repo: Rust crate + Python package + one stray .ts + a real TS dir.
-        // Repo-wide is_pure_rust_project is false because of the .ts files, so
-        // the old guard would advise "create index.ts" for rust/src and pkg.
-        let snapshot = Snapshot {
-            metadata: SnapshotMetadata {
+    fn snapshot_with(
+        files: Vec<crate::types::FileAnalysis>,
+        edges: Vec<crate::snapshot::GraphEdge>,
+    ) -> Snapshot {
+        Snapshot {
+            metadata: crate::snapshot::SnapshotMetadata {
                 ..Default::default()
             },
-            files: vec![
+            files,
+            edges,
+            export_index: std::collections::HashMap::new(),
+            command_bridges: Vec::new(),
+            event_bridges: Vec::new(),
+            barrels: Vec::new(),
+            semantic_facts: None,
+            symbol_graph: None,
+        }
+    }
+
+    /// Acceptance: Rust crate + one stray .ts elsewhere → zero barrel advice for Rust dirs.
+    ///
+    /// rust/src has 3 files and 3 external imports, so the old repo-wide guard
+    /// (is_pure_rust_project defeated by tools/stray.ts) would have emitted
+    /// "create index.ts" for the Rust crate.
+    fn rust_crate_plus_stray_ts() -> Snapshot {
+        snapshot_with(
+            vec![
+                file("rust/src/lib.rs"),
+                file("rust/src/a.rs"),
+                file("rust/src/b.rs"),
+                file("rust/bin/main.rs"),
+                file("tools/stray.ts"),
+            ],
+            vec![
+                edge("rust/bin/main.rs", "rust/src/lib.rs"),
+                edge("rust/bin/main.rs", "rust/src/a.rs"),
+                edge("rust/bin/main.rs", "rust/src/b.rs"),
+            ],
+        )
+    }
+
+    /// Acceptance: TS directory without index.ts → "create index.ts" still fires.
+    fn ts_dir_without_index() -> Snapshot {
+        snapshot_with(
+            vec![
+                file("frontend/utils.ts"),
+                file("frontend/types.ts"),
+                file("frontend/helpers.ts"),
+                file("app.ts"),
+            ],
+            vec![
+                edge("app.ts", "frontend/utils.ts"),
+                edge("app.ts", "frontend/types.ts"),
+                edge("app.ts", "frontend/helpers.ts"),
+            ],
+        )
+    }
+
+    #[test]
+    fn w3_02_rust_crate_with_stray_ts_gets_zero_rust_barrel_advice() {
+        let snapshot = rust_crate_plus_stray_ts();
+        assert!(
+            !is_pure_rust_project(&snapshot),
+            "stray .ts must defeat the repo-wide rust skip"
+        );
+
+        let analysis = analyze_barrel_chaos(&snapshot);
+        assert!(
+            analysis.missing_barrels.is_empty(),
+            "Rust crate + stray .ts must yield zero missing-barrel advice, got {:?}",
+            analysis.missing_barrels
+        );
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .all(|b| !b.directory.starts_with("rust")),
+            "Rust dirs must not get barrel advice: {:?}",
+            analysis.missing_barrels
+        );
+
+        let formatted = format_barrel_analysis(&analysis);
+        assert!(
+            !formatted.contains("rust/src"),
+            "formatted advice leaked a Rust dir:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("create index.ts"),
+            "stray .ts must not turn on create index.ts for a Rust crate:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn w3_02_ts_directory_without_index_still_advises_create_index_ts() {
+        let snapshot = ts_dir_without_index();
+        let analysis = analyze_barrel_chaos(&snapshot);
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .any(|b| b.directory == "frontend"),
+            "TS dir without index.ts must still be advised: {:?}",
+            analysis.missing_barrels
+        );
+
+        let formatted = format_barrel_analysis(&analysis);
+        assert!(
+            formatted.contains("create index.ts"),
+            "TS missing-barrel advice must still say create index.ts:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("frontend/"),
+            "formatted advice must name the TS dir:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn w3_02_barrel_advice_respects_directory_language() {
+        // Mixed repo: both acceptance fixtures in one snapshot (the original hak).
+        // Repo-wide is_pure_rust_project is false because of the .ts files, so
+        // the old guard would advise "create index.ts" for rust/src and pkg.
+        let snapshot = snapshot_with(
+            vec![
                 file("rust/src/lib.rs"),
                 file("rust/src/a.rs"),
                 file("rust/src/b.rs"),
@@ -643,7 +753,7 @@ mod tests {
                 file("frontend/helpers.ts"),
                 file("app.ts"),
             ],
-            edges: vec![
+            vec![
                 edge("rust/bin/main.rs", "rust/src/lib.rs"),
                 edge("rust/bin/main.rs", "rust/src/a.rs"),
                 edge("rust/bin/main.rs", "rust/src/b.rs"),
@@ -654,13 +764,7 @@ mod tests {
                 edge("app.ts", "frontend/types.ts"),
                 edge("app.ts", "frontend/helpers.ts"),
             ],
-            export_index: std::collections::HashMap::new(),
-            command_bridges: Vec::new(),
-            event_bridges: Vec::new(),
-            barrels: Vec::new(),
-            semantic_facts: None,
-            symbol_graph: None,
-        };
+        );
 
         assert!(
             !is_pure_rust_project(&snapshot),
@@ -691,6 +795,16 @@ mod tests {
                 .iter()
                 .any(|b| b.directory == "frontend"),
             "TS dir without index.ts must still be advised: {:?}",
+            analysis.missing_barrels
+        );
+        assert_eq!(
+            analysis
+                .missing_barrels
+                .iter()
+                .map(|b| b.directory.as_str())
+                .collect::<Vec<_>>(),
+            vec!["frontend"],
+            "only the TS dir should be missing a barrel: {:?}",
             analysis.missing_barrels
         );
 
