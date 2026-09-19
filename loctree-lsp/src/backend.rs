@@ -7,6 +7,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use loctree::snapshot::Snapshot;
@@ -41,8 +42,8 @@ use crate::slice::{self, SliceParams, SliceResponse};
 use crate::snapshot::SnapshotState;
 use crate::symbol_context::{self, SymbolContextParams, SymbolContextResponse};
 use crate::watcher::{
-    LoctreeScanProgress, ScanPhase, ScanProgress, ScanStats, WatcherConfig, config_from_options,
-    should_trigger_rescan,
+    LoctreeScanProgress, RescanBackoff, RescanFailureReason, ScanPhase, ScanProgress, ScanStats,
+    WatcherConfig, config_from_options, should_trigger_rescan,
 };
 use crate::workspaces::{
     self, WorkspaceInfo, WorkspaceMode, WorkspaceRegistry, WorkspacesParams, WorkspacesResponse,
@@ -1116,6 +1117,7 @@ impl Backend {
             // task. When the task ends (shutdown), the watcher drops and
             // the OS subscription is released.
             let mut watcher = watcher;
+            let mut rescan_backoff = RescanBackoff::default();
 
             loop {
                 tokio::select! {
@@ -1184,6 +1186,18 @@ impl Backend {
                             continue;
                         }
 
+                        let now = Instant::now();
+                        if let Some(progress) = rescan_backoff.deferred_progress(now) {
+                            tracing::warn!(
+                                reason = progress.reason.as_deref().unwrap_or("other"),
+                                "loctree-lsp: workspace rescan deferred (backoff)"
+                            );
+                            client
+                                .send_notification::<LoctreeScanProgress>(progress)
+                                .await;
+                            continue;
+                        }
+
                         client
                             .send_notification::<LoctreeScanProgress>(ScanProgress::phase_only(
                                 ScanPhase::Scanning,
@@ -1196,6 +1210,7 @@ impl Backend {
                         };
                         let mut successes = 0usize;
                         let mut last_error = None;
+                        let mut last_reason = RescanFailureReason::Other;
                         let mut scope_changed = false;
 
                         for scan_root in affected {
@@ -1222,6 +1237,10 @@ impl Backend {
                                         scan_root.display()
                                     );
                                     last_error = Some(err.to_string());
+                                    last_reason = prefer_enospc(
+                                        last_reason,
+                                        RescanFailureReason::from_error(err.as_ref()),
+                                    );
                                     continue;
                                 }
                             }
@@ -1233,6 +1252,10 @@ impl Backend {
                                     scan_root.display()
                                 );
                                 last_error = Some(err.to_string());
+                                last_reason = prefer_enospc(
+                                    last_reason,
+                                    RescanFailureReason::from_error(&err),
+                                );
                                 continue;
                             }
                             successes = successes.saturating_add(1);
@@ -1266,15 +1289,26 @@ impl Backend {
                         }
 
                         if successes == 0 {
+                            let delay =
+                                rescan_backoff.record_failure(Instant::now(), last_reason);
+                            tracing::warn!(
+                                reason = last_reason.as_str(),
+                                attempts = rescan_backoff.consecutive_failures(),
+                                backoff_ms = delay.as_millis() as u64,
+                                "loctree-lsp: workspace rescan failed; backing off"
+                            );
                             client
-                                .send_notification::<LoctreeScanProgress>(ScanProgress::failed(
-                                    last_error.unwrap_or_else(|| {
-                                        "no resident workspace remained for this event".into()
-                                    }),
-                                ))
+                                .send_notification::<LoctreeScanProgress>(
+                                    rescan_backoff.failure_progress(
+                                        last_error.unwrap_or_else(|| {
+                                            "no resident workspace remained for this event".into()
+                                        }),
+                                    ),
+                                )
                                 .await;
                             continue;
                         }
+                        rescan_backoff.reset();
                         client
                             .send_notification::<LoctreeScanProgress>(ScanProgress::with_counts(
                                 ScanPhase::Composing,
@@ -2403,6 +2437,14 @@ async fn workspace_info(state: &SnapshotState, root: &Path, is_root: bool) -> Wo
         files,
         languages,
         snapshot_age_seconds,
+    }
+}
+
+fn prefer_enospc(current: RescanFailureReason, next: RescanFailureReason) -> RescanFailureReason {
+    if current == RescanFailureReason::Enospc || next == RescanFailureReason::Enospc {
+        RescanFailureReason::Enospc
+    } else {
+        next
     }
 }
 
