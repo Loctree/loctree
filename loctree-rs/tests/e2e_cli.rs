@@ -5290,6 +5290,11 @@ export const app = bootOnly + lazyThing;
         );
 
         std::fs::write(temp.path().join("src/new.ts"), "export const stray = 1;").unwrap();
+        // W2-01: untracked sources no longer break the indexed reuse fence
+        // (`--include-untracked` is the overlay). Dist `--src` still uses
+        // Strict acquire, which reuses when the fence matches. Stage the new
+        // file so it is a tracked dirty `.ts` and Strict must rescan.
+        run_git(temp.path(), &["add", "src/new.ts"]);
 
         let second = loctree()
             .current_dir(temp.path())
