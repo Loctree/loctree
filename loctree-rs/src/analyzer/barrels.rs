@@ -123,6 +123,12 @@ fn detect_missing_barrels(snapshot: &Snapshot) -> Vec<MissingBarrel> {
     let mut missing = Vec::new();
 
     for (dir, files) in &dir_files {
+        // index.ts / index.js is a JS/TS culture. A stray .ts elsewhere must
+        // not produce barrel advice for Rust/Python/Swift/shell directories.
+        if !directory_uses_js_ts_barrel_culture(files) {
+            continue;
+        }
+
         // Skip if directory has index file
         if has_index_file(files) {
             continue;
@@ -339,6 +345,34 @@ fn is_barrel_file(path: &str) -> bool {
     } else {
         false
     }
+}
+
+fn is_js_ts_barrel_language(lang: &str) -> bool {
+    matches!(lang, "ts" | "js")
+}
+
+/// Dominant language of a directory (strict unique max). Ties → none.
+fn directory_dominant_language(files: &[String]) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for file in files {
+        let lang = super::classify::language_from_path(file);
+        if lang.is_empty() {
+            continue;
+        }
+        *counts.entry(lang).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    match ranked.as_slice() {
+        [(lang, count), rest @ ..] if rest.iter().all(|(_, other)| other < count) => {
+            Some(lang.clone())
+        }
+        _ => None,
+    }
+}
+
+fn directory_uses_js_ts_barrel_culture(files: &[String]) -> bool {
+    directory_dominant_language(files).is_some_and(|lang| is_js_ts_barrel_language(&lang))
 }
 
 /// Format barrel analysis for display
@@ -565,5 +599,113 @@ mod tests {
         assert!(analysis.missing_barrels.is_empty());
         assert!(analysis.deep_chains.is_empty());
         assert!(analysis.inconsistent_paths.is_empty());
+    }
+
+    #[test]
+    fn w3_02_barrel_advice_respects_directory_language() {
+        use crate::snapshot::{GraphEdge, SnapshotMetadata};
+        use crate::types::FileAnalysis;
+
+        fn file(path: &str) -> FileAnalysis {
+            FileAnalysis {
+                path: path.to_string(),
+                ..Default::default()
+            }
+        }
+
+        fn edge(from: &str, to: &str) -> GraphEdge {
+            GraphEdge {
+                from: from.to_string(),
+                to: to.to_string(),
+                label: "import".to_string(),
+            }
+        }
+
+        // Mixed repo: Rust crate + Python package + one stray .ts + a real TS dir.
+        // Repo-wide is_pure_rust_project is false because of the .ts files, so
+        // the old guard would advise "create index.ts" for rust/src and pkg.
+        let snapshot = Snapshot {
+            metadata: SnapshotMetadata {
+                ..Default::default()
+            },
+            files: vec![
+                file("rust/src/lib.rs"),
+                file("rust/src/a.rs"),
+                file("rust/src/b.rs"),
+                file("rust/bin/main.rs"),
+                file("pkg/mod_a.py"),
+                file("pkg/mod_b.py"),
+                file("pkg/mod_c.py"),
+                file("app.py"),
+                file("tools/stray.ts"),
+                file("frontend/utils.ts"),
+                file("frontend/types.ts"),
+                file("frontend/helpers.ts"),
+                file("app.ts"),
+            ],
+            edges: vec![
+                edge("rust/bin/main.rs", "rust/src/lib.rs"),
+                edge("rust/bin/main.rs", "rust/src/a.rs"),
+                edge("rust/bin/main.rs", "rust/src/b.rs"),
+                edge("app.py", "pkg/mod_a.py"),
+                edge("app.py", "pkg/mod_b.py"),
+                edge("app.py", "pkg/mod_c.py"),
+                edge("app.ts", "frontend/utils.ts"),
+                edge("app.ts", "frontend/types.ts"),
+                edge("app.ts", "frontend/helpers.ts"),
+            ],
+            export_index: std::collections::HashMap::new(),
+            command_bridges: Vec::new(),
+            event_bridges: Vec::new(),
+            barrels: Vec::new(),
+            semantic_facts: None,
+            symbol_graph: None,
+        };
+
+        assert!(
+            !is_pure_rust_project(&snapshot),
+            "mixed fixture must defeat the repo-wide rust skip"
+        );
+
+        let analysis = analyze_barrel_chaos(&snapshot);
+
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .all(|b| !b.directory.starts_with("rust")),
+            "Rust dirs must not get barrel advice: {:?}",
+            analysis.missing_barrels
+        );
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .all(|b| b.directory != "pkg"),
+            "Python dirs stay silent (W3-06 owns __init__): {:?}",
+            analysis.missing_barrels
+        );
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .any(|b| b.directory == "frontend"),
+            "TS dir without index.ts must still be advised: {:?}",
+            analysis.missing_barrels
+        );
+
+        let formatted = format_barrel_analysis(&analysis);
+        assert!(
+            !formatted.contains("rust/src"),
+            "formatted advice leaked a Rust dir:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("create index.ts"),
+            "TS missing-barrel advice must still say create index.ts:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("frontend/"),
+            "formatted advice must name the TS dir:\n{formatted}"
+        );
     }
 }
