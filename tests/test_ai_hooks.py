@@ -68,15 +68,18 @@ class LoctreeFirstGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_w2_05_guard_split_respects_quotes(self):
+        # [x] git commit -m "fix: grep && rg" is not blocked (quoted &&).
         quoted = self.run_guard('git commit -m "fix: grep && rg"')
         self.assertEqual(quoted.returncode, 0, quoted.stderr)
 
+        # [x] A heredoc whose body contains the word grep is not blocked.
         heredoc = self.run_guard("cat <<'EOF'\ngrep -n main src/main.rs\nEOF")
         self.assertEqual(heredoc.returncode, 0, heredoc.stderr)
 
         escaped = self.run_guard("cat <<\\EOF\ngrep -n main src/main.rs\nEOF")
         self.assertEqual(escaped.returncode, 0, escaped.stderr)
 
+        # [x] Real in-repo `grep -n` stays blocked; out-of-repo stays allowed.
         real = self.run_guard("grep -n main src/main.rs")
         self.assertEqual(real.returncode, 2, real.stderr)
         self.assertIn("LOCTREE FIRST", real.stderr)
