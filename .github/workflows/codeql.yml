@@ -13,7 +13,6 @@ permissions:
 
 jobs:
   analyze:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:
