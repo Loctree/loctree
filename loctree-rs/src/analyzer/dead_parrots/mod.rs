@@ -290,6 +290,10 @@ pub fn find_dead_exports(
                     .any(is_python_library)
         });
 
+    // Snapshot-wide Swift protocol-witness credit (W3-05): protocol `P` in
+    // one file, `struct S: P` implementing P's requirements in another.
+    let swift_protocol_witnesses = crate::analyzer::swift::protocol_witness_credits(analyses);
+
     // Skip Go for now to avoid false positives until package-level usage is implemented
     let analyses: Vec<&FileAnalysis> = analyses
         .iter()
@@ -855,6 +859,10 @@ pub fn find_dead_exports(
             // referenced Swift declaration out of the candidate set instead of
             // letting import-edge absence flag it.
             let is_swift_referenced = is_swift_file && referenced_idents.contains(&exp.name);
+            let is_swift_protocol_witness = is_swift_file
+                && swift_protocol_witnesses
+                    .get(&analysis.path)
+                    .is_some_and(|names| names.contains(&exp.name));
 
             if !is_used
                 && !star_used
@@ -875,6 +883,7 @@ pub fn find_dead_exports(
                 && !shell_called_by_name
                 && !shell_sourced_public_api
                 && !is_swift_referenced
+                && !is_swift_protocol_witness
             {
                 let open_url = super::build_open_url(&analysis.path, exp.line, open_base);
 
