@@ -348,7 +348,8 @@ fn is_barrel_file(path: &str) -> bool {
 }
 
 fn is_js_ts_barrel_language(lang: &str) -> bool {
-    matches!(lang, "ts" | "js")
+    // classify maps tsx→ts and jsx/mjs/cjs→js; mts/cts stay as the raw ext.
+    matches!(lang, "ts" | "js" | "mts" | "cts")
 }
 
 /// Dominant language of a directory (strict unique max). Ties → none.
@@ -675,7 +676,44 @@ mod tests {
     }
 
     #[test]
+    fn w3_02_directory_language_gate_is_per_directory() {
+        assert_eq!(
+            directory_dominant_language(&[
+                "rust/src/lib.rs".into(),
+                "rust/src/a.rs".into(),
+                "rust/src/b.rs".into(),
+            ]),
+            Some("rs".to_string())
+        );
+        assert_eq!(
+            directory_dominant_language(&[
+                "frontend/utils.ts".into(),
+                "frontend/types.tsx".into(),
+            ]),
+            Some("ts".to_string())
+        );
+        assert_eq!(
+            directory_dominant_language(&["a.rs".into(), "b.ts".into()]),
+            None,
+            "ties stay silent"
+        );
+        assert!(!directory_uses_js_ts_barrel_culture(&[
+            "rust/src/lib.rs".into(),
+            "rust/src/a.rs".into(),
+        ]));
+        assert!(directory_uses_js_ts_barrel_culture(&[
+            "frontend/utils.ts".into(),
+            "frontend/types.tsx".into(),
+        ]));
+        assert!(
+            directory_uses_js_ts_barrel_culture(&["esm/a.mts".into(), "esm/b.mts".into()]),
+            "mts is TypeScript barrel culture (classify leaves the raw ext)"
+        );
+    }
+
+    #[test]
     fn w3_02_rust_crate_with_stray_ts_gets_zero_rust_barrel_advice() {
+        // Acceptance: Rust crate + one stray .ts elsewhere → zero barrel advice for Rust dirs.
         let snapshot = rust_crate_plus_stray_ts();
         assert!(
             !is_pure_rust_project(&snapshot),
@@ -710,6 +748,7 @@ mod tests {
 
     #[test]
     fn w3_02_ts_directory_without_index_still_advises_create_index_ts() {
+        // Acceptance: TS directory without index.ts → "create index.ts" still fires.
         let snapshot = ts_dir_without_index();
         let analysis = analyze_barrel_chaos(&snapshot);
         assert!(
