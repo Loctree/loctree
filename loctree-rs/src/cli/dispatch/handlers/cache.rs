@@ -419,55 +419,15 @@ fn handle_clean(
     let base = cache_base_dir();
     let projects_dir = base.join("projects");
 
-    if !projects_dir.exists() {
-        println!("Nothing to clean.");
-        return DispatchResult::Exit(0);
+    // `--project` is an address. Resolve it before the empty-cache shortcut so
+    // an unknown/empty selector cannot report "Nothing to clean" (exit 0) or
+    // fall through to cwd.
+    if let Some(proj) = project {
+        return handle_clean_project(proj, &projects_dir, force);
     }
 
-    // If --project specified, only clean that project's cache
-    if let Some(proj) = project {
-        let proj_path = if proj.is_relative() {
-            std::env::current_dir().unwrap_or_default().join(proj)
-        } else {
-            proj.to_path_buf()
-        };
-        let cache_dir = project_cache_dir(&proj_path);
-        if !cache_dir.exists() {
-            println!("No cache found for project: {}", proj_path.display());
-            return DispatchResult::Exit(0);
-        }
-        // Hold the same exclusive lock Snapshot::save/load use so a concurrent
-        // writer cannot mutate the bucket between measurement and deletion.
-        let _cache_lock = match try_acquire_snapshot_cache_lock(&proj_path) {
-            Ok(lock) => lock,
-            Err(err) => {
-                eprintln!(
-                    "Cannot safely clean cache for {}: {}. No cache entries were removed.",
-                    proj_path.display(),
-                    err
-                );
-                return DispatchResult::Exit(2);
-            }
-        };
-        let size = dir_size(&cache_dir);
-        if !force {
-            eprintln!(
-                "Will remove cache for {} ({}).",
-                proj_path.display(),
-                format_size_sample(size)
-            );
-            eprintln!("Use --force to skip this confirmation.");
-            return DispatchResult::Exit(1);
-        }
-        if let Err(err) = fs::remove_dir_all(&cache_dir) {
-            eprintln!("Failed to remove {}: {}", cache_dir.display(), err);
-            return DispatchResult::Exit(1);
-        }
-        println!(
-            "Removed cache for {} ({})",
-            proj_path.display(),
-            format_size_sample(size)
-        );
+    if !projects_dir.exists() {
+        println!("Nothing to clean.");
         return DispatchResult::Exit(0);
     }
 
@@ -596,6 +556,97 @@ fn handle_clean(
         eprintln!("Failed to remove {} project(s).", summary.failed);
         DispatchResult::Exit(1)
     }
+}
+
+fn is_blank_project_selector(proj: &Path) -> bool {
+    proj.as_os_str().is_empty() || proj.to_string_lossy().trim().is_empty()
+}
+
+fn known_cache_bucket_ids(projects_dir: &Path) -> Vec<String> {
+    let entries = match fs::read_dir(projects_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut ids = Vec::new();
+    visit_cache_bucket_entries(entries, None, |entry| {
+        ids.push(entry.file_name().to_string_lossy().into_owned());
+    });
+    ids.sort();
+    ids
+}
+
+fn format_unknown_project_refusal(requested: &Path, known_buckets: &[String]) -> String {
+    let mut msg = format!(
+        "Refusing cache clean: no cache bucket for project '{}'.\nNo cache entries were removed.",
+        requested.display()
+    );
+    if known_buckets.is_empty() {
+        msg.push_str("\nKnown cache buckets: (none)");
+    } else {
+        msg.push_str("\nKnown cache buckets:");
+        for id in known_buckets {
+            msg.push_str("\n  ");
+            msg.push_str(id);
+        }
+    }
+    msg
+}
+
+fn handle_clean_project(proj: &Path, projects_dir: &Path, force: bool) -> DispatchResult {
+    if is_blank_project_selector(proj) {
+        eprintln!(
+            "Refusing empty --project. Pass an explicit project directory; an empty string is not cwd."
+        );
+        eprintln!("No cache entries were removed.");
+        return DispatchResult::Exit(2);
+    }
+
+    let proj_path = if proj.is_relative() {
+        std::env::current_dir().unwrap_or_default().join(proj)
+    } else {
+        proj.to_path_buf()
+    };
+    let cache_dir = project_cache_dir(&proj_path);
+    if !cache_dir.exists() {
+        eprintln!(
+            "{}",
+            format_unknown_project_refusal(&proj_path, &known_cache_bucket_ids(projects_dir))
+        );
+        return DispatchResult::Exit(2);
+    }
+    // Hold the same exclusive lock Snapshot::save/load use so a concurrent
+    // writer cannot mutate the bucket between measurement and deletion.
+    let _cache_lock = match try_acquire_snapshot_cache_lock(&proj_path) {
+        Ok(lock) => lock,
+        Err(err) => {
+            eprintln!(
+                "Cannot safely clean cache for {}: {}. No cache entries were removed.",
+                proj_path.display(),
+                err
+            );
+            return DispatchResult::Exit(2);
+        }
+    };
+    let size = dir_size(&cache_dir);
+    if !force {
+        eprintln!(
+            "Will remove cache for {} ({}).",
+            proj_path.display(),
+            format_size_sample(size)
+        );
+        eprintln!("Use --force to skip this confirmation.");
+        return DispatchResult::Exit(1);
+    }
+    if let Err(err) = fs::remove_dir_all(&cache_dir) {
+        eprintln!("Failed to remove {}: {}", cache_dir.display(), err);
+        return DispatchResult::Exit(1);
+    }
+    println!(
+        "Removed cache for {} ({})",
+        proj_path.display(),
+        format_size_sample(size)
+    );
+    DispatchResult::Exit(0)
 }
 
 /// Acquire non-blocking exclusive locks for every global cache bucket, in
@@ -1699,5 +1750,106 @@ mod tests {
             "metadata errors must mark cache-list statistics incomplete"
         );
         assert_eq!(stats.size_bytes, 0);
+    }
+
+    fn assert_exit(result: DispatchResult, expected: i32) {
+        match result {
+            DispatchResult::Exit(code) => assert_eq!(code, expected, "expected exit {expected}"),
+            DispatchResult::ShowHelp
+            | DispatchResult::ShowLegacyHelp
+            | DispatchResult::ShowVersion
+            | DispatchResult::Continue(_) => {
+                panic!("expected exit {expected}, got non-exit dispatch result")
+            }
+        }
+    }
+
+    /// Handler belt-and-suspenders: an empty path must not resolve to cwd
+    /// even if a caller bypasses the parser.
+    #[test]
+    #[serial_test::serial]
+    fn w4_04_cache_clean_empty_path_handler_refuses_without_deleting() {
+        let (_cache_dir, _guard) = crate::snapshot::test_env::isolated_cache();
+        let known_project = TempDir::new().expect("known project");
+        let known_bucket = project_cache_dir(known_project.path());
+        fs::create_dir_all(&known_bucket).expect("create known bucket");
+        fs::write(known_bucket.join("payload"), b"keep-me").expect("write payload");
+
+        assert_exit(
+            handle_clean(false, Some(Path::new("")), None, None, true),
+            2,
+        );
+        assert!(
+            known_bucket.exists(),
+            "empty --project must not delete any bucket"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn w4_04_cache_clean_unknown_project_refused_with_known_buckets() {
+        let (_cache_dir, _guard) = crate::snapshot::test_env::isolated_cache();
+        let known_project = TempDir::new().expect("known project");
+        let known_bucket = project_cache_dir(known_project.path());
+        fs::create_dir_all(&known_bucket).expect("create known bucket");
+        fs::write(known_bucket.join("payload"), b"keep-me").expect("write payload");
+        let bucket_id = known_bucket
+            .file_name()
+            .expect("bucket id")
+            .to_string_lossy()
+            .into_owned();
+
+        let missing = TempDir::new().expect("unknown project");
+        let projects_dir = crate::snapshot::cache_base_dir().join("projects");
+        let known = known_cache_bucket_ids(&projects_dir);
+        assert!(
+            known.contains(&bucket_id),
+            "fixture bucket {bucket_id} must appear in known ids: {known:?}"
+        );
+        let msg = format_unknown_project_refusal(missing.path(), &known);
+        assert!(
+            msg.contains("Refusing cache clean"),
+            "unknown project must refuse, got: {msg}"
+        );
+        assert!(
+            msg.contains("Known cache buckets"),
+            "refusal must list known buckets, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bucket_id),
+            "refusal must name the live bucket {bucket_id}, got: {msg}"
+        );
+        assert!(
+            msg.contains("No cache entries were removed"),
+            "refusal must attest zero deletions, got: {msg}"
+        );
+
+        assert_exit(
+            handle_clean(false, Some(missing.path()), None, None, true),
+            2,
+        );
+        assert!(
+            known_bucket.exists(),
+            "unknown project --force must not delete known buckets"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn w4_04_cache_clean_project_without_force_is_preview_only() {
+        let (_cache_dir, _guard) = crate::snapshot::test_env::isolated_cache();
+        let project = TempDir::new().expect("project");
+        let bucket = project_cache_dir(project.path());
+        fs::create_dir_all(&bucket).expect("create bucket");
+        fs::write(bucket.join("payload"), b"preview-me").expect("write payload");
+
+        assert_exit(
+            handle_clean(false, Some(project.path()), None, None, false),
+            1,
+        );
+        assert!(
+            bucket.exists(),
+            "preview without --force must not delete the addressed bucket"
+        );
     }
 }
