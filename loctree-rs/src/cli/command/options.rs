@@ -694,7 +694,7 @@ pub struct DiffOptions {
     /// Show only new problems (added dead exports, new cycles, new missing handlers)
     pub problems_only: bool,
 
-    /// Automatically scan target branch using git worktree (zero-friction diff)
+    /// Automatically scan the --since ref by exporting its tree (no git worktree)
     pub auto_scan_base: bool,
 
     /// Disable the artifact fence (include exports from generated/vendored files)
