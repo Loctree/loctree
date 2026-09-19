@@ -27,7 +27,7 @@ pub(crate) use stdlib::python_stdlib_set;
 use concurrency::detect_py_race_indicators;
 use decorators::{extract_decorator_type_usages, is_framework_decorator, parse_route_decorator};
 use dynamic::{detect_dynamic_exec_templates, detect_sys_modules_injection};
-use exports::{parse_all_list, read_all_from_resolved};
+use exports::{extract_getattr_lazy_reexports, parse_all_list, read_all_from_resolved};
 use helpers::{is_valid_python_identifier, parse_module_const_target};
 use imports::resolve_python_import;
 use metadata::{check_namespace_package, check_typed_package, is_python_test_file};
@@ -502,6 +502,100 @@ fn collect_python_log_messages(content: &str) -> Vec<LogMessage> {
     messages
 }
 
+fn detect_pyproject_script_entrypoints(
+    path: &Path,
+    root: &Path,
+    relative: &str,
+    py_roots: &[PathBuf],
+    extensions: Option<&HashSet<String>>,
+    stdlib: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let pyproject = root.join("pyproject.toml");
+    if !pyproject.exists() {
+        return Vec::new();
+    }
+    let Ok(content) = std::fs::read_to_string(&pyproject) else {
+        return Vec::new();
+    };
+    let Ok(table) = content.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+
+    let mut script_specs = Vec::new();
+
+    if let Some(project) = table.get("project").and_then(|v| v.as_table()) {
+        if let Some(scripts) = project.get("scripts").and_then(|v| v.as_table()) {
+            for (k, v) in scripts {
+                if let Some(spec) = v.as_str() {
+                    script_specs.push((k.to_string(), spec.to_string()));
+                }
+            }
+        }
+        if let Some(entries) = project.get("entry-points").and_then(|v| v.as_table()) {
+            for (_group, group_val) in entries {
+                if let Some(group_tbl) = group_val.as_table() {
+                    for (k, v) in group_tbl {
+                        if let Some(spec) = v.as_str() {
+                            script_specs.push((k.to_string(), spec.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(tool) = table.get("tool").and_then(|v| v.as_table())
+        && let Some(poetry) = tool.get("poetry").and_then(|v| v.as_table())
+        && let Some(scripts) = poetry.get("scripts").and_then(|v| v.as_table())
+    {
+        for (k, v) in scripts {
+            if let Some(spec) = v.as_str() {
+                script_specs.push((k.to_string(), spec.to_string()));
+            }
+        }
+    }
+
+    let mut matched = Vec::new();
+    let norm_rel = relative.replace('\\', "/");
+
+    for (name, spec) in script_specs {
+        let (mod_part, sym_part) = spec.split_once(':').unwrap_or((&spec, "main"));
+        let sym_name = sym_part.split('.').next().unwrap_or(sym_part).trim();
+        let mod_part = mod_part.trim();
+
+        // 1. Try resolving using resolve_python_import
+        let (resolved, _) = resolve_python_import(
+            mod_part,
+            path,
+            root,
+            py_roots,
+            extensions,
+            stdlib,
+        );
+        let resolved_matches = resolved.as_ref().is_some_and(|r| {
+            let r_norm = r.replace('\\', "/");
+            r_norm == norm_rel
+                || r_norm.ends_with(&norm_rel)
+                || norm_rel.ends_with(&r_norm)
+        });
+
+        // 2. Direct string fallback
+        let mod_path = mod_part.replace('.', "/");
+        let direct_matches = norm_rel == format!("{}.py", mod_path)
+            || norm_rel == format!("{}/__init__.py", mod_path)
+            || norm_rel == format!("src/{}.py", mod_path)
+            || norm_rel == format!("src/{}/__init__.py", mod_path)
+            || path.ends_with(format!("{}.py", mod_path).as_str())
+            || path.ends_with(format!("{}/__init__.py", mod_path).as_str());
+
+        if resolved_matches || direct_matches {
+            matched.push((name, sym_name.to_string()));
+        }
+    }
+
+    matched
+}
+
 /// Main entry point for Python file analysis.
 ///
 /// Analyzes a Python file and extracts:
@@ -931,6 +1025,82 @@ pub(crate) fn analyze_py_file(
         }
     }
 
+    // Process module-level __getattr__ lazy re-exports
+    let lazy_reexports = extract_getattr_lazy_reexports(content);
+    for lazy in lazy_reexports {
+        let (resolved, resolution) = resolve_python_import(
+            &lazy.module,
+            path,
+            root,
+            py_roots,
+            extensions,
+            stdlib,
+        );
+
+        // 1. Re-export entry (credits original symbol in target module as used)
+        let existing_re = analysis.reexports.iter_mut().find(|r| r.source == lazy.module);
+        if let Some(r) = existing_re {
+            match &mut r.kind {
+                ReexportKind::Named(pairs) => {
+                    if !pairs.iter().any(|(orig, _)| orig == &lazy.symbol) {
+                        pairs.push((lazy.symbol.clone(), lazy.symbol.clone()));
+                    }
+                }
+                ReexportKind::Star => {}
+            }
+        } else {
+            analysis.reexports.push(ReexportEntry {
+                source: lazy.module.clone(),
+                kind: ReexportKind::Named(vec![(lazy.symbol.clone(), lazy.symbol.clone())]),
+                resolved: resolved.clone(),
+            });
+        }
+
+        // 2. Export symbol on this module (with kind="reexport" so dead_parrots skips it)
+        if let Some(exp) = analysis.exports.iter_mut().find(|e| e.name == lazy.symbol) {
+            if exp.kind == "__all__" {
+                exp.kind = "reexport".to_string();
+            }
+        } else {
+            analysis.exports.push(ExportSymbol::new(
+                lazy.symbol.clone(),
+                "reexport",
+                "named",
+                Some(lazy.line),
+            ));
+        }
+
+        // 3. Lazy import entry
+        let existing_imp = analysis.imports.iter_mut().find(|i| i.source == lazy.module);
+        if let Some(imp) = existing_imp {
+            imp.is_lazy = true;
+            if !imp.symbols.iter().any(|s| s.name == lazy.symbol) {
+                imp.symbols.push(ImportSymbol {
+                    name: lazy.symbol.clone(),
+                    alias: None,
+                    is_default: false,
+                });
+            }
+        } else {
+            let mut imp = ImportEntry::new(lazy.module.clone(), ImportKind::Static);
+            imp.line = Some(lazy.line);
+            imp.resolution = resolution;
+            imp.resolved_path = resolved.clone();
+            imp.is_lazy = true;
+            imp.symbols.push(ImportSymbol {
+                name: lazy.symbol.clone(),
+                alias: None,
+                is_default: false,
+            });
+            analysis.imports.push(imp);
+        }
+
+        // 4. Record local use
+        if !analysis.local_uses.contains(&lazy.symbol) {
+            analysis.local_uses.push(lazy.symbol.clone());
+        }
+    }
+
     if !local_symbols.is_empty() {
         let export_names: HashSet<String> =
             analysis.exports.iter().map(|e| e.name.clone()).collect();
@@ -1013,6 +1183,30 @@ pub(crate) fn analyze_py_file(
             if !analysis.entry_points.contains(&kind_string) {
                 analysis.entry_points.push(kind_string);
             }
+        }
+    }
+    // 5. pyproject.toml [project.scripts] and [project.entry-points]
+    for (script_name, sym_name) in detect_pyproject_script_entrypoints(
+        path,
+        root,
+        &analysis.path,
+        py_roots,
+        extensions,
+        stdlib,
+    ) {
+        if !analysis.entry_points.contains(&"script".to_string()) {
+            analysis.entry_points.push("script".to_string());
+        }
+        let script_ep = format!("script:{}", script_name);
+        if !analysis.entry_points.contains(&script_ep) {
+            analysis.entry_points.push(script_ep);
+        }
+        let sym_ep = format!("entrypoint:{}", sym_name);
+        if !analysis.entry_points.contains(&sym_ep) {
+            analysis.entry_points.push(sym_ep);
+        }
+        if !analysis.local_uses.contains(&sym_name) {
+            analysis.local_uses.push(sym_name);
         }
     }
 
@@ -2751,6 +2945,161 @@ def health():
             analysis.entry_points.contains(&"wsgi_target".to_string()),
             "expected wsgi_target entrypoint, got: {:?}",
             analysis.entry_points
+        );
+    }
+
+    #[test]
+    fn w3_06_python_getattr_reexport_is_consumer_edge() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let pkg_dir = root.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+
+        std::fs::write(
+            pkg_dir.join("mod.py"),
+            r#"
+def lazy_func():
+    return 42
+
+def dead_func():
+    return -1
+"#,
+        )
+        .expect("write mod.py");
+
+        let init_content = r#"
+_LAZY_IMPORTS = {
+    "lazy_func": ".mod",
+}
+
+def __getattr__(name: str):
+    if name in _LAZY_IMPORTS:
+        import importlib
+        module = importlib.import_module(_LAZY_IMPORTS[name], __package__)
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+"#;
+        std::fs::write(pkg_dir.join("__init__.py"), init_content).expect("write __init__.py");
+
+        let init_analysis = analyze_py_file(
+            init_content,
+            &pkg_dir.join("__init__.py"),
+            root,
+            Some(&py_exts()),
+            "pkg/__init__.py".to_string(),
+            &[root.to_path_buf()],
+            &HashSet::new(),
+        );
+
+        let mod_content = std::fs::read_to_string(pkg_dir.join("mod.py")).expect("read mod.py");
+        let mod_analysis = analyze_py_file(
+            &mod_content,
+            &pkg_dir.join("mod.py"),
+            root,
+            Some(&py_exts()),
+            "pkg/mod.py".to_string(),
+            &[root.to_path_buf()],
+            &HashSet::new(),
+        );
+
+        // Verify consumer re-export edge is established
+        assert!(
+            init_analysis.reexports.iter().any(|r| {
+                matches!(&r.kind, ReexportKind::Named(pairs) if pairs.iter().any(|(orig, _)| orig == "lazy_func"))
+            }),
+            "expected lazy_func reexport edge in __init__.py, got: {:?}",
+            init_analysis.reexports
+        );
+
+        let analyses = vec![init_analysis, mod_analysis];
+        let dead = crate::analyzer::dead_parrots::find_dead_exports(
+            &analyses,
+            false,
+            None,
+            crate::analyzer::dead_parrots::DeadFilterConfig::default(),
+        );
+
+        assert!(
+            !dead.iter().any(|d| d.symbol == "lazy_func"),
+            "lazy_func should not be dead (re-exported via __getattr__), got dead: {:?}",
+            dead
+        );
+        assert!(
+            dead.iter().any(|d| d.symbol == "dead_func"),
+            "dead_func should be reported as dead, got: {:?}",
+            dead
+        );
+    }
+
+    #[test]
+    fn w3_06_fixture_pyproject_scripts_main_not_dead() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let pkg_dir = root.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
+
+        std::fs::write(
+            root.join("pyproject.toml"),
+            r#"
+[project]
+name = "test-pkg"
+version = "0.1.0"
+
+[project.scripts]
+foo = "pkg.mod:main"
+"#,
+        )
+        .expect("write pyproject.toml");
+
+        std::fs::write(pkg_dir.join("__init__.py"), "").expect("write __init__.py");
+        let mod_content = r#"
+def main():
+    return 0
+
+def genuinely_dead():
+    return 1
+"#;
+        std::fs::write(pkg_dir.join("mod.py"), mod_content).expect("write mod.py");
+
+        let mod_analysis = analyze_py_file(
+            mod_content,
+            &pkg_dir.join("mod.py"),
+            root,
+            Some(&py_exts()),
+            "pkg/mod.py".to_string(),
+            &[root.to_path_buf()],
+            &HashSet::new(),
+        );
+
+        assert!(
+            mod_analysis.entry_points.contains(&"script".to_string())
+                || mod_analysis.entry_points.iter().any(|ep| ep.starts_with("script")),
+            "expected script entry point in mod.py, got: {:?}",
+            mod_analysis.entry_points
+        );
+        assert!(
+            mod_analysis.local_uses.contains(&"main".to_string()),
+            "expected main to be in local_uses as runtime root, got: {:?}",
+            mod_analysis.local_uses
+        );
+
+        let analyses = vec![mod_analysis];
+        let dead = crate::analyzer::dead_parrots::find_dead_exports(
+            &analyses,
+            false,
+            None,
+            crate::analyzer::dead_parrots::DeadFilterConfig::default(),
+        );
+
+        assert!(
+            !dead.iter().any(|d| d.symbol == "main"),
+            "main from pyproject [project.scripts] should not be dead, got dead: {:?}",
+            dead
+        );
+        assert!(
+            dead.iter().any(|d| d.symbol == "genuinely_dead"),
+            "genuinely_dead should be dead, got: {:?}",
+            dead
         );
     }
 }
