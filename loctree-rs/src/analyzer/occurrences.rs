@@ -753,10 +753,11 @@ pub struct LiteralScopeStats {
 
 /// Resolution receipt for an explicitly requested file scope.
 ///
-/// A selector is authoritative only when it resolves to exactly one indexed
-/// snapshot path. `indexed` remains separate from `resolved` so an ambiguous
-/// basename reports that indexed candidates exist without silently searching
-/// all of them or laundering the ambiguity into a polished zero.
+/// A selector is authoritative when it resolves to exactly one indexed snapshot
+/// path, **or** to one or more snapshot paths under a directory / path prefix.
+/// `indexed` remains separate from `resolved` so an ambiguous basename reports
+/// that indexed candidates exist without silently searching all of them or
+/// laundering the ambiguity into a polished zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileScopeResolution {
     pub requested: String,
@@ -769,9 +770,11 @@ pub struct FileScopeResolution {
 
 impl FileScopeResolution {
     /// Resolve a CLI/MCP selector against the canonical paths stored in the
-    /// snapshot. Full relative paths and unique suffixes win first; a unique
-    /// extensionless basename (for example `adapter_brute_force`) is accepted
-    /// as the final compatibility form.
+    /// snapshot. Directories and path prefixes expand to every indexed file
+    /// under them. Full relative paths and unique suffixes win for a single
+    /// file; a unique extensionless basename (for example
+    /// `adapter_brute_force`) is accepted as the final compatibility form.
+    /// Unresolved and ambiguous basename selectors stay fail-loud.
     pub fn resolve<'a, I>(requested: &str, snapshot_paths: I) -> Self
     where
         I: IntoIterator<Item = &'a str>,
@@ -782,37 +785,56 @@ impl FileScopeResolution {
             .map(normalize_scope_path)
             .collect::<Vec<_>>();
 
-        let mut matched_paths = paths
+        let mut prefix_paths = paths
             .iter()
-            .filter(|path| {
-                **path == normalized
-                    || path.ends_with(&format!("/{normalized}"))
-                    || normalized.ends_with(&format!("/{path}"))
-            })
+            .filter(|path| scope_selects_as_prefix(&normalized, path))
             .cloned()
             .collect::<Vec<_>>();
+        prefix_paths.sort();
+        prefix_paths.dedup();
 
-        if matched_paths.is_empty()
-            && !normalized.is_empty()
-            && !normalized.contains('/')
-            && !normalized.contains('.')
-        {
-            matched_paths = paths
+        let mut matched_paths = if !prefix_paths.is_empty() {
+            prefix_paths
+        } else {
+            let mut exact_or_suffix = paths
                 .iter()
                 .filter(|path| {
-                    path.rsplit('/').next().is_some_and(|filename| {
-                        filename.rsplit_once('.').map_or(filename, |(stem, _)| stem) == normalized
-                    })
+                    **path == normalized
+                        || path.ends_with(&format!("/{normalized}"))
+                        || normalized.ends_with(&format!("/{path}"))
                 })
                 .cloned()
-                .collect();
-        }
+                .collect::<Vec<_>>();
+
+            if exact_or_suffix.is_empty()
+                && !normalized.is_empty()
+                && !normalized.contains('/')
+                && !normalized.contains('.')
+            {
+                exact_or_suffix = paths
+                    .iter()
+                    .filter(|path| {
+                        path.rsplit('/').next().is_some_and(|filename| {
+                            filename.rsplit_once('.').map_or(filename, |(stem, _)| stem)
+                                == normalized
+                        })
+                    })
+                    .cloned()
+                    .collect();
+            }
+            exact_or_suffix
+        };
 
         matched_paths.sort();
         matched_paths.dedup();
+        let prefix_family = !matched_paths.is_empty()
+            && matched_paths
+                .iter()
+                .all(|path| scope_selects_as_prefix(&normalized, path));
         let (resolved, status) = match matched_paths.len() {
             0 => (false, "unresolved"),
             1 => (true, "resolved"),
+            _ if prefix_family => (true, "resolved"),
             _ => (false, "ambiguous"),
         };
 
@@ -826,13 +848,18 @@ impl FileScopeResolution {
         }
     }
 
-    /// Convert a resolution receipt into the scanner's exact path scope.
-    /// Unresolved or ambiguous selectors intentionally match no path.
+    /// Convert a resolution receipt into the scanner's path scope.
+    ///
+    /// A resolved directory/prefix uses the selector itself so
+    /// [`path_matches_scope`] keeps every expanded snapshot file. Unresolved
+    /// or ambiguous selectors intentionally match no path.
     pub fn scan_scope(&self) -> FileScope<'_> {
-        let file = if self.resolved {
-            self.matched_paths.first().map(String::as_str)
-        } else {
+        let file = if !self.resolved {
             Some("")
+        } else if self.matched_paths.len() > 1 {
+            Some(self.normalized.as_str())
+        } else {
+            self.matched_paths.first().map(String::as_str)
         };
         FileScope { file }
     }
@@ -1217,9 +1244,10 @@ pub struct ReportOptions {
 /// set into the exact occurrence scanner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileScope<'a> {
-    /// Relative path/prefix to keep, e.g. `src/app.css`. Leading `./` and
-    /// platform separators are normalized. A file matches when it is exactly
-    /// this path or ends with `/<scope>`.
+    /// Relative path/prefix to keep, e.g. `src/app.css` or `src/cli`. Leading
+    /// `./` and platform separators are normalized. A file matches when it is
+    /// exactly this path, ends with `/<scope>`, or lives under that directory
+    /// / path prefix.
     pub file: Option<&'a str>,
 }
 
@@ -3097,13 +3125,33 @@ fn rust_source_target_path(
 }
 
 fn normalize_scope_path(path: &str) -> String {
-    path.trim().trim_start_matches("./").replace('\\', "/")
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// True when `path` is the selector itself, a file whose path continues the
+/// selector (`src/lib` → `src/lib.rs`), or a snapshot file nested under that
+/// directory/prefix (`src/cli` → `src/cli/dispatch.rs`).
+fn scope_selects_as_prefix(scope: &str, path: &str) -> bool {
+    if scope.is_empty() {
+        return false;
+    }
+    if path == scope || path.starts_with(&format!("{scope}/")) {
+        return true;
+    }
+    path.starts_with(scope) && path[scope.len()..].starts_with('.')
 }
 
 pub fn path_matches_scope(path: &str, scope: &str) -> bool {
     let path = normalize_scope_path(path);
     let scope = normalize_scope_path(scope);
-    !scope.is_empty() && (path == scope || path.ends_with(&format!("/{scope}")))
+    if scope.is_empty() {
+        return false;
+    }
+    path == scope || path.ends_with(&format!("/{scope}")) || scope_selects_as_prefix(&scope, &path)
 }
 
 #[cfg(test)]
@@ -3596,6 +3644,64 @@ mod tests {
         assert!(ambiguous.indexed);
         assert_eq!(ambiguous.status, "ambiguous");
         assert_eq!(ambiguous.matched_paths.len(), 2);
+    }
+
+    #[test]
+    fn w1_01_find_file_scope_expands_directories() {
+        // G-FIND-FILE-DIR: `--file <dir>` / `--file <prefix>` must scan the
+        // snapshot files under that selector, not collapse to scanned 0 of 0.
+        let paths = [
+            "src/cli/dispatch.rs",
+            "src/cli/entrypoint.rs",
+            "src/lib.rs",
+            "docs/guide.md",
+        ];
+
+        let dir = FileScopeResolution::resolve("src/cli", paths);
+        assert!(dir.resolved, "directory selectors must resolve");
+        assert_eq!(dir.status, "resolved");
+        assert_eq!(
+            dir.matched_paths,
+            vec!["src/cli/dispatch.rs", "src/cli/entrypoint.rs"]
+        );
+        let dir_scope = dir.scan_scope();
+        assert!(dir_scope.matches("src/cli/dispatch.rs"));
+        assert!(dir_scope.matches("src/cli/entrypoint.rs"));
+        assert!(!dir_scope.matches("src/lib.rs"));
+        assert!(!dir_scope.matches("docs/guide.md"));
+
+        let prefix = FileScopeResolution::resolve("src/cli/dispatch", paths);
+        assert!(prefix.resolved, "partial path prefixes must resolve");
+        assert_eq!(prefix.matched_paths, vec!["src/cli/dispatch.rs"]);
+        assert!(prefix.scan_scope().matches("src/cli/dispatch.rs"));
+        assert!(!prefix.scan_scope().matches("src/cli/entrypoint.rs"));
+
+        let missing = FileScopeResolution::resolve("no/such/dir", paths);
+        assert!(!missing.resolved);
+        assert!(!missing.indexed);
+        assert_eq!(missing.status, "unresolved");
+        assert!(
+            !missing.scan_scope().matches("src/cli/dispatch.rs"),
+            "unresolved must stay fail-loud, never 0-of-0 over the whole universe"
+        );
+
+        let hits = scan_files_with_scope(
+            [
+                ("src/cli/dispatch.rs", "fn handle_find() { TOKEN_W1_01 }"),
+                ("src/cli/entrypoint.rs", "fn main() {}"),
+                ("src/lib.rs", "TOKEN_W1_01 in the wrong tree"),
+            ],
+            "TOKEN_W1_01",
+            ScanOptions::default(),
+            dir.scan_scope(),
+        );
+        assert!(
+            hits.scope.as_ref().is_some_and(|s| s.files_scanned > 0),
+            "directory scope must scan N>0 files, got {:?}",
+            hits.scope
+        );
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.occurrences[0].file, "src/cli/dispatch.rs");
     }
 
     #[test]
