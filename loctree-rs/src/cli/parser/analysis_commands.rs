@@ -8,6 +8,7 @@ use super::super::command::{
     BodyOptions, Command, CyclesOptions, DeadOptions, FindOptions, ImpactCommandOptions,
     OccurrencesOptions, QueryKind, QueryOptions, TwinsOptions,
 };
+use crate::analyzer::occurrences::positional_dot_query_error;
 
 /// Parse `loct dead [options]` command - detect unused exports.
 pub(super) fn parse_dead_command(args: &[String]) -> Result<Command, String> {
@@ -524,6 +525,12 @@ EXAMPLES:
         // (not discovery). Agents used to get silent fixed_string-0 on pipes and
         // fall back to grep — multi-literal closes that hole.
         opts.literal = true;
+    }
+
+    if opts.literal
+        && let Some(err) = positional_dot_query_error(&queries)
+    {
+        return Err(err.to_string());
     }
 
     if opts.literal && !opts.all && opts.limit.is_none() {
@@ -1134,6 +1141,22 @@ mod tests {
         assert!(
             err.contains("mutually exclusive"),
             "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn w3_01_positional_dot_is_scan_root_not_pattern() {
+        // G-LITERAL-OVERMATCH residue: `loct find --literal runtime-install .`
+        // used to treat `.` as a second literal (every period) instead of cwd.
+        let err = parse_find_command(&["--literal".into(), "runtime-install".into(), ".".into()])
+            .unwrap_err();
+        assert!(
+            err.contains("positional '.'"),
+            "expected positional-dot hint, got: {err}"
+        );
+        assert!(
+            err.contains("--root"),
+            "hint must name --root as the scan-root flag, got: {err}"
         );
     }
 
