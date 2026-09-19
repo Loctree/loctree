@@ -23,6 +23,20 @@ loct --version
 
 If a command is not found, your `npm bin -g` path is not on `PATH`.
 
+## Install from a local checkout (developers)
+
+```bash
+make npm-install        # alias: make install-npm
+```
+
+Builds the four suite binaries, stages the wrapper plus your host platform
+package, and runs a real `npm install -g` from local tarballs — the machine
+ends up with exactly the registry layout. Handy overrides:
+`NPM_INSTALL_WORK=/path` (staging area), `npm_config_prefix=/tmp/x` (throwaway
+prefix). `distribution/npm/install-local.sh` is the reusable core; it takes
+`--wrapper` / `--native-bin-dir` / `--platform` / `--legacy-names` and can be
+dropped into other wrapper+platform-packages repos (e.g. AICX) as-is.
+
 ## Everyday CLI
 
 ```bash

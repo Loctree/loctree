@@ -26,7 +26,7 @@ else ifeq (,$(shell command -v cargo 2>/dev/null))
   $(warning cargo not found on PATH and $(HOME)/.cargo/bin/cargo is missing)
 endif
 
-.PHONY: all build release-binaries release-bundles release-pack smoke-release-macos-arm64 smoke-release-linux-gnu install install-all install-service uninstall-service clean test check precheck preflight semgrep fmt help setup-protoc
+.PHONY: all build release-binaries release-bundles release-pack smoke-release-macos-arm64 smoke-release-linux-gnu install install-all install-npm npm-install install-service uninstall-service clean test check precheck preflight semgrep fmt help setup-protoc
 .PHONY: editors editors-full editors-vscode editors-vscode-package editors-neovim editors-jetbrains editors-jetbrains-full editors-jetbrains-verify editors-jetbrains-install
 .PHONY: version version-show version-check version-assert publish npm-release-verify npm-release-publish
 .PHONY: mcp-build mcp-install mcp-test
@@ -221,6 +221,21 @@ install-service:
 
 uninstall-service:
 	bash tools/install-mcp-service.sh --uninstall
+
+# Daily dev loop: build the suite binaries and reinstall the global npm package
+# from THIS checkout — same on-disk layout as `npm install -g @loctree/loctree`
+# (bin symlinks in <npm prefix>/bin, natives in the scoped platform package).
+# install-npm is an alias of npm-install. Throwaway prefix for testing:
+#   npm_config_prefix=/tmp/loctree-npm make npm-install
+NPM_INSTALL_WORK ?= $(or $(TMPDIR),/tmp)/loctree-npm-install
+
+install-npm: npm-install
+
+npm-install: setup-protoc
+	$(MAKE) release-binaries STAGING_DIR="$(NPM_INSTALL_WORK)/native"
+	NPM_LEGACY_NAMES="loctree" bash distribution/npm/install-local.sh \
+		--wrapper distribution/npm/loct \
+		--native-bin-dir "$(NPM_INSTALL_WORK)/native/bin"
 
 # Setup protoc - check system or use Homebrew
 setup-protoc:
@@ -437,6 +452,7 @@ help:
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'release-pack' '- Full distribution pack (version gate + editor packages + release bundles)'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install' '- Install loct, loctree & loctree-mcp'
 	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'install-all' '- Install loct, loctree, loctree-mcp & loctree-lsp'
+	@printf '    $(HELP_C_GREEN)%-18s$(HELP_C_RESET) %s\n' 'npm-install' '- Build + reinstall the global npm package from this checkout (alias: install-npm)'
 	@printf '%s\n' '  make release-bundles VERSION=X - Build combined Loctree+AICX release tarballs'
 	@printf '%s\n' '      Optional: AICX_VERSION=0.12.5 BUNDLE_TARGET=x86_64-unknown-linux-gnu'
 	@printf '%s\n' '      Windows: BUNDLE_TARGET=x86_64-pc-windows-msvc builds the full six-binary .tar.gz bundle'
