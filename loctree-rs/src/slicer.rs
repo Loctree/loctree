@@ -889,6 +889,36 @@ fn ensure_snapshot(root: &Path, parsed: &ParsedArgs) -> io::Result<bool> {
     }
 }
 
+/// Build a synthetic snapshot leaf for an untracked file that exists on disk.
+/// Used by `--include-untracked` so `slice` can bind without a full rescan.
+fn synthetic_untracked_slice_leaf(root: &Path, target: &str) -> Option<FileAnalysis> {
+    let candidate = match assemble_slice_target_path(target) {
+        Ok(raw) if raw.is_absolute() => raw,
+        Ok(raw) => root.join(raw),
+        Err(_) => return None,
+    };
+    if !candidate.is_file() {
+        return None;
+    }
+    let rel = candidate
+        .strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| target.trim_start_matches("./").replace('\\', "/"));
+    let text = std::fs::read_to_string(&candidate).ok()?;
+    let loc = text.lines().count();
+    let language = candidate
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Some(FileAnalysis {
+        path: rel.clone(),
+        loc,
+        language,
+        ..FileAnalysis::new(rel)
+    })
+}
+
 /// Run slice command
 pub fn run_slice(
     root: &Path,
@@ -962,7 +992,7 @@ pub fn run_slice(
         }
     }
 
-    let snapshot = crate::snapshot::acquire_snapshot(
+    let mut snapshot = crate::snapshot::acquire_snapshot(
         std::slice::from_ref(&effective_root),
         crate::snapshot::SnapshotReusePolicy::Strict,
         &crate::snapshot::AcquireOptions {
@@ -976,6 +1006,13 @@ pub fn run_slice(
         include_consumers,
         max_depth: 2,
     };
+
+    if parsed.include_untracked
+        && HolographicSlice::from_path(&snapshot, target, &config).is_none()
+        && let Some(leaf) = synthetic_untracked_slice_leaf(&effective_root, target)
+    {
+        snapshot.files.push(leaf);
+    }
 
     let slice = match HolographicSlice::from_path(&snapshot, target, &config) {
         Some(s) => s,
@@ -1006,6 +1043,9 @@ pub fn run_slice(
             eprintln!("   - File path is incorrect or uses wrong case");
             eprintln!("   - File was added after last snapshot (run `loctree` to update)");
             eprintln!("   - File is excluded by .gitignore or .loctignore");
+            eprintln!(
+                "   - File is untracked; pass --include-untracked to slice it without a full rescan"
+            );
             eprintln!();
             std::process::exit(1);
         }

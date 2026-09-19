@@ -677,12 +677,55 @@ impl IndexedUniverse {
         Self::from_counts(analyses.len(), analyses.len(), stats, ignored_files)
     }
 
+    /// Overlay untracked accounting without pretending those files are indexed.
+    ///
+    /// `scan_complete` stays an indexed-universe claim: extra untracked scans
+    /// increase `scanned_files` but do not flip completeness false.
+    pub fn declare_untracked(&mut self, count: usize, included: bool, scanned: usize) {
+        self.untracked = UniverseSlice {
+            inclusion: if included {
+                UniverseInclusion::Included
+            } else if count == 0 {
+                UniverseInclusion::Excluded
+            } else {
+                UniverseInclusion::Conditional
+            },
+            files: Some(count),
+            note: if included {
+                "scanned in-memory via --include-untracked; snapshot was not mutated".to_string()
+            } else if count == 0 {
+                "no untracked source files outside the snapshot".to_string()
+            } else {
+                "present on disk but not scanned; pass --include-untracked".to_string()
+            },
+        };
+        // Do not fold untracked scans into `scanned_files`: that field (and
+        // `scan_complete`) is an indexed-universe claim. Overlay hits live in
+        // `untracked` so coverage still distinguishes the two.
+        let _ = scanned;
+        if !included
+            && count > 0
+            && !self
+                .exclusions
+                .iter()
+                .any(|entry| entry.kind == "untracked")
+        {
+            self.exclusions.push(UniverseExclusion {
+                kind: "untracked".to_string(),
+                files: Some(count),
+                reason: "untracked source files exist; pass --include-untracked to scan them without a full rescan".to_string(),
+            });
+        }
+    }
+
     /// Compact human line mirroring the JSON contract without hiding unknowns.
     pub fn summary_line(&self) -> String {
         format!(
-            "universe: indexed={}, scanned={}, tracked=unknown, untracked=unknown, ignored={}, generated={}, fixtures={}, exclusions={}{}",
+            "universe: indexed={}, scanned={}, tracked={}, untracked={}, ignored={}, generated={}, fixtures={}, exclusions={}{}",
             self.indexed_files,
             self.scanned_files,
+            Self::optional_count(self.tracked.files),
+            Self::optional_count(self.untracked.files),
             self.ignored.files.unwrap_or(0),
             self.generated.files.unwrap_or(0),
             self.fixtures.files.unwrap_or(0),
@@ -693,6 +736,12 @@ impl IndexedUniverse {
                 "; coverage incomplete"
             }
         )
+    }
+
+    fn optional_count(files: Option<usize>) -> String {
+        files
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     /// True when any exclusion boundary is declared (including the permanent
@@ -1181,6 +1230,32 @@ impl OccurrenceResults {
     pub fn declare_snapshot_universe(&mut self, snapshot: &Snapshot, scope: FileScope<'_>) {
         let scanned_files = self.scope.as_ref().map_or(0, |stats| stats.files_scanned);
         self.universe = IndexedUniverse::from_snapshot(snapshot, scope, scanned_files);
+        self.refresh_coverage_line();
+    }
+
+    /// Overlay untracked accounting after [`Self::declare_snapshot_universe`].
+    ///
+    /// Rebuilds the coverage line so `untracked=N` is visible without flipping
+    /// indexed `scan_complete`.
+    pub fn declare_untracked_overlay(&mut self, count: usize, included: bool, scanned: usize) {
+        self.universe.declare_untracked(count, included, scanned);
+        self.refresh_coverage_line();
+        if !included && count > 0 && self.total == 0 {
+            let hint = SuggestedNext {
+                command: "loct find --literal <query> --include-untracked".to_string(),
+                reason: "untracked source files exist outside the snapshot; scan them in-memory without a full rescan".to_string(),
+            };
+            if !self
+                .suggested_next
+                .iter()
+                .any(|next| next.command.contains("--include-untracked"))
+            {
+                self.suggested_next.insert(0, hint);
+            }
+        }
+    }
+
+    fn refresh_coverage_line(&mut self) {
         if let Some(stats) = &mut self.scope {
             stats.files_in_universe = self.universe.indexed_files;
             stats.files_scanned = self.universe.scanned_files;
