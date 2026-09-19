@@ -145,6 +145,14 @@ if ! grep -Fq "build-mode: manual" "$CODEQL_WORKFLOW"; then
   echo "CodeQL workflow does not opt Java/Kotlin into an explicit build" >&2
   exit 1
 fi
+if ! grep -Fq "uses: actions/setup-java@v4" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not set up Java deterministically for the Kotlin lane" >&2
+  exit 1
+fi
+if ! grep -Fq 'java-version: "21"' "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not pin the required Java toolchain for the Kotlin lane" >&2
+  exit 1
+fi
 if ! grep -Fq "working-directory: editors/jetbrains" "$CODEQL_WORKFLOW"; then
   echo "CodeQL workflow does not build the JetBrains Gradle project in place" >&2
   exit 1
