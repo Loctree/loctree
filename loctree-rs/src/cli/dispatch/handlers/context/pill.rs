@@ -2003,6 +2003,16 @@ mod tests {
             !pack.risk.dirty_worktree,
             "git probe failure must not claim a dirty worktree"
         );
+        assert_eq!(
+            pack.risk.cache_scope,
+            crate::pack::RiskCacheScope::Unknown,
+            "git probe failure must not advertise a Clean cache_scope"
+        );
+        assert_eq!(
+            pack.risk.cache_scope_authority,
+            AuthorityLabel::StaleOrUnknown,
+            "unknown git identity is not RepoVerified"
+        );
 
         let scope = AutoScope {
             dirty: false,
@@ -2015,6 +2025,10 @@ mod tests {
         assert!(
             md.contains("git: unknown"),
             "pill must render git: unknown, got:\n{md}"
+        );
+        assert!(
+            md.contains("Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)"),
+            "pill TL;DR must fail-closed on git identity, got:\n{md}"
         );
         assert!(
             !md.contains("clean worktree"),
