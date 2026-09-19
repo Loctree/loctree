@@ -16,7 +16,7 @@ use super::super::{DispatchResult, GlobalOptions, load_or_create_query_snapshot_
 use crate::analyzer::occurrences::{
     FileScope, FileScopeResolution, LiteralOccurrence, MatchMode, OccurrenceResults, ReportOptions,
     ScanOptions, attach_near_matches, enrich_with_snapshot, expand_literal_patterns,
-    scan_files_multi_literal, scan_files_with, scan_files_with_regex,
+    positional_dot_query_error, scan_files_multi_literal, scan_files_with, scan_files_with_regex,
 };
 use crate::analyzer::search::{FuzzySuggestion, literal_fuzzy_suggestions};
 use crate::snapshot::Snapshot;
@@ -204,9 +204,15 @@ fn handle_occurrences_regex(
 ///
 /// Multi-pattern OR (agent anti-grep surface):
 /// - `loct find A B` → exact OR of A and B
-/// - `loct find 'A|B'` → same, when every segment is a simple literal
-///   (not regex). This prevents the silent fixed_string-0 trap on pipes.
+/// - `loct find 'A|B'` → same, per-term exact literals. A metachar in a
+///   term (`.` / `(`) is that term's text, not a veto of the split.
+///   Real regex OR is `--regex`. This prevents the silent fixed_string-0
+///   trap on pipes.
 pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -> DispatchResult {
+    if let Some(err) = positional_dot_query_error(&opts.queries) {
+        eprintln!("[loct][error] {err}");
+        return DispatchResult::Exit(1);
+    }
     let patterns = literal_find_patterns(opts);
     if patterns.is_empty() {
         eprintln!(
@@ -321,6 +327,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
             "mode": "literal",
             "query": display_query,
             "patterns": patterns,
+            "interpreted_as": literal_matches.match_mode.interpreted_as(),
             "literal_matches": literal_matches,
             // Mode-stable alias. Without it the envelope key changes with the
             // mode (`literal_matches` here, `regex_matches` under --regex), so a
@@ -470,6 +477,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
         let payload = serde_json::json!({
             "mode": "regex",
             "query": pattern,
+            "interpreted_as": matches.match_mode.interpreted_as(),
             "regex_matches": matches,
             // Mode-stable alias — see the literal branch above.
             "matches": matches,
@@ -590,8 +598,11 @@ fn zero_hit_absence_text(
     looks_like_regex: bool,
     ctx: ZeroHitCtx<'_>,
 ) -> String {
+    let interpreted = format!("interpreted_as: {}", results.match_mode.interpreted_as());
     if !results.universe.scan_complete {
-        return "not found — absence is NOT trustworthy because at least one indexed path could not be scanned".to_string();
+        return format!(
+            "not found — absence is NOT trustworthy because at least one indexed path could not be scanned ({interpreted})"
+        );
     }
 
     let file_scope = results.file_scope.as_ref();
@@ -601,25 +612,29 @@ fn zero_hit_absence_text(
         let status = file_scope.map(|s| s.status).unwrap_or("unresolved");
         if let Some(hint) = file_scope_loctignore_hint(ctx.project_root, file_scope) {
             return format!(
-                "not found — file scope status={status}; excluded-by-.loctignore `{requested}` — {hint}"
+                "not found — file scope status={status}; excluded-by-.loctignore `{requested}` — {hint} ({interpreted})"
             );
         }
         if ctx.snapshot_stale {
             return format!(
-                "not found — file scope status={status}; requested `{requested}` is not in this snapshot, and the snapshot is stale — absence is NOT trustworthy (rescan with `loct scan`)"
+                "not found — file scope status={status}; requested `{requested}` is not in this snapshot, and the snapshot is stale — absence is NOT trustworthy (rescan with `loct scan`) ({interpreted})"
             );
         }
         return format!(
-            "not found — file scope status={status}; requested `{requested}` did not resolve to an indexed path — absence is NOT trustworthy"
+            "not found — file scope status={status}; requested `{requested}` did not resolve to an indexed path — absence is NOT trustworthy ({interpreted})"
         );
     }
 
     if matches!(mode, AbsenceMode::Literal) && looks_like_regex {
-        return "0 exact-string matches — NOT a trustworthy absence: the query contains regex metacharacters and `--literal` matches literally, so a pattern was never evaluated. For a regex search use a pattern-aware tool.".to_string();
+        return format!(
+            "0 exact-string matches — NOT a trustworthy absence: the query contains regex metacharacters and `--literal` matches literally, so a pattern was never evaluated. For a regex search use a pattern-aware tool. ({interpreted})"
+        );
     }
 
     if ctx.snapshot_stale {
-        return "not found — snapshot is stale; absence is NOT trustworthy (rescan with `loct scan`)".to_string();
+        return format!(
+            "not found — snapshot is stale; absence is NOT trustworthy (rescan with `loct scan`) ({interpreted})"
+        );
     }
 
     let file_scoped = file_scope.is_some_and(|scope| scope.resolved);
@@ -628,11 +643,15 @@ fn zero_hit_absence_text(
             AbsenceMode::Regex => "not found — pattern evaluated; ",
             AbsenceMode::Literal => "not found — literal ",
         };
-        return format!("{prefix}{caveat}");
+        return format!("{prefix}{caveat} ({interpreted})");
     }
     match mode {
-        AbsenceMode::Regex => "not found — pattern evaluated; absence is trustworthy".to_string(),
-        AbsenceMode::Literal => "not found — literal absence is trustworthy".to_string(),
+        AbsenceMode::Regex => {
+            format!("not found — pattern evaluated; absence is trustworthy ({interpreted})")
+        }
+        AbsenceMode::Literal => {
+            format!("not found — literal absence is trustworthy ({interpreted})")
+        }
     }
 }
 
@@ -1396,6 +1415,27 @@ mod tests {
         assert!(
             stale_text.contains("stale"),
             "stale snapshot must be named, got: {stale_text}"
+        );
+        assert!(
+            stale_text.contains("interpreted_as:"),
+            "zero-hit must name query interpretation, got: {stale_text}"
+        );
+    }
+
+    #[test]
+    fn w3_01_pipe_query_reports_interpretation() {
+        let mut results = scan_files_with_scope(
+            [("src/lib.rs", "fn present() {}\n")],
+            "absent_term",
+            ScanOptions::default(),
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        results.match_mode = crate::analyzer::occurrences::MatchMode::MultiLiteral;
+        let text =
+            zero_hit_absence_text(&results, AbsenceMode::Literal, false, ZeroHitCtx::default());
+        assert!(
+            text.contains("interpreted_as: multi_literal"),
+            "zero-hit must name multi_literal interpretation, got: {text}"
         );
     }
 }

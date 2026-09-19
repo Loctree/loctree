@@ -136,6 +136,22 @@ pub enum MatchMode {
     Regex,
 }
 
+impl MatchMode {
+    /// Coarse agent-facing interpretation: `fixed_string`, `multi_literal`, or `regex`.
+    ///
+    /// Identifier/whole-token scans are still exact-string truth; they collapse
+    /// to `fixed_string` so a zero-hit receipt has three named buckets, not five.
+    pub fn interpreted_as(self) -> &'static str {
+        match self {
+            MatchMode::MultiLiteral => "multi_literal",
+            MatchMode::Regex => "regex",
+            MatchMode::IdentifierBoundary
+            | MatchMode::WholeTokenBoundary
+            | MatchMode::FixedString => "fixed_string",
+        }
+    }
+}
+
 /// Agent-readable role derived from [`OccurrenceKind`].
 ///
 /// This is deliberately coarser than `occurrence_kind`: agents need a compact
@@ -946,15 +962,18 @@ pub struct OccurrenceResults {
 ///
 /// Forms accepted:
 /// - multiple strings → each is one pattern
-/// - a single string with unescaped `|` where every segment is a *simple*
-///   literal (no regex metacharacters) → split into OR of exact literals
+/// - a single string with unescaped `|` and two or more non-empty segments →
+///   split into OR of exact literals (per-term). A metacharacter in a term
+///   (`.` in `foo.bar`, `(` in `init(`) is that term's exact text, not a
+///   veto of the split. Real regex OR is `--regex`.
 ///
 /// This closes the loctree-fail class where agents type
 /// `find 'global_async_runtime|get_tokio_runtime'`, get `fixed_string` total 0
-/// (looking for the pipe character), and fall back to `grep -E`.
+/// (looking for the pipe character), and fall back to `grep -E` — and the
+/// follow-on class where `foo.bar|baz` used to degrade the same way because
+/// `.` / `(` in *any* term vetoed the split.
 ///
-/// Escaped `\|` keeps the pipe inside a segment. Segments that look like real
-/// regex (contain `.+*?[]()…`) do **not** trigger split — use `--regex`.
+/// Escaped `\|` keeps the pipe inside a segment.
 pub fn expand_literal_patterns(raw_queries: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in raw_queries {
@@ -976,9 +995,29 @@ pub fn expand_literal_patterns(raw_queries: &[String]) -> Vec<String> {
     out
 }
 
+/// Grep-muscle-memory trap: `loct find --literal needle .` treats `.` as a
+/// second exact-literal pattern (every period in the tree) instead of cwd.
+///
+/// A single-query `'.'` stays legal (the caller asked to search for a dot).
+/// Two-or-more positionals with a bare `.` is the path-as-pattern override.
+pub fn positional_dot_query_error(raw_queries: &[String]) -> Option<&'static str> {
+    if raw_queries.len() >= 2 && raw_queries.iter().any(|q| q == ".") {
+        Some(
+            "positional '.' looks like a scan root (grep-style), not a literal query. \
+             Omit it, or pass `--root .`. To search for a literal dot, use a single quoted query.",
+        )
+    } else {
+        None
+    }
+}
+
 fn looks_like_multi_literal_or(q: &str) -> bool {
-    let parts = split_unescaped_pipes(q);
-    parts.len() >= 2 && parts.iter().all(|s| is_simple_literal_segment(s.trim()))
+    split_unescaped_pipes(q)
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .count()
+        >= 2
 }
 
 /// Split on `|` that is not preceded by an odd number of backslashes.
@@ -1004,19 +1043,6 @@ fn split_unescaped_pipes(q: &str) -> Vec<String> {
     }
     parts.push(cur);
     parts
-}
-
-fn is_simple_literal_segment(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    // Reject regex metacharacters; allow identifier / path-ish tokens.
-    !s.chars().any(|c| {
-        matches!(
-            c,
-            '\\' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '*' | '?' | '^' | '$' | '.'
-        )
-    })
 }
 
 fn push_unique_pattern(out: &mut Vec<String>, pattern: &str) {
@@ -4535,10 +4561,11 @@ class AgentConstraints {\n\
     }
 
     #[test]
-    fn expand_literal_patterns_keeps_real_regex_unsplit() {
-        // Real regex still goes to --regex; literal must not silently mangle it.
+    fn expand_literal_patterns_splits_regexish_terms_as_literals() {
+        // Pipe still splits; each term is exact-string (not regex). Real regex
+        // OR remains `--regex`.
         let patterns = expand_literal_patterns(&["foo.*|bar+".to_string()]);
-        assert_eq!(patterns, vec!["foo.*|bar+".to_string()]);
+        assert_eq!(patterns, vec!["foo.*".to_string(), "bar+".to_string()]);
     }
 
     #[test]
@@ -4570,5 +4597,73 @@ class AgentConstraints {\n\
             .collect();
         assert!(texts.contains(&"global_async_runtime"));
         assert!(texts.contains(&"get_tokio_runtime"));
+    }
+
+    #[test]
+    fn w3_01_multiliteral_or_with_metachars_splits() {
+        // G-MULTILITERAL-DEGRADE: `.` / `(` in a term must not veto pipe-split.
+        let dotted = expand_literal_patterns(&["foo.bar|baz".to_string()]);
+        assert_eq!(dotted, vec!["foo.bar".to_string(), "baz".to_string()]);
+        let parens = expand_literal_patterns(&["init(|ready".to_string()]);
+        assert_eq!(parens, vec!["init(".to_string(), "ready".to_string()]);
+
+        let files = [
+            ("a.rs", "let x = foo.bar;\n"),
+            ("b.rs", "const baz = 1;\n"),
+            ("c.rs", "fn other() {}\n"),
+        ];
+        let merged = scan_files_for_literal_query(
+            &files,
+            "foo.bar|baz",
+            ScanOptions::default(),
+            FileScope::default(),
+        );
+        assert_eq!(merged.match_mode, MatchMode::MultiLiteral);
+        assert_eq!(merged.match_mode.interpreted_as(), "multi_literal");
+        assert_eq!(
+            merged.total, 2,
+            "both terms must hit as exact literals, not 0"
+        );
+        let texts: Vec<_> = merged
+            .occurrences
+            .iter()
+            .map(|o| o.matched_text.as_str())
+            .collect();
+        assert!(texts.contains(&"foo.bar"));
+        assert!(texts.contains(&"baz"));
+    }
+
+    #[test]
+    fn w3_01_pipe_query_reports_interpretation() {
+        // Zero-hit must name how the query was interpreted — not a silent
+        // fixed_string search for the pipe character.
+        let files = [("a.rs", "fn present() {}\n")];
+        let merged = scan_files_for_literal_query(
+            &files,
+            "no_such_foo.bar|no_such_baz",
+            ScanOptions::default(),
+            FileScope::default(),
+        );
+        assert_eq!(merged.total, 0);
+        assert_eq!(merged.match_mode, MatchMode::MultiLiteral);
+        assert_eq!(merged.match_mode.interpreted_as(), "multi_literal");
+
+        let single = scan_files_with(
+            files.iter().copied(),
+            "no_such_ident",
+            ScanOptions::default(),
+        );
+        assert_eq!(single.total, 0);
+        assert_eq!(single.match_mode.interpreted_as(), "fixed_string");
+        assert_eq!(MatchMode::Regex.interpreted_as(), "regex");
+
+        assert!(
+            positional_dot_query_error(&["runtime-install".into(), ".".into()]).is_some(),
+            "grep-style trailing '.' must be a loud positional error"
+        );
+        assert!(
+            positional_dot_query_error(&[".".into()]).is_none(),
+            "a single-query literal '.' stays a literal search"
+        );
     }
 }
