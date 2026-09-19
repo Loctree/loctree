@@ -1620,11 +1620,7 @@ mod tests {
             panic!("Expected Body command");
         }
 
-        let args_project = vec![
-            "my_sym".into(),
-            "--project".into(),
-            "/other/path".into(),
-        ];
+        let args_project = vec!["my_sym".into(), "--project".into(), "/other/path".into()];
         let result_project = parse_body_command(&args_project).unwrap();
         if let Command::Body(opts) = result_project {
             assert_eq!(opts.root, Some(PathBuf::from("/other/path")));

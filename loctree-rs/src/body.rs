@@ -210,7 +210,10 @@ fn assignment_collection_rhs(line: &str) -> Option<(usize, &'static str)> {
             }
             let rhs = line[i + 1..].trim_start();
             let inner = rhs.strip_prefix('&').map(str::trim_start).unwrap_or(rhs);
-            let inner = inner.strip_prefix("mut").map(str::trim_start).unwrap_or(inner);
+            let inner = inner
+                .strip_prefix("mut")
+                .map(str::trim_start)
+                .unwrap_or(inner);
             let inner = inner.trim_start();
             if (inner.starts_with('(') && !rhs.contains("=>")) || inner.starts_with('[') {
                 return Some((i + 1, EXTENT_BRACKET));
@@ -427,8 +430,10 @@ fn resolve_extent(lines: &[&str], start_idx: usize, language: &str) -> (usize, &
     // Assignment-opened collection (`NAME = (`/`[`/`{` or `NAME = &[`/`&{`): balance
     // that bracket/brace so a multi-line const returns exactly its own body instead of a
     // fixed window that overshoots into trailing code.
-    if let Some((close_idx, extent)) = assignment_collection_rhs(lines[start_idx])
-        .and_then(|(off, ext)| extract_bracket_balanced(lines, start_idx, off, language).map(|c| (c, ext)))
+    if let Some((close_idx, extent)) =
+        assignment_collection_rhs(lines[start_idx]).and_then(|(off, ext)| {
+            extract_bracket_balanced(lines, start_idx, off, language).map(|c| (c, ext))
+        })
     {
         return (close_idx, extent);
     }
@@ -1335,7 +1340,10 @@ mod tests {
         assert_eq!(b.end_line, 5, "ref slice ends on line 5 at `];`");
         assert_eq!(b.total_lines, 5);
         assert_eq!(b.extent, EXTENT_BRACKET);
-        assert!(!b.truncated, "ref slice within line_cap must not be truncated");
+        assert!(
+            !b.truncated,
+            "ref slice within line_cap must not be truncated"
+        );
         assert!(b.source.contains("FAILURE_PHRASES"));
         assert!(b.source.contains("\"timeout\""));
         assert!(
@@ -1347,7 +1355,10 @@ mod tests {
         let map_src = "pub const LOOKUP: std::collections::HashMap<&str, i32> = {\n    let mut m = std::collections::HashMap::new();\n    m.insert(\"key\", 42);\n    m\n};\n\npub fn after() {}";
         let map_lines: Vec<&str> = map_src.lines().collect();
         let mb = extract_body(&map_lines, 0, 200, "rs");
-        assert_eq!(mb.end_line, 5, "block assignment ends on line 5 at closing brace");
+        assert_eq!(
+            mb.end_line, 5,
+            "block assignment ends on line 5 at closing brace"
+        );
         assert_eq!(mb.total_lines, 5);
         assert_eq!(mb.extent, EXTENT_BRACE);
         assert!(!mb.truncated);
@@ -1401,7 +1412,11 @@ mod tests {
         for (rel_path, ret_val) in [("src/a.rs", 10), ("src/b.rs", 20)] {
             let full_path = tmp.path().join(rel_path);
             std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
-            std::fs::write(&full_path, format!("pub fn helper() -> i32 {{\n    {ret_val}\n}}\n")).unwrap();
+            std::fs::write(
+                &full_path,
+                format!("pub fn helper() -> i32 {{\n    {ret_val}\n}}\n"),
+            )
+            .unwrap();
 
             let mut file = crate::types::FileAnalysis::new(full_path.to_string_lossy().to_string());
             file.exports.push(crate::types::ExportSymbol {
@@ -1417,17 +1432,29 @@ mod tests {
 
         // Unqualified helper returns 2 twin bodies
         let unqualified = query_symbol_body(&snapshot, "helper", None);
-        assert_eq!(unqualified.bodies.len(), 2, "twins should both be found when unqualified");
+        assert_eq!(
+            unqualified.bodies.len(),
+            2,
+            "twins should both be found when unqualified"
+        );
 
         // Qualified path syntax src/a.rs::helper resolves only src/a.rs
         let qual_a = query_symbol_body(&snapshot, "src/a.rs::helper", None);
-        assert_eq!(qual_a.bodies.len(), 1, "path::sym must disambiguate to src/a.rs");
+        assert_eq!(
+            qual_a.bodies.len(),
+            1,
+            "path::sym must disambiguate to src/a.rs"
+        );
         assert!(qual_a.bodies[0].file.ends_with("src/a.rs"));
         assert!(qual_a.bodies[0].source.contains("10"));
 
         // Qualified path syntax src/b.rs::helper resolves only src/b.rs
         let qual_b = query_symbol_body(&snapshot, "src/b.rs::helper", None);
-        assert_eq!(qual_b.bodies.len(), 1, "path::sym must disambiguate to src/b.rs");
+        assert_eq!(
+            qual_b.bodies.len(),
+            1,
+            "path::sym must disambiguate to src/b.rs"
+        );
         assert!(qual_b.bodies[0].file.ends_with("src/b.rs"));
         assert!(qual_b.bodies[0].source.contains("20"));
 

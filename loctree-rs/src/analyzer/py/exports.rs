@@ -66,11 +66,19 @@ fn extract_name_equality(line: &str, param: &str) -> Option<String> {
         let cond = trimmed.split(':').next().unwrap_or(trimmed);
         for part in cond.split(" and ").chain(cond.split(" or ")) {
             if let Some((lhs, rhs)) = part.split_once("==") {
-                let lhs = lhs.trim().trim_start_matches("if ").trim_start_matches("elif ").trim();
+                let lhs = lhs
+                    .trim()
+                    .trim_start_matches("if ")
+                    .trim_start_matches("elif ")
+                    .trim();
                 let rhs = rhs.trim();
-                if lhs == param && let Some(s) = extract_string_literal(rhs) {
+                if lhs == param
+                    && let Some(s) = extract_string_literal(rhs)
+                {
                     return Some(s);
-                } else if rhs == param && let Some(s) = extract_string_literal(lhs) {
+                } else if rhs == param
+                    && let Some(s) = extract_string_literal(lhs)
+                {
                     return Some(s);
                 }
             }
@@ -84,9 +92,15 @@ fn extract_name_in_set(line: &str, param: &str) -> Option<Vec<String>> {
     if (trimmed.starts_with("if ") || trimmed.starts_with("elif ")) && trimmed.contains(" in ") {
         let cond = trimmed.split(':').next().unwrap_or(trimmed);
         if let Some((lhs, rhs)) = cond.split_once(" in ") {
-            let lhs = lhs.trim().trim_start_matches("if ").trim_start_matches("elif ").trim();
+            let lhs = lhs
+                .trim()
+                .trim_start_matches("if ")
+                .trim_start_matches("elif ")
+                .trim();
             if lhs == param {
-                let rhs = rhs.trim().trim_matches(|c| c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}');
+                let rhs = rhs.trim().trim_matches(|c| {
+                    c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}'
+                });
                 let items: Vec<String> = rhs
                     .split(',')
                     .filter_map(|item| extract_string_literal(item.trim()))
@@ -104,7 +118,12 @@ fn extract_name_in_set(line: &str, param: &str) -> Option<Vec<String>> {
 fn extract_import_module_arg(line: &str) -> Option<String> {
     if let Some(pos) = line.find("import_module(") {
         let after = &line[pos + "import_module(".len()..];
-        let arg = after.split(',').next().and_then(|a| a.split(')').next()).unwrap_or("").trim();
+        let arg = after
+            .split(',')
+            .next()
+            .and_then(|a| a.split(')').next())
+            .unwrap_or("")
+            .trim();
         return extract_string_literal(arg);
     }
     None
@@ -142,9 +161,15 @@ fn extract_getattr_call(line: &str) -> Option<(String, String)> {
 }
 
 fn parse_lazy_dict(dict_str: &str, line: usize, results: &mut Vec<LazyReexport>) {
-    let Some(start) = dict_str.find('{') else { return; };
-    let Some(end) = dict_str.rfind('}') else { return; };
-    if start >= end { return; }
+    let Some(start) = dict_str.find('{') else {
+        return;
+    };
+    let Some(end) = dict_str.rfind('}') else {
+        return;
+    };
+    if start >= end {
+        return;
+    }
     let inner = &dict_str[start + 1..end];
 
     for entry in inner.split(',') {
@@ -230,13 +255,20 @@ pub(super) fn extract_getattr_lazy_reexports(content: &str) -> Vec<LazyReexport>
     };
 
     // 2. Collect imports in this file to map module aliases/names
-    let mut imported_module_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut imported_module_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for line in &lines {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("from ") {
             if let Some((mod_part, names_part)) = rest.split_once(" import ") {
                 let mod_part = mod_part.trim();
-                let names = names_part.split('#').next().unwrap_or("").trim().trim_matches('(').trim_matches(')');
+                let names = names_part
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('(')
+                    .trim_matches(')');
                 for name in names.split(',') {
                     let name = name.trim();
                     if name.is_empty() {
@@ -250,7 +282,8 @@ pub(super) fn extract_getattr_lazy_reexports(content: &str) -> Vec<LazyReexport>
                     if mod_part == "." {
                         imported_module_map.insert(alias.to_string(), format!(".{}", orig));
                     } else {
-                        imported_module_map.insert(alias.to_string(), format!("{}.{}", mod_part, orig));
+                        imported_module_map
+                            .insert(alias.to_string(), format!("{}.{}", mod_part, orig));
                     }
                 }
             }
@@ -258,7 +291,8 @@ pub(super) fn extract_getattr_lazy_reexports(content: &str) -> Vec<LazyReexport>
             for part in rest.split(',') {
                 let part = part.trim();
                 if let Some((mod_name, alias)) = part.split_once(" as ") {
-                    imported_module_map.insert(alias.trim().to_string(), mod_name.trim().to_string());
+                    imported_module_map
+                        .insert(alias.trim().to_string(), mod_name.trim().to_string());
                 } else if !part.is_empty() {
                     let last_seg = part.rsplit('.').next().unwrap_or(part);
                     imported_module_map.insert(last_seg.to_string(), part.to_string());
@@ -273,9 +307,7 @@ pub(super) fn extract_getattr_lazy_reexports(content: &str) -> Vec<LazyReexport>
     for line in &lines {
         let trimmed = line.trim();
         if !in_dict {
-            if (trimmed.contains('{') && trimmed.contains('='))
-                || trimmed.starts_with('{')
-            {
+            if (trimmed.contains('{') && trimmed.contains('=')) || trimmed.starts_with('{') {
                 in_dict = true;
                 dict_buffer.clear();
                 dict_buffer.push_str(line);

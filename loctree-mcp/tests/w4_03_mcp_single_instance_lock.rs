@@ -28,9 +28,7 @@ fn sample_project(name: &str) -> TempDir {
     fs::create_dir_all(&src).expect("create src dir");
     fs::write(
         tmp.path().join("Cargo.toml"),
-        format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
-        ),
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
     )
     .expect("write Cargo.toml");
     fs::write(
@@ -59,7 +57,7 @@ fn read_announced_addr(child: &mut Child) -> SocketAddr {
             match reader.read_line(&mut line) {
                 Ok(0) => {
                     let _ = tx.send(Err(
-                        "server exited before announcing a listening address".into(),
+                        "server exited before announcing a listening address".into()
                     ));
                     return;
                 }
@@ -117,7 +115,10 @@ fn w4_03_mcp_single_instance_lock() {
     let cache_dir = project_cache_dir(project_path);
     let pid_file = cache_dir.join("mcp.pid");
 
-    assert!(!pid_file.exists(), "pidfile must not exist before server start");
+    assert!(
+        !pid_file.exists(),
+        "pidfile must not exist before server start"
+    );
 
     // Start instance 1
     let mut child1 = Command::new(env!("CARGO_BIN_EXE_loctree-mcp"))
@@ -142,7 +143,10 @@ fn w4_03_mcp_single_instance_lock() {
     let _addr1 = read_announced_addr(&mut child1);
 
     // Verify pidfile exists and contains child1_pid
-    assert!(pid_file.exists(), "pidfile must exist while instance 1 is running");
+    assert!(
+        pid_file.exists(),
+        "pidfile must exist while instance 1 is running"
+    );
     let pid_content = fs::read_to_string(&pid_file).expect("read pidfile");
     assert_eq!(
         pid_content.trim(),
@@ -260,7 +264,10 @@ fn w4_03_mcp_single_instance_lock() {
         let _ = child3.kill();
     }
     let _ = child3.wait();
-    assert!(!pid_file.exists(), "pidfile must be cleaned up after instance 3 exit");
+    assert!(
+        !pid_file.exists(),
+        "pidfile must be cleaned up after instance 3 exit"
+    );
 }
 
 #[test]

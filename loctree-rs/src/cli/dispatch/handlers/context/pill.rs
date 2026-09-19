@@ -403,7 +403,10 @@ fn top_three_warnings(input: &PillInput<'_>, m: &Metrics) -> Vec<String> {
             input.pack.risk.high_fan_in.len()
         ))
     } else if git_is_unknown(input) {
-        Some("Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)".to_string())
+        Some(
+            "Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)"
+                .to_string(),
+        )
     } else if input.pack.risk.dirty_worktree {
         Some("Worktree is dirty — auto-scope mirrors uncommitted edits, not committed state. (RepoVerified)".to_string())
     } else {
@@ -1992,9 +1995,8 @@ mod tests {
             no_aicx: true,
             ..crate::pack::ContextOptions::default()
         };
-        let pack =
-            crate::pack::compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot)
-                .expect("compose pack against broken git");
+        let pack = crate::pack::compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot)
+            .expect("compose pack against broken git");
         assert!(
             pack.risk.git_unknown,
             "broken .git must fail-closed as git_unknown"
@@ -2027,7 +2029,9 @@ mod tests {
             "pill must render git: unknown, got:\n{md}"
         );
         assert!(
-            md.contains("Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)"),
+            md.contains(
+                "Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)"
+            ),
             "pill TL;DR must fail-closed on git identity, got:\n{md}"
         );
         assert!(

@@ -25,11 +25,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::aicx::redact::redact_secrets;
 use crate::aicx::{
     AicxClient, IntentAuthority, ScopeKeywords, SemanticReadiness, authority_for_intent,
     is_aicx_available, score_intent, summarize_entry,
 };
-use crate::aicx::redact::redact_secrets;
 use crate::analyzer::classify::{ArtifactClass, artifact_class};
 use crate::analyzer::env_truth::source_reads::collect_source_env_reads;
 use crate::cli::command::GlobalOptions;
@@ -6379,7 +6379,9 @@ mod tests {
             eprintln!("W2-04 {label} coverage json: {}", json["coverage"]);
             let md = format_context_pack_markdown(pack);
             assert!(
-                md.contains("**Coverage**: 8 of 12 targets selected (truncated — not the whole repo)"),
+                md.contains(
+                    "**Coverage**: 8 of 12 targets selected (truncated — not the whole repo)"
+                ),
                 "{label} markdown must declare coverage, got:\n{md}"
             );
         }
@@ -6418,8 +6420,8 @@ mod tests {
             task: Some("fix launch.sh permissions".to_string()),
             ..ContextOptions::default()
         };
-        let pack = compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot)
-            .expect("task pack");
+        let pack =
+            compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot).expect("task pack");
         assert!(
             pack.structural
                 .files

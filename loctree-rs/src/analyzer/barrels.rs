@@ -686,10 +686,9 @@ mod tests {
             Some("rs".to_string())
         );
         assert_eq!(
-            directory_dominant_language(&[
-                "frontend/utils.ts".into(),
-                "frontend/types.tsx".into(),
-            ]),
+            directory_dominant_language(
+                &["frontend/utils.ts".into(), "frontend/types.tsx".into(),]
+            ),
             Some("ts".to_string())
         );
         assert_eq!(

@@ -645,7 +645,8 @@ fn crowds_not_in_health_metrics() {
         ..HealthMetrics::default()
     });
     assert_eq!(
-        clean.health, Some(100),
+        clean.health,
+        Some(100),
         "a repository with zero issues scores 100 — no crowd count can move it"
     );
 

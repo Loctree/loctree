@@ -405,10 +405,7 @@ pub(crate) fn resolve_reexport_target(
     }
     let parent = file_path.parent()?;
     let candidate = parent.join(spec);
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "py" || ext == "pyi" {
         resolve_python_candidate(candidate, root, exts)
     } else {
@@ -572,11 +569,33 @@ fn is_language_compatible(ext: &str, target_lang: &str) -> bool {
         "py" => matches!(ext, "py" | "pyi"),
         "ts" => matches!(
             ext,
-            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "svelte" | "vue" | "astro" | "json" | "css"
+            "ts" | "tsx"
+                | "mts"
+                | "cts"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "svelte"
+                | "vue"
+                | "astro"
+                | "json"
+                | "css"
         ),
         "js" => matches!(
             ext,
-            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "svelte" | "vue" | "astro" | "json" | "css"
+            "js" | "jsx"
+                | "mjs"
+                | "cjs"
+                | "ts"
+                | "tsx"
+                | "mts"
+                | "cts"
+                | "svelte"
+                | "vue"
+                | "astro"
+                | "json"
+                | "css"
         ),
         "swift" => matches!(ext, "swift"),
         "rs" => matches!(ext, "rs"),
@@ -649,10 +668,7 @@ pub(crate) fn resolve_with_extensions_hint(
 
     if candidate.exists() {
         // If the candidate is a directory, try to resolve to an index file
-        if candidate.is_dir()
-            && !has_known_js_extension(&candidate)
-            && lang_hint != Some("py")
-        {
+        if candidate.is_dir() && !has_known_js_extension(&candidate) && lang_hint != Some("py") {
             for index_name in [
                 "index.ts",
                 "index.tsx",
@@ -1214,9 +1230,7 @@ pub(crate) fn resolve_rust_import(
         return Some(resolved);
     }
 
-    if source.starts_with("std::")
-        || source.starts_with("core::")
-        || source.starts_with("alloc::")
+    if source.starts_with("std::") || source.starts_with("core::") || source.starts_with("alloc::")
     {
         return None;
     }
@@ -2115,9 +2129,16 @@ mod tests {
         );
 
         // 2. Direct submodule resolution across crates
-        let resolved_sub =
-            resolve_rust_import("crate_a::internal::ExportedType", &file_b, &crate_b_root, root);
-        assert!(resolved_sub.is_some(), "Expected submodule import to resolve");
+        let resolved_sub = resolve_rust_import(
+            "crate_a::internal::ExportedType",
+            &file_b,
+            &crate_b_root,
+            root,
+        );
+        assert!(
+            resolved_sub.is_some(),
+            "Expected submodule import to resolve"
+        );
         let resolved_sub_path = resolved_sub.unwrap();
         assert!(
             resolved_sub_path.contains("crates/crate_a/src/internal.rs"),
@@ -2125,7 +2146,7 @@ mod tests {
         );
 
         // 3. Impact analysis: re-export in crate A consumed in crate B -> impact B->A visible
-        use crate::impact::{analyze_impact, ImpactOptions};
+        use crate::impact::{ImpactOptions, analyze_impact};
         use crate::snapshot::{GraphEdge, Snapshot};
 
         let mut snapshot = Snapshot::new(vec!["crates".to_string()]);
@@ -2146,8 +2167,7 @@ mod tests {
             label: "reexport".to_string(),
         });
 
-        let impact_internal =
-            analyze_impact(&snapshot, internal_path, &ImpactOptions::default());
+        let impact_internal = analyze_impact(&snapshot, internal_path, &ImpactOptions::default());
         assert!(
             impact_internal
                 .direct_consumers

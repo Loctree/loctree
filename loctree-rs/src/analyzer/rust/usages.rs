@@ -266,7 +266,8 @@ fn strip_rust_visibility(trimmed: &str) -> &str {
 /// Strip a keyword only when it is a whole token (not `async_foo`).
 fn strip_leading_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
     let rest = s.strip_prefix(word)?;
-    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '"' || c == '(')
+    if rest.is_empty()
+        || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '"' || c == '(')
     {
         Some(rest.trim_start())
     } else {

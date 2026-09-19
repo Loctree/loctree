@@ -22,6 +22,7 @@ mod types;
 // Re-export the main types at the module level
 pub use crate::pack::ContextOptions;
 pub use global::GlobalOptions;
+pub use help::LOCT_USAGE;
 pub use options::{
     AnchorsOptions, AtlasOptions, AuditOptions, AutoOptions, BodyOptions, CacheAction,
     CacheOptions, CommandsOptions, CoverageOptions, CrowdOptions, CyclesOptions, DeadOptions,
@@ -34,6 +35,5 @@ pub use options::{
     SuppressOptions, SuppressionsOptions, TagmapOptions, TraceOptions, TreeOptions, TwinsOptions,
     WatchMode, WatchOptions, ZombieOptions,
 };
-pub use help::LOCT_USAGE;
 pub use parsed::ParsedCommand;
 pub use types::Command;

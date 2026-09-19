@@ -1143,7 +1143,8 @@ mod tests {
         let collision_score = audit_health(&collisions).health;
         let exact_score = audit_health(&exact).health;
         assert_eq!(
-            collision_score, Some(100),
+            collision_score,
+            Some(100),
             "NAME_COLLISION is informational and must not move health"
         );
         assert!(

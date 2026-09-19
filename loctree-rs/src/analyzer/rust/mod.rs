@@ -1502,7 +1502,7 @@ pub fn pub_plain_export() {}
     #[test]
     fn w5_03_build_script_include_edges() {
         use crate::analyzer::resolvers::resolve_rust_import;
-        use crate::impact::{analyze_impact, ImpactOptions};
+        use crate::impact::{ImpactOptions, analyze_impact};
         use crate::snapshot::{GraphEdge, Snapshot};
         use crate::types::ImportResolutionKind;
 
@@ -1560,9 +1560,11 @@ fn main() {}
         assert_eq!(imp_dyn.kind, ImportKind::Dynamic);
         assert_eq!(imp_dyn.resolution, ImportResolutionKind::Dynamic);
         assert!(imp_dyn.resolved_path.is_none());
-        assert!(analysis_main
-            .dynamic_imports
-            .contains(&"UNRESOLVED_DYNAMIC_VAR".to_string()));
+        assert!(
+            analysis_main
+                .dynamic_imports
+                .contains(&"UNRESOLVED_DYNAMIC_VAR".to_string())
+        );
 
         // Also check include_bytes!
         let imp_bytes = analysis_main
@@ -1595,7 +1597,10 @@ fn main() {
             .find(|i| i.source == "plugins/session-manager.wasm")
             .expect("plugins/session-manager.wasm must be in build.rs imports");
         let resolved_wasm = resolve_rust_import(&imp_wasm.source, &build_rs_path, root, root);
-        assert_eq!(resolved_wasm.as_deref(), Some("plugins/session-manager.wasm"));
+        assert_eq!(
+            resolved_wasm.as_deref(),
+            Some("plugins/session-manager.wasm")
+        );
 
         let imp_schema = analysis_build
             .imports
@@ -1607,7 +1612,10 @@ fn main() {
 
         // Build.rs self-dependency must be absent
         assert!(
-            !analysis_build.imports.iter().any(|i| i.source == "build.rs"),
+            !analysis_build
+                .imports
+                .iter()
+                .any(|i| i.source == "build.rs"),
             "build.rs must not import itself"
         );
 
@@ -1619,9 +1627,11 @@ fn main() {
             .expect("DYNAMIC_PLUGIN_PATH must be in build.rs imports as dynamic");
         assert_eq!(imp_build_dyn.kind, ImportKind::Dynamic);
         assert_eq!(imp_build_dyn.resolution, ImportResolutionKind::Dynamic);
-        assert!(analysis_build
-            .dynamic_imports
-            .contains(&"DYNAMIC_PLUGIN_PATH".to_string()));
+        assert!(
+            analysis_build
+                .dynamic_imports
+                .contains(&"DYNAMIC_PLUGIN_PATH".to_string())
+        );
 
         // Impact verification on snapshot
         let mut snapshot = Snapshot::new(vec![root.display().to_string()]);
@@ -1650,13 +1660,15 @@ fn main() {
         assert_eq!(impact_x.direct_consumers.len(), 1);
         assert_eq!(impact_x.direct_consumers[0].file, "src/main.rs");
 
-        let impact_wasm =
-            analyze_impact(&snapshot, "plugins/session-manager.wasm", &ImpactOptions::default());
+        let impact_wasm = analyze_impact(
+            &snapshot,
+            "plugins/session-manager.wasm",
+            &ImpactOptions::default(),
+        );
         assert_eq!(impact_wasm.direct_consumers.len(), 1);
         assert_eq!(impact_wasm.direct_consumers[0].file, "build.rs");
 
-        let impact_schema =
-            analyze_impact(&snapshot, "schema.sql", &ImpactOptions::default());
+        let impact_schema = analyze_impact(&snapshot, "schema.sql", &ImpactOptions::default());
         assert_eq!(impact_schema.direct_consumers.len(), 1);
         assert_eq!(impact_schema.direct_consumers[0].file, "build.rs");
 
@@ -1679,9 +1691,10 @@ fn main() {
         };
         let scan_results = crate::analyzer::root_scan::scan_roots(scan_cfg).expect("scan_roots");
         let ctx = &scan_results.contexts[0];
-        let has_edge_to_x = ctx.graph_edges.iter().any(|(from, to, _)| {
-            from.ends_with("main.rs") && to.ends_with("data/x.json")
-        });
+        let has_edge_to_x = ctx
+            .graph_edges
+            .iter()
+            .any(|(from, to, _)| from.ends_with("main.rs") && to.ends_with("data/x.json"));
         assert!(
             has_edge_to_x,
             "scan_roots must produce graph edge to data/x.json: {:?}",
