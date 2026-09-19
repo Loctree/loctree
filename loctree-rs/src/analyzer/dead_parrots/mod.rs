@@ -1013,9 +1013,10 @@ pub fn find_dead_exports(
 // Dead truth — canonical pipeline (single count) + cross-check before verdict
 // ============================================================================
 
-/// Counters describing what the cross-check changed. Candidates are degraded
-/// (confidence → "low") with the evidence appended to `reason`; they are
-/// never silently dropped — the operator sees the same list everywhere.
+/// Counters describing what the cross-check changed. Generic evidence
+/// degrades confidence (→ `"low"`) with a reason trail. `Command::new`
+/// string-literal (and const-resolved) spawn matches are runtime-root
+/// credit: those candidates are removed, not left on the list as low.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct CrossCheckStats {
     /// Candidates degraded because the literal layer found identifier hits
@@ -1030,6 +1031,12 @@ pub struct CrossCheckStats {
     pub symbol_graph_degraded: usize,
     /// Candidates marked as runtime entrypoints (never delete quick-wins).
     pub entrypoint_fenced: usize,
+    /// Candidates dropped because `Command::new("…")` (or a const-resolved
+    /// `Command::new(IDENT)`) names their file — they are live sidecars.
+    pub spawn_credited: usize,
+    /// `Command::new` calls whose argument was not a resolvable string
+    /// (env/format/variable). Sidecar-shaped leftovers are marked `unknown`.
+    pub spawn_unknown: usize,
 }
 
 /// Result of the canonical dead-export pipeline. All public surfaces
@@ -1146,12 +1153,248 @@ fn stem_variants(path: &str) -> Vec<String> {
     variants
 }
 
+fn is_simple_rust_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+fn ident_is_generic_spawn_arg(ident: &str) -> bool {
+    let lower = ident.to_ascii_lowercase();
+    lower.len() < 4
+        || matches!(
+            lower.as_str(),
+            "name"
+                | "cmd"
+                | "bin"
+                | "path"
+                | "prog"
+                | "exe"
+                | "tool"
+                | "argv"
+                | "args"
+                | "program"
+                | "command"
+        )
+}
+
+fn looks_like_spawn_sidecar(path: &str) -> bool {
+    let norm = norm_rel_path(path);
+    let ext = std::path::Path::new(&norm)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if matches!(
+        ext,
+        "swift" | "sh" | "bash" | "zsh" | "py" | "js" | "mjs" | "cjs" | ""
+    ) {
+        return true;
+    }
+    ext == "rs" && (norm.contains("/bin/") || norm.starts_with("bin/"))
+}
+
+fn rust_string_literal(arg: &str) -> Option<String> {
+    let s = arg.trim();
+    let s = s.strip_prefix("to_string()").unwrap_or(s);
+    let s = s.trim().trim_end_matches(".to_string()").trim();
+    if let Some(rest) = s.strip_prefix("r#") {
+        let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+        let rest = &rest[hashes..];
+        let rest = rest.strip_prefix('"')?;
+        let close = format!("\"{}", "#".repeat(hashes));
+        let end = rest.find(&close)?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(rest) = s.strip_prefix("r\"") {
+        let end = rest.find('"')?;
+        return Some(rest[..end].to_string());
+    }
+    if let Some(rest) = s.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+                continue;
+            }
+            if c == '"' {
+                return Some(out);
+            }
+            out.push(c);
+        }
+    }
+    None
+}
+
+fn rust_binding_string_consts(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let Some(eq) = trimmed.find('=') else {
+            continue;
+        };
+        let lhs = trimmed[..eq].trim();
+        let rhs = trimmed[eq + 1..].trim().trim_end_matches(';').trim();
+        let name = if let Some(rest) = lhs.strip_prefix("const ") {
+            rest
+        } else if let Some(rest) = lhs.strip_prefix("static ") {
+            rest
+        } else if let Some(rest) = lhs.strip_prefix("let ") {
+            rest
+        } else {
+            continue;
+        };
+        let Some(name) = name
+            .trim()
+            .trim_start_matches("mut ")
+            .split(|c: char| c == ':' || c.is_whitespace())
+            .find(|part| !part.is_empty())
+        else {
+            continue;
+        };
+        if !is_simple_rust_ident(name) {
+            continue;
+        }
+        if let Some(value) = rust_string_literal(rhs) {
+            map.insert(name.to_string(), value);
+        }
+    }
+    map
+}
+
+fn extract_paren_inner(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    if bytes.first().copied() != Some(b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if escape {
+                escape = false;
+                continue;
+            }
+            if b == b'\\' {
+                escape = true;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(s[1..i].trim());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn push_spawn_keys(out: &mut HashSet<String>, raw: &str) {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+    out.insert(raw.to_string());
+    let base = std::path::Path::new(raw)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw);
+    out.insert(base.to_string());
+    let stem = std::path::Path::new(base)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(base);
+    if stem_is_generic(stem) {
+        return;
+    }
+    out.insert(stem.to_string());
+    out.insert(stem.replace('_', "-"));
+    out.insert(stem.replace('-', "_"));
+    out.insert(stem.to_ascii_lowercase());
+}
+
+fn file_spawn_keys(path: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    push_spawn_keys(&mut keys, &norm_rel_path(path));
+    keys
+}
+
+fn spawn_credits_file(spawn_keys: &HashSet<String>, file: &str) -> bool {
+    if spawn_keys.is_empty() {
+        return false;
+    }
+    file_spawn_keys(file).iter().any(|k| spawn_keys.contains(k))
+}
+
+struct CommandNewScan {
+    keys: HashSet<String>,
+    unknown: usize,
+}
+
+fn scan_command_new_spawns(content: &str) -> CommandNewScan {
+    let consts = rust_binding_string_consts(content);
+    let mut keys = HashSet::new();
+    let mut unknown = 0usize;
+    let needle = "Command::new";
+    let mut from = 0usize;
+    while let Some(rel) = content[from..].find(needle) {
+        let abs = from + rel;
+        let line_start = content[..abs].rfind('\n').map(|n| n + 1).unwrap_or(0);
+        let line_prefix = content[line_start..abs].trim_start();
+        if line_prefix.starts_with("//") {
+            from = abs + needle.len();
+            continue;
+        }
+        let after = content[abs + needle.len()..].trim_start();
+        let Some(arg) = extract_paren_inner(after) else {
+            from = abs + needle.len();
+            continue;
+        };
+        let arg = arg.trim().trim_start_matches('&').trim();
+        if let Some(lit) = rust_string_literal(arg) {
+            push_spawn_keys(&mut keys, &lit);
+        } else if is_simple_rust_ident(arg) {
+            if let Some(lit) = consts.get(arg) {
+                push_spawn_keys(&mut keys, lit);
+            } else if ident_is_generic_spawn_arg(arg) {
+                unknown += 1;
+            } else {
+                push_spawn_keys(&mut keys, arg);
+            }
+        } else {
+            unknown += 1;
+        }
+        from = abs + needle.len();
+    }
+    CommandNewScan { keys, unknown }
+}
+
 /// Cross-check dead-export candidates against the literal truth layer and —
 /// when the snapshot carries one — the symbol graph, then apply the
-/// entry-point fence. Evidence degrades confidence and lands in `reason`;
-/// candidates are never silently dropped here.
+/// entry-point fence. Generic evidence degrades confidence into `reason`.
+/// `Command::new` spawn matches are runtime-root credit and are dropped.
 pub fn cross_check_dead_exports(
-    mut candidates: Vec<DeadExport>,
+    candidates: Vec<DeadExport>,
     snapshot: &crate::snapshot::Snapshot,
 ) -> (Vec<DeadExport>, CrossCheckStats) {
     use crate::analyzer::occurrences::{OccurrenceKind, occurrences_in_line, scan_text};
@@ -1222,6 +1465,7 @@ pub fn cross_check_dead_exports(
     }
 
     // --- Pass 2: disk literal scan (raw-byte truth, fills graph blind spots)
+    let mut spawn_keys: HashSet<String> = HashSet::new();
     let root = snapshot
         .metadata
         .roots
@@ -1238,6 +1482,9 @@ pub fn cross_check_dead_exports(
             let Ok(content) = std::fs::read_to_string(&full) else {
                 continue;
             };
+            let spawn = scan_command_new_spawns(&content);
+            spawn_keys.extend(spawn.keys);
+            stats.spawn_unknown += spawn.unknown;
             for sym in &symbols {
                 if !content.contains(sym.as_str()) {
                     continue;
@@ -1321,8 +1568,13 @@ pub fn cross_check_dead_exports(
         false
     };
 
-    // --- Verdict assembly: degrade with evidence, fence entrypoints ---------
-    for candidate in &mut candidates {
+    // --- Verdict assembly: Command::new runtime-root credit, then degrade ----
+    let mut kept: Vec<DeadExport> = Vec::with_capacity(candidates.len());
+    for mut candidate in candidates {
+        if spawn_credits_file(&spawn_keys, &candidate.file) {
+            stats.spawn_credited += 1;
+            continue;
+        }
         let cand_norm = norm_rel_path(&candidate.file);
         let outside = |hits: Option<&Vec<(String, usize)>>| -> Vec<(String, usize)> {
             hits.map(|v| {
@@ -1410,7 +1662,12 @@ pub fn cross_check_dead_exports(
             notes.push("not an entrypoint".to_string());
         }
 
-        if degrade && candidate.confidence != "low" {
+        if stats.spawn_unknown > 0 && looks_like_spawn_sidecar(&candidate.file) {
+            candidate.confidence = "unknown".to_string();
+            notes.push(
+                "Command::new argument is not a string literal — spawn target unresolved (not treated as dead)".to_string(),
+            );
+        } else if degrade && candidate.confidence != "low" {
             candidate.confidence = "low".to_string();
         }
         candidate.action = default_dead_action();
@@ -1419,9 +1676,10 @@ pub fn cross_check_dead_exports(
             candidate.reason.trim_end(),
             notes.join("; ")
         );
+        kept.push(candidate);
     }
 
-    (candidates, stats)
+    (kept, stats)
 }
 
 /// Detect shadow exports: same symbol exported by multiple files, but only one is actually used.
@@ -2205,6 +2463,148 @@ mod tests {
         let result = find_dead_exports(&analyses, false, None, DeadFilterConfig::default());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].symbol, "unusedHelper");
+    }
+
+    fn w3_04_write_sidecar_fixture(
+        spawn_src: &str,
+    ) -> (tempfile::TempDir, crate::snapshot::Snapshot) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let sidecar_src = "func runHelperTool() {\n    print(\"sidecar\")\n}\n";
+        let orphan_src = "pub fn unused_orphan() {}\n";
+        std::fs::write(root.join("helper-tool.swift"), sidecar_src).unwrap();
+        std::fs::write(root.join("src/spawn.rs"), spawn_src).unwrap();
+        std::fs::write(root.join("src/orphan.rs"), orphan_src).unwrap();
+
+        let sidecar = crate::analyzer::swift::analyze_swift_file(
+            sidecar_src,
+            "helper-tool.swift".to_string(),
+        );
+        assert!(
+            sidecar.exports.iter().any(|e| e.name == "runHelperTool"),
+            "sidecar fixture must export runHelperTool, got {:?}",
+            sidecar.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        let spawn =
+            crate::analyzer::rust::analyze_rust_file(spawn_src, "src/spawn.rs".to_string(), &[]);
+        let orphan =
+            crate::analyzer::rust::analyze_rust_file(orphan_src, "src/orphan.rs".to_string(), &[]);
+        assert!(
+            orphan.exports.iter().any(|e| e.name == "unused_orphan"),
+            "orphan control must export unused_orphan"
+        );
+
+        let mut snapshot = crate::snapshot::Snapshot::new(vec![root.display().to_string()]);
+        snapshot.files = vec![sidecar, spawn, orphan];
+        (tmp, snapshot)
+    }
+
+    fn w3_04_sidecar_files(dead: &[DeadExport]) -> Vec<&DeadExport> {
+        dead.iter()
+            .filter(|c| c.file.contains("helper-tool"))
+            .collect()
+    }
+
+    /// W3-04: `Command::new("helper-tool")` is a runtime root, not a dead
+    /// candidate. The unused `src/orphan.rs` export stays on the list so the
+    /// credit is spawn-specific, not a blanket drop.
+    #[test]
+    fn w3_04_sidecar_spawn_is_runtime_root() {
+        let spawn_src = r#"use std::process::Command;
+pub fn boot() {
+    let _ = Command::new("helper-tool").spawn();
+}
+"#;
+        let (_tmp, snapshot) = w3_04_write_sidecar_fixture(spawn_src);
+        let truth = compute_dead_truth_with(&snapshot, DeadFilterConfig::default(), false);
+        assert!(
+            w3_04_sidecar_files(&truth.dead).is_empty(),
+            "Command::new(\"helper-tool\") must exclude helper-tool from dead candidates: {:?}",
+            truth.dead
+        );
+        assert!(
+            truth.cross_check.spawn_credited >= 1,
+            "spawn credit must fire: {:?}",
+            truth.cross_check
+        );
+        assert!(
+            truth
+                .dead
+                .iter()
+                .any(|c| c.file.contains("orphan.rs") && c.symbol == "unused_orphan"),
+            "non-sidecar unused pub must remain a dead candidate: {:?}",
+            truth.dead
+        );
+    }
+
+    /// W3-04: `const HELPER: &str = "helper-tool"; Command::new(HELPER)`
+    /// resolves the binding and credits the sidecar the same as a literal.
+    #[test]
+    fn w3_04_sidecar_spawn_const_string_is_runtime_root() {
+        let spawn_src = r#"use std::process::Command;
+const HELPER: &str = "helper-tool";
+pub fn boot() {
+    let _ = Command::new(HELPER).spawn();
+}
+"#;
+        let (_tmp, snapshot) = w3_04_write_sidecar_fixture(spawn_src);
+        let truth = compute_dead_truth_with(&snapshot, DeadFilterConfig::default(), false);
+        assert!(
+            w3_04_sidecar_files(&truth.dead).is_empty(),
+            "const-resolved Command::new(HELPER) must exclude helper-tool: {:?}",
+            truth.dead
+        );
+        assert!(
+            truth.cross_check.spawn_credited >= 1,
+            "const spawn credit must fire: {:?}",
+            truth.cross_check
+        );
+    }
+
+    /// W3-04: opaque `Command::new(env/format)` is not a false-dead high hit.
+    /// Sidecar-shaped leftovers are `unknown` with an explicit reason.
+    #[test]
+    fn w3_04_sidecar_spawn_opaque_arg_is_unknown() {
+        let spawn_src = r#"use std::process::Command;
+pub fn boot() {
+    let _ = Command::new(std::env::var("HELPER").unwrap()).spawn();
+}
+"#;
+        let (_tmp, snapshot) = w3_04_write_sidecar_fixture(spawn_src);
+        let truth = compute_dead_truth_with(&snapshot, DeadFilterConfig::default(), false);
+        assert!(
+            truth.cross_check.spawn_unknown >= 1,
+            "opaque Command::new arg must count as unknown: {:?}",
+            truth.cross_check
+        );
+        let sidecar = w3_04_sidecar_files(&truth.dead);
+        assert!(
+            !sidecar.is_empty(),
+            "unresolved spawn must not silently drop the sidecar: {:?}",
+            truth.dead
+        );
+        for c in &sidecar {
+            assert_eq!(
+                c.confidence, "unknown",
+                "opaque spawn must not be false-dead high: {c:?}"
+            );
+            assert!(
+                c.reason.contains("spawn target unresolved"),
+                "unknown sidecar must name the reason: {}",
+                c.reason
+            );
+        }
+        assert!(
+            truth
+                .dead
+                .iter()
+                .any(|c| c.file.contains("orphan.rs")
+                    && c.symbol == "unused_orphan"
+                    && c.confidence != "unknown"),
+            "non-sidecar unused pub must not inherit spawn-unknown: {:?}",
+            truth.dead
+        );
     }
 
     #[test]
