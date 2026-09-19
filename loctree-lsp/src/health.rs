@@ -249,7 +249,9 @@ fn recommend_actions(report: &HealthReport, stale: bool, score: Option<u8>) -> V
         actions.push("Audit twin groups (`loct twins --json`)".into());
     }
     match score {
-        None => actions.push("Scan files before treating health as HEALTHY — no files analyzed".into()),
+        None => {
+            actions.push("Scan files before treating health as HEALTHY — no files analyzed".into())
+        }
         Some(value) if value < 50 => {
             actions.push("Block destructive refactors until score ≥ 50".into());
         }

@@ -1,0 +1,11 @@
+name: "loctree-codeql-config"
+
+# rust/cleartext-logging fires on virtually every stdout/stderr print of
+# analysis results — which is the product of a CLI analysis tool. The rule
+# produced 30+ open alerts repo-wide with zero actionable signal (aggregate
+# counts, file paths, health scores; no credentials). Excluded repo-wide;
+# revisit if loctree grows a network-facing surface where request data flows
+# into logs.
+query-filters:
+  - exclude:
+      id: rust/cleartext-logging

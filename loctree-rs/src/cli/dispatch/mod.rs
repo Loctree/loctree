@@ -642,7 +642,10 @@ pub fn dispatch_command(parsed_cmd: &ParsedCommand) -> DispatchResult {
                 println!("{}", text);
                 return DispatchResult::Exit(0);
             }
-            eprintln!("{}", crate::cli::parser::format_unknown_help_topic(&cmd_name));
+            eprintln!(
+                "{}",
+                crate::cli::parser::format_unknown_help_topic(&cmd_name)
+            );
             return DispatchResult::Exit(1);
         }
         Command::Help(_) => {

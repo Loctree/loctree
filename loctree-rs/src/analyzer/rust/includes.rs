@@ -310,11 +310,7 @@ pub(crate) fn extract_rust_includes(content: &str, relative: &str) -> Vec<RustIn
             if path_str == "build.rs" || path_str == "./build.rs" {
                 continue;
             }
-            let line = content[..m.start()]
-                .chars()
-                .filter(|&c| c == '\n')
-                .count()
-                + 1;
+            let line = content[..m.start()].chars().filter(|&c| c == '\n').count() + 1;
             let is_dynamic = path_str.contains('{') || path_str.contains('}');
             if seen.insert((path_str.to_string(), is_dynamic)) {
                 includes.push(RustInclude {
@@ -331,11 +327,7 @@ pub(crate) fn extract_rust_includes(content: &str, relative: &str) -> Vec<RustIn
             let m = caps.get(0).unwrap();
             let after_paren = m.end() - 1; // start of '('
             if let Some((inner, _delim)) = extract_macro_call_arg(content, after_paren) {
-                let line = content[..m.start()]
-                    .chars()
-                    .filter(|&c| c == '\n')
-                    .count()
-                    + 1;
+                let line = content[..m.start()].chars().filter(|&c| c == '\n').count() + 1;
                 let first_arg = extract_first_comma_arg(inner).trim();
                 if first_arg.is_empty() {
                     continue;

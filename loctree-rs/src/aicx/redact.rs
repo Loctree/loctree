@@ -52,9 +52,11 @@ static HOME_UNIX: Lazy<Regex> =
 static HOME_WIN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)[A-Z]:\\Users\\[^\s\\/]+").expect("windows home regex"));
 /// Long base64 that is *not* a hex hash: requires `+`, `/`, or `=` so overlay
-/// revision hex blobs (`sr1:` + 64 hex) survive.
+/// revision hex blobs (`sr1:` + 64 hex) survive. No trailing `\b`: padding
+/// (`=`) is a non-word char, so a boundary after it never matches at EOS or
+/// before whitespace and padded values would slip through.
 static LONG_B64: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b[A-Za-z0-9+/]{40,}={1,2}\b|[A-Za-z0-9+/]{32,}[+/=][A-Za-z0-9+/=]{8,}\b")
+    Regex::new(r"\b[A-Za-z0-9+/]{40,}={1,2}|[A-Za-z0-9+/]{32,}[+/=][A-Za-z0-9+/=]{8,}")
         .expect("base64 regex")
 });
 
@@ -126,6 +128,15 @@ mod tests {
         let result = redact_secrets(&hex);
         assert_eq!(result.count, 0, "{}", result.text);
         assert_eq!(result.text, hex);
+    }
+
+    #[test]
+    fn padded_base64_at_string_end_is_redacted() {
+        // `=` followed by EOS is a non-word/non-word boundary, so a trailing
+        // `\b` in the pattern could never match — padded payloads slipped through.
+        let raw = "token VGhpc0lzQVNlY3JldFBheWxvYWRXaXRoQmFzZTY0==";
+        let result = redact_secrets(raw);
+        assert!(!result.text.contains("VGhpc0lz"), "{}", result.text);
     }
 
     #[test]

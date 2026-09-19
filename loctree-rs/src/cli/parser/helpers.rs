@@ -166,9 +166,7 @@ pub(crate) fn format_unknown_analysis_option(command: &str, arg: &str, accepted:
         "--markdown" | "--md" => format!(
             "Unknown option '{arg}' for '{command}' command. did you mean `loct context --markdown`, or global `--json`? Accepted: {accepted}."
         ),
-        _ => format!(
-            "Unknown option '{arg}' for '{command}' command. Accepted: {accepted}."
-        ),
+        _ => format!("Unknown option '{arg}' for '{command}' command. Accepted: {accepted}."),
     }
 }
 

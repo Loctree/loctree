@@ -891,13 +891,43 @@ fn ensure_snapshot(root: &Path, parsed: &ParsedArgs) -> io::Result<bool> {
 
 /// Build a synthetic snapshot leaf for an untracked file that exists on disk.
 /// Used by `--include-untracked` so `slice` can bind without a full rescan.
-fn synthetic_untracked_slice_leaf(root: &Path, target: &str) -> Option<FileAnalysis> {
+/// The overlay reads straight from the filesystem, so it must re-apply the
+/// gates a scan would: containment under the repo root plus the ignore rules
+/// (`.loctignore` patterns, then the gitignore verdict) — otherwise ignored
+/// secrets (`.env`, keys) could be pulled into the slice.
+fn synthetic_untracked_slice_leaf(
+    root: &Path,
+    target: &str,
+    ignore_matchers: &crate::fs_utils::IgnoreMatchers,
+    git_checker: Option<&crate::fs_utils::GitIgnoreChecker>,
+) -> Option<FileAnalysis> {
     let candidate = match assemble_slice_target_path(target) {
         Ok(raw) if raw.is_absolute() => raw,
         Ok(raw) => root.join(raw),
         Err(_) => return None,
     };
     if !candidate.is_file() {
+        return None;
+    }
+    // Containment: absolute targets or `..` segments must not read files
+    // outside the repo root.
+    crate::fs_utils::SanitizedPath::within(root, &candidate).ok()?;
+    // Ignore gates (mirror of `should_ignore` in fs_utils).
+    if ignore_matchers
+        .ignore_paths
+        .iter()
+        .any(|ignored| candidate.starts_with(ignored))
+    {
+        return None;
+    }
+    if let Some(globs) = &ignore_matchers.ignore_globs
+        && globs.is_match(&candidate)
+    {
+        return None;
+    }
+    if let Some(checker) = git_checker
+        && checker.is_ignored(&candidate)
+    {
         return None;
     }
     let rel = candidate
@@ -1007,11 +1037,24 @@ pub fn run_slice(
         max_depth: 2,
     };
 
-    if parsed.include_untracked
-        && HolographicSlice::from_path(&snapshot, target, &config).is_none()
-        && let Some(leaf) = synthetic_untracked_slice_leaf(&effective_root, target)
+    if parsed.include_untracked && HolographicSlice::from_path(&snapshot, target, &config).is_none()
     {
-        snapshot.files.push(leaf);
+        // The untracked overlay bypasses the scan pipeline, so re-apply the
+        // scan-side rules here: .loctignore + .gitignore (and containment
+        // under the root inside synthetic_untracked_slice_leaf).
+        let mut ignore_patterns = parsed.ignore_patterns.clone();
+        ignore_patterns.extend(crate::fs_utils::load_loctreeignore(&effective_root));
+        let ignore_matchers =
+            crate::fs_utils::build_ignore_matchers(&ignore_patterns, &effective_root);
+        let git_checker = crate::fs_utils::GitIgnoreChecker::new(&effective_root);
+        if let Some(leaf) = synthetic_untracked_slice_leaf(
+            &effective_root,
+            target,
+            &ignore_matchers,
+            git_checker.as_ref(),
+        ) {
+            snapshot.files.push(leaf);
+        }
     }
 
     let slice = match HolographicSlice::from_path(&snapshot, target, &config) {

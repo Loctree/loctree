@@ -4882,7 +4882,10 @@ class AgentConstraints {\n\
             "banner_marker",
             ScanOptions::default(),
         );
-        assert_eq!(default_res.total, 3, "default scan should include all 3 hits");
+        assert_eq!(
+            default_res.total, 3,
+            "default scan should include all 3 hits"
+        );
         assert_eq!(default_res.files_matched, 3);
         assert_eq!(default_res.generated_skipped, None);
         assert!(

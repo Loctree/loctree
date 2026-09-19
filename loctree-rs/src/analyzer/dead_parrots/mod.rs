@@ -2605,12 +2605,9 @@ pub fn boot() {
             );
         }
         assert!(
-            truth
-                .dead
-                .iter()
-                .any(|c| c.file.contains("orphan.rs")
-                    && c.symbol == "unused_orphan"
-                    && c.confidence != "unknown"),
+            truth.dead.iter().any(|c| c.file.contains("orphan.rs")
+                && c.symbol == "unused_orphan"
+                && c.confidence != "unknown"),
             "non-sidecar unused pub must not inherit spawn-unknown: {:?}",
             truth.dead
         );

@@ -733,9 +733,7 @@ fn scan_single_root(
                                 .and_then(|r| r.resolve(&imp.source, options.extensions.as_ref()))
                         }
                     }
-                    "rs" => {
-                        resolve_rust_import(&imp.source, &file, root_path, root_path)
-                    }
+                    "rs" => resolve_rust_import(&imp.source, &file, root_path, root_path),
                     _ => None,
                 });
                 if let Some(target) = resolved {

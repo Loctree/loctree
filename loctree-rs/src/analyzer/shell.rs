@@ -437,7 +437,9 @@ fn extract_variable_assignments(content: &str) -> HashMap<String, String> {
             let name = caps.get(1).map(|m| m.as_str().to_string());
             let raw_val = caps.get(2).map(|m| m.as_str().trim());
             if let (Some(name), Some(raw_val)) = (name, raw_val) {
-                let val = if (raw_val.starts_with('"') && raw_val.ends_with('"') && raw_val.len() >= 2)
+                let val = if (raw_val.starts_with('"')
+                    && raw_val.ends_with('"')
+                    && raw_val.len() >= 2)
                     || (raw_val.starts_with('\'') && raw_val.ends_with('\'') && raw_val.len() >= 2)
                 {
                     &raw_val[1..raw_val.len() - 1]
@@ -514,9 +516,13 @@ pub fn resolve_shell_source(spec: &str, file_path: &Path, root: &Path) -> Option
         return None;
     }
 
-    let parent = file_path
-        .parent()
-        .map(|p| if p.as_os_str().is_empty() { Path::new(".") } else { p });
+    let parent = file_path.parent().map(|p| {
+        if p.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            p
+        }
+    });
 
     // 1. Direct path check if spec contains no variables
     if !clean_spec.contains('$') {
@@ -573,7 +579,11 @@ pub fn resolve_shell_source(spec: &str, file_path: &Path, root: &Path) -> Option
     }
 
     // 3. Basename fallback
-    let candidate_str = if !expanded.is_empty() { &expanded } else { clean_spec };
+    let candidate_str = if !expanded.is_empty() {
+        &expanded
+    } else {
+        clean_spec
+    };
     let target_basename = Path::new(candidate_str)
         .file_name()
         .and_then(|s| s.to_str())
@@ -878,8 +888,15 @@ foo
         assert_eq!(analysis.imports.len(), 1);
         assert_eq!(analysis.imports[0].source, "$LIB_DIR/foo.sh");
         assert!(matches!(analysis.imports[0].kind, ImportKind::Dynamic));
-        assert_eq!(analysis.imports[0].resolution, ImportResolutionKind::Dynamic);
-        assert!(analysis.dynamic_imports.contains(&"$LIB_DIR/foo.sh".to_string()));
+        assert_eq!(
+            analysis.imports[0].resolution,
+            ImportResolutionKind::Dynamic
+        );
+        assert!(
+            analysis
+                .dynamic_imports
+                .contains(&"$LIB_DIR/foo.sh".to_string())
+        );
 
         // 2. Verify variable expansion in resolve_shell_source
         let resolved = resolve_shell_source("$LIB_DIR/foo.sh", &main_sh, root);
@@ -893,7 +910,10 @@ foo
         std::fs::write(&bar_path, "bar() { echo bar; }\n").expect("write bar.sh");
 
         let resolved_bar = resolve_shell_source("$UNKNOWN_VAR/bar.sh", &main_sh, root);
-        assert!(resolved_bar.is_some(), "expected unambiguous bar.sh to resolve via basename fallback");
+        assert!(
+            resolved_bar.is_some(),
+            "expected unambiguous bar.sh to resolve via basename fallback"
+        );
         assert_eq!(resolved_bar.unwrap(), "unique_dir/bar.sh");
 
         // 4. Verify ambiguous basename fallback fails closed without edge

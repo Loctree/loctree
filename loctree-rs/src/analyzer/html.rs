@@ -175,9 +175,10 @@ fn cargo_toml_has_tauri(cargo_path: &Path) -> bool {
         return false;
     };
     if let Ok(toml_val) = toml::from_str::<toml::Value>(&content)
-        && toml_contains_tauri_dependency(&toml_val) {
-            return true;
-        }
+        && toml_contains_tauri_dependency(&toml_val)
+    {
+        return true;
+    }
     // Fallback line check in case of custom or invalid TOML syntax
     content.lines().any(|line| {
         let trimmed = line.trim();
@@ -199,23 +200,26 @@ fn toml_contains_tauri_dependency(val: &toml::Value) -> bool {
     };
     for dep_key in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(deps) = table.get(dep_key).and_then(|v| v.as_table())
-            && (deps.contains_key("tauri") || deps.contains_key("tauri-build")) {
-                return true;
-            }
+            && (deps.contains_key("tauri") || deps.contains_key("tauri-build"))
+        {
+            return true;
+        }
     }
     if let Some(ws) = table.get("workspace").and_then(|v| v.as_table())
         && let Some(deps) = ws.get("dependencies").and_then(|v| v.as_table())
-            && (deps.contains_key("tauri") || deps.contains_key("tauri-build")) {
-                return true;
-            }
+        && (deps.contains_key("tauri") || deps.contains_key("tauri-build"))
+    {
+        return true;
+    }
     if let Some(targets) = table.get("target").and_then(|v| v.as_table()) {
         for (_target_name, target_val) in targets {
             if let Some(target_table) = target_val.as_table() {
                 for dep_key in ["dependencies", "dev-dependencies", "build-dependencies"] {
                     if let Some(deps) = target_table.get(dep_key).and_then(|v| v.as_table())
-                        && (deps.contains_key("tauri") || deps.contains_key("tauri-build")) {
-                            return true;
-                        }
+                        && (deps.contains_key("tauri") || deps.contains_key("tauri-build"))
+                    {
+                        return true;
+                    }
                 }
             }
         }
@@ -234,9 +238,9 @@ fn package_json_has_tauri(pkg_path: &Path) -> bool {
                 && (deps.contains_key("@tauri-apps/api")
                     || deps.contains_key("@tauri-apps/cli")
                     || deps.keys().any(|k| k.starts_with("@tauri-apps/")))
-                {
-                    return true;
-                }
+            {
+                return true;
+            }
         }
     }
     false

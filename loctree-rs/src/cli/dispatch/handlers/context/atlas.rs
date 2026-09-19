@@ -642,6 +642,8 @@ fn copy_flat_atlas_file(source_dir: &Path, destination_dir: &Path, name: &str) -
 }
 
 fn write_manifest_files(manifest: &ContextAtlasManifest) -> io::Result<()> {
+    // Path derived from the repo-local atlas dir by this module, never user input.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
     let manifest_path = Path::new(&manifest.manifest);
     let dir = manifest_path.parent().ok_or_else(|| {
         io::Error::new(
@@ -651,6 +653,8 @@ fn write_manifest_files(manifest: &ContextAtlasManifest) -> io::Result<()> {
     })?;
     write_atlas_file_atomic(manifest_path, render_manifest(manifest).as_bytes())?;
     write_atlas_file_atomic(
+        // Path derived from the repo-local atlas dir by this module, never user input.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         Path::new(&manifest.manifest_json),
         serde_json::to_string_pretty(manifest).map_err(io::Error::other)?,
     )?;

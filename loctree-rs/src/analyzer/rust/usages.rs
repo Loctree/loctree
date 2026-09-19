@@ -266,7 +266,8 @@ fn strip_rust_visibility(trimmed: &str) -> &str {
 /// Strip a keyword only when it is a whole token (not `async_foo`).
 fn strip_leading_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
     let rest = s.strip_prefix(word)?;
-    if rest.is_empty() || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '"' || c == '(')
+    if rest.is_empty()
+        || rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '"' || c == '(')
     {
         Some(rest.trim_start())
     } else {
@@ -274,16 +275,49 @@ fn strip_leading_word<'a>(s: &'a str, word: &str) -> Option<&'a str> {
     }
 }
 
-/// Strip `async` / `const` / `unsafe` / `extern "ABI"` / `default` prefixes.
+/// Strip `async` / `unsafe` / `extern "ABI"` / `default` prefixes. `const` is
+/// stripped only in `const fn` position: a bare `const NAME: Ty = …` is an item
+/// definition, and dropping the keyword would hide that line and let the
+/// declaration count as an ordinary use (a self-call keeping the const alive).
 fn strip_rust_fn_qualifiers(mut s: &str) -> &str {
     loop {
         if let Some(rest) = strip_leading_word(s, "async")
-            .or_else(|| strip_leading_word(s, "const"))
             .or_else(|| strip_leading_word(s, "unsafe"))
             .or_else(|| strip_leading_word(s, "default"))
         {
             s = rest;
             continue;
+        }
+        if let Some(rest) = strip_leading_word(s, "const") {
+            // Keep `const` unless the remaining qualifiers land on `fn`
+            // (`const fn`, `const unsafe fn`, `const extern "C" fn`).
+            let mut probe = rest;
+            loop {
+                if let Some(r) = strip_leading_word(probe, "unsafe")
+                    .or_else(|| strip_leading_word(probe, "async"))
+                {
+                    probe = r;
+                    continue;
+                }
+                if let Some(r) = strip_leading_word(probe, "extern") {
+                    match r
+                        .strip_prefix('"')
+                        .and_then(|q| q.find('"').map(|end| q[end + 1..].trim_start()))
+                    {
+                        Some(after_abi) => {
+                            probe = after_abi;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+                break;
+            }
+            if probe.starts_with("fn ") || probe.starts_with("fn(") {
+                s = rest;
+                continue;
+            }
+            return s;
         }
         if let Some(rest) = strip_leading_word(s, "extern") {
             s = if let Some(quoted) = rest.strip_prefix('"') {

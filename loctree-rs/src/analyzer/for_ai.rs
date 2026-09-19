@@ -1862,7 +1862,8 @@ mod tests {
             summary.coverage_warning
         );
         assert_eq!(
-            summary.health_score, Some(100),
+            summary.health_score,
+            Some(100),
             "no issues + code language present → full health"
         );
         assert!(
@@ -1987,7 +1988,11 @@ mod tests {
         let clean = compute_summary(&[clean_section], &[], None);
         let lazy = compute_summary(&[lazy_section], &[], None);
 
-        assert_eq!(clean.health_score, Some(100), "no cycles means no SMELL penalty");
+        assert_eq!(
+            clean.health_score,
+            Some(100),
+            "no cycles means no SMELL penalty"
+        );
         assert!(
             lazy.health_score < clean.health_score,
             "lazy cycle must lower health (was {:?}, clean {:?})",
@@ -2284,7 +2289,8 @@ mod tests {
         // missing_handlers is now excluded from health score (for consistency with findings.rs)
         // With empty analyses and only missing_handlers, health should be 100
         assert_eq!(
-            summary.health_score, Some(100),
+            summary.health_score,
+            Some(100),
             "Expected health = 100 since missing_handlers is excluded, got {:?}",
             summary.health_score
         );

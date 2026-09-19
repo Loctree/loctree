@@ -4328,9 +4328,11 @@ impl ServerHandler for LoctreeServer {
     fn get_info(&self) -> ServerInfo {
         touch_activity();
         let mut capabilities = rmcp::model::ServerCapabilities::default();
-        capabilities.tools = Some(rmcp::model::ToolsCapability {
-            list_changed: Some(true),
-        });
+        // rmcp 2.x marks ToolsCapability non-exhaustive: build via Default and
+        // mutate the pub fields, struct expressions are refused (E0639).
+        let mut tools = rmcp::model::ToolsCapability::default();
+        tools.list_changed = Some(true);
+        capabilities.tools = Some(tools);
 
         ServerInfo::new(capabilities)
             .with_server_info(
@@ -4409,7 +4411,7 @@ async fn run_idle_watchdog(idle_duration: Duration) {
 async fn wait_for_shutdown_signal() {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(e) => {
@@ -4465,27 +4467,24 @@ impl SingleInstanceLock {
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .with_context(|| {
-                format!("could not open mcp lock file at {}", lock_path.display())
-            })?;
+            .with_context(|| format!("could not open mcp lock file at {}", lock_path.display()))?;
 
-        if !file.try_lock_exclusive().with_context(|| {
-            format!("could not lock mcp lock file at {}", lock_path.display())
-        })? {
+        if !file
+            .try_lock_exclusive()
+            .with_context(|| format!("could not lock mcp lock file at {}", lock_path.display()))?
+        {
             // Lock is held by an active process!
-            let pid_str = std::fs::read_to_string(&pid_path)
-                .ok()
-                .or_else(|| {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let mut content = String::new();
-                    let _ = file.seek(SeekFrom::Start(0));
-                    let _ = file.read_to_string(&mut content);
-                    if content.trim().is_empty() {
-                        None
-                    } else {
-                        Some(content)
-                    }
-                });
+            let pid_str = std::fs::read_to_string(&pid_path).ok().or_else(|| {
+                use std::io::{Read, Seek, SeekFrom};
+                let mut content = String::new();
+                let _ = file.seek(SeekFrom::Start(0));
+                let _ = file.read_to_string(&mut content);
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
+            });
 
             let pid_display = pid_str
                 .as_deref()
@@ -4506,10 +4505,7 @@ impl SingleInstanceLock {
         let pid_payload = format!("{}\n", my_pid);
 
         if let Err(e) = std::fs::write(&pid_path, &pid_payload) {
-            warn!(
-                "failed to write pidfile at {}: {e}",
-                pid_path.display()
-            );
+            warn!("failed to write pidfile at {}: {e}", pid_path.display());
         }
 
         use std::io::{Seek, SeekFrom, Write};
@@ -4769,7 +4765,10 @@ mod tests {
         let lock2_err = SingleInstanceLock::acquire(project).unwrap_err();
         let err_msg = lock2_err.to_string();
         assert!(err_msg.contains("already running"), "{err_msg}");
-        assert!(err_msg.contains(&std::process::id().to_string()), "{err_msg}");
+        assert!(
+            err_msg.contains(&std::process::id().to_string()),
+            "{err_msg}"
+        );
 
         // Distinct project can acquire lock concurrently
         let temp2 = TempDir::new().expect("tempdir2");

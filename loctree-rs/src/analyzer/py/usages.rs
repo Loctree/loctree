@@ -248,10 +248,12 @@ pub(super) fn extract_python_function_calls(content: &str, local_uses: &mut Vec<
                 }
                 let is_def = prev >= 3
                     && &bytes[prev - 3..prev] == b"def"
-                    && (prev == 3 || !bytes[prev - 4].is_ascii_alphanumeric() && bytes[prev - 4] != b'_');
+                    && (prev == 3
+                        || !bytes[prev - 4].is_ascii_alphanumeric() && bytes[prev - 4] != b'_');
                 let is_class = prev >= 5
                     && &bytes[prev - 5..prev] == b"class"
-                    && (prev == 5 || !bytes[prev - 6].is_ascii_alphanumeric() && bytes[prev - 6] != b'_');
+                    && (prev == 5
+                        || !bytes[prev - 6].is_ascii_alphanumeric() && bytes[prev - 6] != b'_');
 
                 if !is_def && !is_class {
                     local_uses.push(ident);

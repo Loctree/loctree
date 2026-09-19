@@ -722,11 +722,7 @@ pub(crate) fn protocol_witness_credits(
                 && visiting_protos.insert(sym.context.clone())
             {
                 let mut visiting = HashSet::new();
-                methods.extend(requirement_names_for(
-                    &sym.context,
-                    &index,
-                    &mut visiting,
-                ));
+                methods.extend(requirement_names_for(&sym.context, &index, &mut visiting));
             }
         }
         if methods.is_empty() {

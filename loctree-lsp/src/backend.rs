@@ -1195,7 +1195,14 @@ impl Backend {
                             client
                                 .send_notification::<LoctreeScanProgress>(progress)
                                 .await;
-                            continue;
+                            // Do NOT drop the batch: edits that arrived during the
+                            // backoff window still need their scan. Wait out the
+                            // remaining delay — the event channel is unbounded, so
+                            // new edits queue up for the next debounce round — then
+                            // fall through to the rescan instead of `continue`.
+                            if let Some(remaining) = rescan_backoff.remaining(now) {
+                                tokio::time::sleep(remaining).await;
+                            }
                         }
 
                         client

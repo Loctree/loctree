@@ -564,19 +564,11 @@ fn detect_pyproject_script_entrypoints(
         let mod_part = mod_part.trim();
 
         // 1. Try resolving using resolve_python_import
-        let (resolved, _) = resolve_python_import(
-            mod_part,
-            path,
-            root,
-            py_roots,
-            extensions,
-            stdlib,
-        );
+        let (resolved, _) =
+            resolve_python_import(mod_part, path, root, py_roots, extensions, stdlib);
         let resolved_matches = resolved.as_ref().is_some_and(|r| {
             let r_norm = r.replace('\\', "/");
-            r_norm == norm_rel
-                || r_norm.ends_with(&norm_rel)
-                || norm_rel.ends_with(&r_norm)
+            r_norm == norm_rel || r_norm.ends_with(&norm_rel) || norm_rel.ends_with(&r_norm)
         });
 
         // 2. Direct string fallback
@@ -1028,17 +1020,14 @@ pub(crate) fn analyze_py_file(
     // Process module-level __getattr__ lazy re-exports
     let lazy_reexports = extract_getattr_lazy_reexports(content);
     for lazy in lazy_reexports {
-        let (resolved, resolution) = resolve_python_import(
-            &lazy.module,
-            path,
-            root,
-            py_roots,
-            extensions,
-            stdlib,
-        );
+        let (resolved, resolution) =
+            resolve_python_import(&lazy.module, path, root, py_roots, extensions, stdlib);
 
         // 1. Re-export entry (credits original symbol in target module as used)
-        let existing_re = analysis.reexports.iter_mut().find(|r| r.source == lazy.module);
+        let existing_re = analysis
+            .reexports
+            .iter_mut()
+            .find(|r| r.source == lazy.module);
         if let Some(r) = existing_re {
             match &mut r.kind {
                 ReexportKind::Named(pairs) => {
@@ -1071,7 +1060,10 @@ pub(crate) fn analyze_py_file(
         }
 
         // 3. Lazy import entry
-        let existing_imp = analysis.imports.iter_mut().find(|i| i.source == lazy.module);
+        let existing_imp = analysis
+            .imports
+            .iter_mut()
+            .find(|i| i.source == lazy.module);
         if let Some(imp) = existing_imp {
             imp.is_lazy = true;
             if !imp.symbols.iter().any(|s| s.name == lazy.symbol) {
@@ -3073,7 +3065,10 @@ def genuinely_dead():
 
         assert!(
             mod_analysis.entry_points.contains(&"script".to_string())
-                || mod_analysis.entry_points.iter().any(|ep| ep.starts_with("script")),
+                || mod_analysis
+                    .entry_points
+                    .iter()
+                    .any(|ep| ep.starts_with("script")),
             "expected script entry point in mod.py, got: {:?}",
             mod_analysis.entry_points
         );

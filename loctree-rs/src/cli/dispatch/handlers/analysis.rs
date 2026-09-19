@@ -440,7 +440,8 @@ pub fn handle_dead_command(opts: &DeadOptions, global: &GlobalOptions) -> Dispat
         if let Some(filter) = &opts.path_filter {
             s.finish_success(&format!(
                 "Found {} dead export(s) in {}",
-                dead_exports.len(), filter
+                dead_exports.len(),
+                filter
             ));
         } else {
             s.finish_success(&format!("Found {} dead export(s)", dead_exports.len()));
@@ -457,7 +458,11 @@ pub fn handle_dead_command(opts: &DeadOptions, global: &GlobalOptions) -> Dispat
     if !global.json
         && let Some(filter) = &opts.path_filter
     {
-        println!("Coverage: path filter '{}' ({} matching)", filter, dead_exports.len());
+        println!(
+            "Coverage: path filter '{}' ({} matching)",
+            filter,
+            dead_exports.len()
+        );
     }
 
     print_dead_exports(
@@ -1762,10 +1767,9 @@ pub fn handle_focus_command(opts: &FocusOptions, global: &GlobalOptions) -> Disp
         } else {
             rel_str.to_string()
         }
-    } else if let (Ok(canon_target), Ok(canon_root)) = (
-        Path::new(&opts.target).canonicalize(),
-        root.canonicalize(),
-    ) {
+    } else if let (Ok(canon_target), Ok(canon_root)) =
+        (Path::new(&opts.target).canonicalize(), root.canonicalize())
+    {
         if canon_target == canon_root {
             ".".to_string()
         } else if let Ok(rel) = canon_target.strip_prefix(&canon_root) {
