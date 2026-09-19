@@ -11,6 +11,42 @@ use crate::snapshot::Snapshot;
 
 const SELECTOR_KINDS: [&str; 4] = ["path", "tag", "import", "reach"];
 
+/// How `--scope` clauses combine after each value is expanded.
+///
+/// Repeated `--scope` flags default to intersection (`All` / AND). Pass
+/// [`ScopeMode::Any`] (`--scope-mode any`) for a union. A comma-joined
+/// value such as `path:a,path:b` is always a union of those selectors,
+/// even under `All`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeMode {
+    /// Intersection: a file must match every `--scope` clause (default).
+    #[default]
+    All,
+    /// Union: a file matching any `--scope` clause is in scope.
+    Any,
+}
+
+impl ScopeMode {
+    /// Parse a CLI `--scope-mode` token. Allowed: `all`, `any`.
+    pub fn parse_cli(value: &str) -> Result<Self, String> {
+        match value {
+            "all" => Ok(Self::All),
+            "any" => Ok(Self::Any),
+            other => Err(format!(
+                "unknown --scope-mode '{other}'. Allowed values: all, any"
+            )),
+        }
+    }
+
+    fn fingerprint_token(self) -> &'static [u8] {
+        match self {
+            Self::All => b"all",
+            Self::Any => b"any",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScopeReport {
     pub selectors: Vec<String>,
@@ -74,6 +110,10 @@ pub enum ScopeError {
     ScopesConfigInvalid(toml::de::Error),
     ScopesConfigRead(std::io::Error),
     SymbolNotFound(String),
+    UnknownSelectorKind {
+        kind: String,
+        selector: String,
+    },
 }
 
 impl std::fmt::Display for ScopeError {
@@ -137,6 +177,11 @@ impl std::fmt::Display for ScopeError {
             Self::SymbolNotFound(symbol) => write!(
                 f,
                 "symbol not found in dispatch graph: '{symbol}'. Run `loct find --mode where-symbol <name>` to verify."
+            ),
+            Self::UnknownSelectorKind { kind, selector } => write!(
+                f,
+                "unknown --scope selector kind '{kind}' in '{selector}'. Allowed kinds: {}",
+                allowed_selector_kinds()
             ),
         }
     }
@@ -213,8 +258,18 @@ pub fn resolve_scope(
     project_root: &Path,
     snapshot: &Snapshot,
 ) -> Result<ResolvedScope, ScopeError> {
+    resolve_scope_with_mode(raw, project_root, snapshot, ScopeMode::All)
+}
+
+/// Resolve `--scope` selectors with an explicit combination mode.
+pub fn resolve_scope_with_mode(
+    raw: &[String],
+    project_root: &Path,
+    snapshot: &Snapshot,
+    mode: ScopeMode,
+) -> Result<ResolvedScope, ScopeError> {
     let config = ScopesConfig::load(project_root)?;
-    resolve_scope_with_config(raw, &config, snapshot)
+    resolve_scope_with_config_and_mode(raw, &config, snapshot, mode)
 }
 
 pub fn resolve_scope_with_config(
@@ -222,30 +277,60 @@ pub fn resolve_scope_with_config(
     config: &ScopesConfig,
     snapshot: &Snapshot,
 ) -> Result<ResolvedScope, ScopeError> {
+    resolve_scope_with_config_and_mode(raw, config, snapshot, ScopeMode::All)
+}
+
+/// Resolve selectors against `config` using `mode` to combine `--scope` clauses.
+///
+/// Shape: each `--scope` value is a clause. Comma-joined selectors inside one
+/// value are a union of AND-groups (a named scope still ANDs its members).
+/// Clauses then combine with [`ScopeMode`]: `All` intersects, `Any` unions.
+pub fn resolve_scope_with_config_and_mode(
+    raw: &[String],
+    config: &ScopesConfig,
+    snapshot: &Snapshot,
+    mode: ScopeMode,
+) -> Result<ResolvedScope, ScopeError> {
+    // clause = OR of groups; group = AND of selectors (named-scope expansion).
+    let mut clauses: Vec<Vec<Vec<Selector>>> = Vec::new();
     let mut expanded = Vec::new();
     let mut named = Vec::new();
     for value in raw {
-        expand_selector_value(value, config, &mut expanded, &mut named)?;
+        let pieces = split_union_selectors(value);
+        let pieces = if pieces.is_empty() {
+            vec![value.to_string()]
+        } else {
+            pieces
+        };
+        let mut clause: Vec<Vec<Selector>> = Vec::new();
+        for piece in pieces {
+            let mut piece_expanded = Vec::new();
+            expand_one_selector(&piece, config, &mut piece_expanded, &mut named)?;
+            let mut group = Vec::with_capacity(piece_expanded.len());
+            for token in &piece_expanded {
+                group.push(parse_selector(token, snapshot)?);
+            }
+            expanded.extend(piece_expanded);
+            if !group.is_empty() {
+                clause.push(group);
+            }
+        }
+        if !clause.is_empty() {
+            clauses.push(clause);
+        }
     }
 
-    let mut selectors = Vec::new();
-    for value in &expanded {
-        selectors.push(parse_selector(value, snapshot)?);
-    }
-
-    let selector_match_counts = count_selector_matches(&expanded, &selectors, snapshot);
+    let flat_selectors: Vec<&Selector> = clauses.iter().flatten().flatten().collect();
+    let selector_match_counts = count_selector_matches(&expanded, &flat_selectors, snapshot);
 
     let mut matched = HashSet::new();
     for file in &snapshot.files {
-        if selectors
-            .iter()
-            .all(|selector| selector_matches(selector, &file.path, snapshot))
-        {
+        if file_matches_scope(&clauses, mode, &file.path, snapshot) {
             matched.insert(file.path.clone());
         }
     }
 
-    let fingerprint = fingerprint_selectors(&expanded);
+    let fingerprint = fingerprint_selectors(mode, &expanded);
     let report = ScopeReport {
         selectors: raw.to_vec(),
         matched_files: matched.len(),
@@ -271,16 +356,44 @@ pub fn resolve_scope_with_config(
     Ok(ResolvedScope { report, matched })
 }
 
+fn group_matches(group: &[Selector], path: &str, snapshot: &Snapshot) -> bool {
+    group
+        .iter()
+        .all(|selector| selector_matches(selector, path, snapshot))
+}
+
+fn clause_matches(clause: &[Vec<Selector>], path: &str, snapshot: &Snapshot) -> bool {
+    clause
+        .iter()
+        .any(|group| group_matches(group, path, snapshot))
+}
+
+fn file_matches_scope(
+    clauses: &[Vec<Vec<Selector>>],
+    mode: ScopeMode,
+    path: &str,
+    snapshot: &Snapshot,
+) -> bool {
+    match mode {
+        ScopeMode::All => clauses
+            .iter()
+            .all(|clause| clause_matches(clause, path, snapshot)),
+        ScopeMode::Any => clauses
+            .iter()
+            .any(|clause| clause_matches(clause, path, snapshot)),
+    }
+}
+
 fn count_selector_matches(
     raw: &[String],
-    selectors: &[Selector],
+    selectors: &[&Selector],
     snapshot: &Snapshot,
 ) -> Vec<SelectorMatchCount> {
     if selectors.len() <= 1 {
         return Vec::new();
     }
     raw.iter()
-        .zip(selectors.iter())
+        .zip(selectors.iter().copied())
         .map(|(selector, parsed)| SelectorMatchCount {
             selector: selector.clone(),
             matched_files: snapshot
@@ -292,12 +405,22 @@ fn count_selector_matches(
         .collect()
 }
 
-fn expand_selector_value(
+fn expand_one_selector(
     value: &str,
     config: &ScopesConfig,
     out: &mut Vec<String>,
     named: &mut Vec<String>,
 ) -> Result<(), ScopeError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    if let Some(kind) = unknown_selector_kind(value) {
+        return Err(ScopeError::UnknownSelectorKind {
+            kind: kind.to_string(),
+            selector: value.to_string(),
+        });
+    }
     if selector_kind(value).is_some() {
         out.push(value.to_string());
         return Ok(());
@@ -320,6 +443,62 @@ fn expand_selector_value(
     })
 }
 
+fn allowed_selector_kinds() -> String {
+    SELECTOR_KINDS.join(", ")
+}
+
+/// Split `path:a,path:b` into union members. Commas inside a glob body
+/// (`path:src/{a,b}.rs`) stay attached to that selector.
+fn split_union_selectors(value: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b',' {
+            let rest = value[i + 1..].trim_start();
+            if looks_like_selector_start(rest) {
+                let piece = value[start..i].trim();
+                if !piece.is_empty() {
+                    out.push(piece.to_string());
+                }
+                let trimmed_off = value[i + 1..].len() - rest.len();
+                start = i + 1 + trimmed_off;
+                i = start;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let last = value[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
+fn looks_like_selector_start(s: &str) -> bool {
+    let Some((kind, _)) = s.split_once(':') else {
+        return false;
+    };
+    !kind.is_empty() && kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn unknown_selector_kind(value: &str) -> Option<&str> {
+    let (kind, _) = value.split_once(':')?;
+    if kind.is_empty() {
+        return None;
+    }
+    if !kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    if SELECTOR_KINDS.contains(&kind) {
+        None
+    } else {
+        Some(kind)
+    }
+}
+
 fn selector_kind(value: &str) -> Option<&str> {
     let (kind, _) = value.split_once(':')?;
     SELECTOR_KINDS.contains(&kind).then_some(kind)
@@ -334,7 +513,10 @@ fn parse_selector(value: &str, snapshot: &Snapshot) -> Result<Selector, ScopeErr
         "tag" => Ok(Selector::Tag(body.to_string())),
         "import" => Ok(Selector::Import(snapshot.normalize_path(body))),
         "reach" => parse_reach_selector(body, snapshot),
-        _ => unreachable!("selector_kind filters invalid kinds"),
+        other => Err(ScopeError::UnknownSelectorKind {
+            kind: other.to_string(),
+            selector: value.to_string(),
+        }),
     }
 }
 
@@ -490,8 +672,10 @@ fn nearest_path_prefix<'a>(value: &str, available: &'a [String]) -> Option<&'a s
         .map(|(name, _)| name)
 }
 
-fn fingerprint_selectors(selectors: &[String]) -> String {
+fn fingerprint_selectors(mode: ScopeMode, selectors: &[String]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(mode.fingerprint_token());
+    hasher.update([0]);
     for selector in selectors {
         hasher.update(selector.as_bytes());
         hasher.update([0]);
@@ -670,5 +854,64 @@ mod tests {
         .unwrap();
         assert_eq!(a.report.fingerprint, b.report.fingerprint);
         assert_ne!(a.report.fingerprint, c.report.fingerprint);
+    }
+
+    #[test]
+    fn w2_02_scope_union_matches_either() {
+        let snapshot = snapshot(&[
+            "loctree-rs/src/lib.rs",
+            "loctree-mcp/src/main.rs",
+            "unrelated/foo.rs",
+        ]);
+        let any = resolve_scope_with_config_and_mode(
+            &[
+                "path:loctree-rs/src".to_string(),
+                "path:loctree-mcp/src".to_string(),
+            ],
+            &ScopesConfig::default(),
+            &snapshot,
+            ScopeMode::Any,
+        )
+        .unwrap();
+        assert_eq!(
+            any.matched_files(),
+            vec!["loctree-mcp/src/main.rs", "loctree-rs/src/lib.rs"]
+        );
+
+        let comma = resolve_scope_with_config(
+            &["path:loctree-rs/src,path:loctree-mcp/src".to_string()],
+            &ScopesConfig::default(),
+            &snapshot,
+        )
+        .unwrap();
+        assert_eq!(
+            comma.matched_files(),
+            vec!["loctree-mcp/src/main.rs", "loctree-rs/src/lib.rs"]
+        );
+    }
+
+    #[test]
+    fn w2_02_unknown_selector_kind_fails_loudly() {
+        let snapshot = snapshot(&["src/lib.rs"]);
+        let err = resolve_scope_with_config(
+            &["lang:rust".to_string()],
+            &ScopesConfig::default(),
+            &snapshot,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("unknown --scope selector kind 'lang'"),
+            "expected unknown-kind error, got: {err}"
+        );
+        assert!(
+            err.contains("Allowed kinds: path, tag, import, reach"),
+            "expected allowed-kind list, got: {err}"
+        );
+        assert!(
+            !err.contains("is not a known selector kind or named scope"),
+            "unknown kinds must not be framed as named-scope misses, got: {err}"
+        );
     }
 }

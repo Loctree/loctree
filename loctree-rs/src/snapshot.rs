@@ -4578,6 +4578,7 @@ pub(crate) fn write_auto_artifacts(
         changed: false,
         task: None,
         scopes: Vec::new(),
+        scope_mode: crate::context_scope::ScopeMode::All,
         with_aicx: true,
         no_aicx: false,
         project: Some(snapshot_root.to_path_buf()),

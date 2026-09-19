@@ -2082,6 +2082,7 @@ impl LoctreeServer {
             changed: params.changed,
             task: params.task,
             scopes: params.scope,
+            scope_mode: loctree::ScopeMode::All,
             with_aicx: params.with_aicx,
             no_aicx: params.no_aicx,
             project: Some(project.clone()),

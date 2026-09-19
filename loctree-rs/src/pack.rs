@@ -34,7 +34,9 @@ use crate::analyzer::env_truth::source_reads::collect_source_env_reads;
 use crate::cli::command::GlobalOptions;
 use crate::cli::dispatch::DispatchResult;
 use crate::context_render::chunk_ref;
-use crate::context_scope::{ResolvedScope, ScopeReport, TaskReport, resolve_scope};
+use crate::context_scope::{
+    ResolvedScope, ScopeMode, ScopeReport, TaskReport, resolve_scope_with_mode,
+};
 use crate::context_stack::{
     PackageManager, ProjectStack, dedup_top_n, detect_project_stack, extract_ci_test_commands,
     read_makefile_test_targets,
@@ -68,8 +70,14 @@ pub struct ContextOptions {
     /// Natural-language task hint for context narrowing.
     pub task: Option<String>,
 
-    /// Deterministic structural scope selectors. Repeatable; multiple selectors are ANDed.
+    /// Deterministic structural scope selectors. Repeatable; default combine is AND.
+    /// Comma-joined selectors in one value (`path:a,path:b`) are a union.
     pub scopes: Vec<String>,
+
+    /// How repeated `--scope` flags combine. Default [`ScopeMode::All`] (AND).
+    /// `--scope-mode any` unions them. Comma-joined values stay a union
+    /// regardless of this flag.
+    pub scope_mode: ScopeMode,
 
     /// Include AICX memory overlay.
     pub with_aicx: bool,
@@ -3860,7 +3868,7 @@ fn resolve_context_scope_for_opts(
     if opts.file.is_some() || opts.scopes.is_empty() {
         return Ok(None);
     }
-    resolve_scope(&opts.scopes, project_root, snapshot)
+    resolve_scope_with_mode(&opts.scopes, project_root, snapshot, opts.scope_mode)
         .map(Some)
         .map_err(ContextLoadError::Scope)
 }
