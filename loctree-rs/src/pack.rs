@@ -55,6 +55,14 @@ use crate::types::{ImportKind, ImportResolutionKind, OutputMode};
 // 1.1: additive `receipt` field (loctree.receipt.v1 identity binding, W1-A).
 pub const CONTEXT_SCHEMA_VERSION: &str = "1.1";
 const MAKE_RUNTIME_TARGET_LIMIT: usize = 6;
+/// Bare/default context keeps at most this many target files. The pack must
+/// declare how many were kept vs the indexed universe so agents never read a
+/// truncated slice as the whole repo (G-FULL-SCOPE).
+const DEFAULT_SCOPE_TARGET_LIMIT: usize = 8;
+/// `--task` ranker: a file named verbatim in the task outranks substring
+/// token hits (path +5 / export +3) so `launch.sh` is not buried by recency
+/// hotspots that merely share a word (G-TASK-RANKING).
+const EXACT_NAME_TASK_BOOST: usize = 50;
 
 /// Options for composing a ContextPack.
 #[derive(Debug, Clone, Default)]
@@ -139,6 +147,10 @@ pub enum AuthorityLabel {
 pub struct ContextPack {
     pub schema_version: String,
     pub project: ProjectIdentity,
+    /// How many targets this pack selected versus the indexed universe.
+    /// Silent `truncate(8)` without this field reads as whole-repo truth.
+    #[serde(default)]
+    pub coverage: PackCoverage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<ScopeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +165,17 @@ pub struct ContextPack {
     /// snapshot fingerprint, and the answering binary (`loctree.receipt.v1`).
     #[serde(default)]
     pub receipt: QueryReceipt,
+}
+
+/// Declared target coverage for a ContextPack (bare and `--full`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackCoverage {
+    /// Targets actually composed into this pack.
+    pub selected: usize,
+    /// Indexed files in the snapshot (the universe the selection was drawn from).
+    pub total: usize,
+    /// `true` when `selected < total` — the pack is a slice, not the repo.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -414,6 +437,10 @@ pub struct RiskSlice {
     pub cache_scope_authority: AuthorityLabel,
     pub stale_snapshot: bool,
     pub dirty_worktree: bool,
+    /// Git status/HEAD could not be determined. Fail-closed: never treat
+    /// `dirty_worktree == false` as a verified clean worktree (G-DIRTY-IDENTITY).
+    #[serde(default)]
+    pub git_unknown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +664,7 @@ impl ContextPack {
         Self {
             schema_version: CONTEXT_SCHEMA_VERSION.to_string(),
             project,
+            coverage: PackCoverage::default(),
             scope: None,
             task: None,
             structural: StructuralSlice::default(),
@@ -793,6 +821,7 @@ pub(crate) fn compose_context_pack_with_global(
             );
             retain_context_targets(&mut targets);
         }
+        bind_pack_coverage(&mut pack, &snapshot, targets.len());
         if targets.is_empty() && resolved_scope.is_some() {
             pack.risk = compose_risk_slice(&effective_opts, &snapshot);
         } else if targets.is_empty() && (effective_opts.changed || effective_opts.task.is_some()) {
@@ -922,6 +951,7 @@ pub fn compose_context_pack_from_snapshot(
         );
         retain_context_targets(&mut targets);
     }
+    bind_pack_coverage(&mut pack, snapshot, targets.len());
 
     if targets.is_empty() && resolved_scope.is_some() {
         pack.risk = compose_risk_slice(&effective_opts, snapshot);
@@ -2531,9 +2561,17 @@ pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSli
 
     let snapshot_root = context_snapshot_root(opts);
     let current_head = current_git_head(&snapshot_root);
+    let git_dirty = git_worktree_dirty(&snapshot_root);
+    let git_unknown = git_dirty.is_none();
     let stale_snapshot = snapshot_commit_is_stale(snapshot, current_head.as_deref());
-    let dirty_worktree = git_worktree_dirty(&snapshot_root).unwrap_or(false);
-    let cache_scope = cache_scope_for(snapshot, &snapshot_root, stale_snapshot, dirty_worktree);
+    let dirty_worktree = git_dirty.unwrap_or(false);
+    let cache_scope = cache_scope_for(
+        snapshot,
+        &snapshot_root,
+        stale_snapshot,
+        dirty_worktree,
+        git_unknown,
+    );
     let importer_counts = importer_counts_direct(snapshot);
 
     let mut scoped_counts: Vec<(String, usize)> = risk_scope_files(opts, snapshot)
@@ -2576,12 +2614,14 @@ pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSli
         hotspots,
         high_fan_in,
         snapshot_health: Some(
-            snapshot_health_label(stale_snapshot, dirty_worktree, empty_corpus).to_string(),
+            snapshot_health_label(stale_snapshot, dirty_worktree, empty_corpus, git_unknown)
+                .to_string(),
         ),
         cache_scope: cache_scope.clone(),
         cache_scope_authority: cache_scope_authority(&cache_scope),
         stale_snapshot,
         dirty_worktree,
+        git_unknown,
     }
 }
 
@@ -3175,7 +3215,8 @@ fn snapshot_commit_is_stale(snapshot: &Snapshot, current_head: Option<&str>) -> 
         return false;
     };
     let Some(current_head) = current_head else {
-        return false;
+        // Fail-closed: a named snapshot commit with no live HEAD is not "fresh".
+        return true;
     };
     !(current_head.starts_with(snapshot_commit) || snapshot_commit.starts_with(current_head))
 }
@@ -3185,6 +3226,7 @@ fn cache_scope_for(
     snapshot_root: &Path,
     stale_snapshot: bool,
     dirty_worktree: bool,
+    git_unknown: bool,
 ) -> RiskCacheScope {
     if snapshot.metadata.roots.is_empty() {
         return RiskCacheScope::Unknown;
@@ -3196,6 +3238,9 @@ fn cache_scope_for(
         snapshot_root,
     );
     if expected != actual {
+        return RiskCacheScope::Unknown;
+    }
+    if git_unknown {
         return RiskCacheScope::Unknown;
     }
     if stale_snapshot {
@@ -3211,11 +3256,15 @@ fn snapshot_health_label(
     stale_snapshot: bool,
     dirty_worktree: bool,
     empty_corpus: bool,
+    git_unknown: bool,
 ) -> &'static str {
     // Empty successful snapshot wins the clean label so agents can separate
     // "verified zero files" from "no authority / missing snapshot".
     if empty_corpus && !stale_snapshot && !dirty_worktree {
         return "empty_snapshot";
+    }
+    if git_unknown {
+        return "unknown";
     }
     match (stale_snapshot, dirty_worktree) {
         (true, true) => "stale_dirty",
@@ -4006,7 +4055,7 @@ pub fn compose_default_scope(
     }
 
     stable_dedup_strings(&mut targets);
-    targets.truncate(8);
+    targets.truncate(DEFAULT_SCOPE_TARGET_LIMIT);
     targets
 }
 
@@ -4021,6 +4070,15 @@ fn non_empty_context_path(path: &Path) -> Option<String> {
 
 fn retain_context_targets(targets: &mut Vec<String>) {
     targets.retain(|target| !target.trim().is_empty());
+}
+
+fn bind_pack_coverage(pack: &mut ContextPack, snapshot: &Snapshot, selected: usize) {
+    let total = snapshot.files.len();
+    pack.coverage = PackCoverage {
+        selected,
+        total,
+        truncated: selected < total,
+    };
 }
 
 fn top_hub_files(snapshot: &Snapshot, limit: usize) -> Vec<String> {
@@ -4213,9 +4271,11 @@ fn get_changed_targets(opts: &ContextOptions, snapshot: &Snapshot) -> Vec<String
 }
 
 fn get_task_targets(task: &str, snapshot: &Snapshot) -> Vec<String> {
+    // Keep dots so `launch.sh` is one token, not `launch` + discarded `sh`.
     let tokens: Vec<String> = task
         .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !(c.is_alphanumeric() || c == '.'))
+        .map(|t| t.trim_matches('.'))
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_string())
         .collect();
@@ -4229,6 +4289,11 @@ fn get_task_targets(task: &str, snapshot: &Snapshot) -> Vec<String> {
     for file in &snapshot.files {
         let mut score = 0;
         let file_lower = file.path.to_lowercase();
+        let basename = Path::new(&file.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(file.path.as_str())
+            .to_lowercase();
 
         for token in &tokens {
             if file_lower.contains(token) {
@@ -4246,6 +4311,9 @@ fn get_task_targets(task: &str, snapshot: &Snapshot) -> Vec<String> {
                     }
                 }
             }
+        }
+        if tokens.iter().any(|token| token == &basename) {
+            score += EXACT_NAME_TASK_BOOST;
         }
         if score > 0 {
             scores.insert(file.path.clone(), score);
@@ -4420,6 +4488,7 @@ fn merge_risk(dest: &mut RiskSlice, src: RiskSlice) {
     dest.cache_scope_authority = src.cache_scope_authority;
     dest.stale_snapshot = dest.stale_snapshot || src.stale_snapshot;
     dest.dirty_worktree = dest.dirty_worktree || src.dirty_worktree;
+    dest.git_unknown = dest.git_unknown || src.git_unknown;
 }
 
 fn dedup_risk(dest: &mut RiskSlice) {
@@ -4594,6 +4663,16 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
             snapshot_id
         ));
     }
+    md.push_str(&format!(
+        "- **Coverage**: {} of {} targets selected{}\n",
+        pack.coverage.selected,
+        pack.coverage.total,
+        if pack.coverage.truncated {
+            " (truncated — not the whole repo)"
+        } else {
+            ""
+        }
+    ));
     md.push('\n');
 
     md.push_str(
@@ -6207,6 +6286,109 @@ mod tests {
         assert_eq!(risk.snapshot_health.as_deref(), Some("empty_snapshot"));
         assert_ne!(risk.snapshot_health.as_deref(), Some("missing_snapshot"));
         assert!(!risk.stale_snapshot);
+    }
+
+    fn twelve_file_universe() -> Snapshot {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+        for i in 0..12 {
+            let mut file = FileAnalysis::new(format!("src/file_{i:02}.rs"));
+            file.loc = 80 + i;
+            file.language = "rust".to_string();
+            snapshot.files.push(file);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn w2_04_full_pack_declares_coverage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = twelve_file_universe();
+        let bare_opts = ContextOptions {
+            project: Some(tmp.path().to_path_buf()),
+            no_aicx: true,
+            ..ContextOptions::default()
+        };
+        let full_opts = ContextOptions {
+            full: true,
+            ..bare_opts.clone()
+        };
+
+        let bare = compose_context_pack_from_snapshot(&bare_opts, tmp.path(), &snapshot)
+            .expect("bare pack");
+        let full = compose_context_pack_from_snapshot(&full_opts, tmp.path(), &snapshot)
+            .expect("full pack");
+
+        for (label, pack) in [("bare", &bare), ("full", &full)] {
+            assert_eq!(
+                pack.coverage.selected, DEFAULT_SCOPE_TARGET_LIMIT,
+                "{label} selected"
+            );
+            assert_eq!(pack.coverage.total, 12, "{label} total");
+            assert!(pack.coverage.truncated, "{label} must declare truncation");
+            let json = serde_json::to_value(pack).expect("serialize");
+            assert_eq!(json["coverage"]["selected"], 8, "{label} json selected");
+            assert_eq!(json["coverage"]["total"], 12, "{label} json total");
+            assert_eq!(
+                json["coverage"]["truncated"].as_bool(),
+                Some(true),
+                "{label} json truncated"
+            );
+            eprintln!("W2-04 {label} coverage json: {}", json["coverage"]);
+            let md = format_context_pack_markdown(pack);
+            assert!(
+                md.contains("**Coverage**: 8 of 12 targets selected (truncated — not the whole repo)"),
+                "{label} markdown must declare coverage, got:\n{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn w2_04_task_exact_name_outranks_recency() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        let mut named = FileAnalysis::new("launch.sh".to_string());
+        named.loc = 4;
+        snapshot.files.push(named);
+        for i in 0..6 {
+            let mut hotspot = FileAnalysis::new(format!("src/fix_permissions_{i}.rs"));
+            hotspot.loc = 900;
+            hotspot.exports.push(ExportSymbol::new(
+                "fix_permissions".to_string(),
+                "function",
+                "named",
+                Some(1),
+            ));
+            snapshot.files.push(hotspot);
+        }
+
+        let ranked = get_task_targets("fix launch.sh permissions", &snapshot);
+        eprintln!("W2-04 task ranking: {ranked:?}");
+        assert_eq!(
+            ranked.first().map(String::as_str),
+            Some("launch.sh"),
+            "exact-name file must outrank substring recency stand-ins: {ranked:?}"
+        );
+
+        let opts = ContextOptions {
+            project: Some(tmp.path().to_path_buf()),
+            no_aicx: true,
+            task: Some("fix launch.sh permissions".to_string()),
+            ..ContextOptions::default()
+        };
+        let pack = compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot)
+            .expect("task pack");
+        assert!(
+            pack.structural
+                .files
+                .iter()
+                .any(|file| file.path == "launch.sh"),
+            "pack targets must include launch.sh, got {:?}",
+            pack.structural
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// W1-A negative control (audit wrong-commit class LCT-D/E/L): a snapshot
