@@ -277,6 +277,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
     let file_scope_resolved = file_scope.as_ref().is_none_or(|scope| scope.resolved);
     let file_scoped = file_scope.as_ref().is_some_and(|scope| scope.resolved);
     literal_matches.file_scope = file_scope;
+    rewrite_unresolved_file_scope_coverage(&mut literal_matches);
     literal_matches.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
         count_only: opts.count_only,
@@ -444,6 +445,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
     let file_scope_resolved = file_scope.as_ref().is_none_or(|scope| scope.resolved);
     let file_scoped = file_scope.as_ref().is_some_and(|scope| scope.resolved);
     matches.file_scope = file_scope;
+    rewrite_unresolved_file_scope_coverage(&mut matches);
     matches.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
         count_only: opts.count_only,
@@ -552,6 +554,21 @@ fn absence_trust(
         scope,
         exclusion_caveat,
     }
+}
+
+/// Unresolved `--file` must not look like an empty-repo scan (`scanned 0 of 0`).
+/// The coverage line becomes a named selector failure instead of a false vacuum.
+fn rewrite_unresolved_file_scope_coverage(results: &mut OccurrenceResults) {
+    let Some(scope) = results.file_scope.as_ref() else {
+        return;
+    };
+    if scope.resolved {
+        return;
+    }
+    results.coverage_line = format!(
+        "file scope status={} requested=`{}` — selector did not resolve; this is not a scanned-0-of-0 empty universe",
+        scope.status, scope.requested
+    );
 }
 
 fn file_scope_loctignore_hint(
@@ -1179,7 +1196,7 @@ fn print_file_context(results: &OccurrenceResults) {
 mod tests {
     use super::{
         AbsenceMode, ZeroHitCtx, line_group_spans, more_cols_suffix, query_has_regex_metachars,
-        zero_hit_absence_text,
+        rewrite_unresolved_file_scope_coverage, zero_hit_absence_text,
     };
     use crate::analyzer::occurrences::{FileScopeResolution, ScanOptions, scan_files_with_scope};
 
@@ -1307,6 +1324,17 @@ mod tests {
             ignored_scope.scan_scope(),
         );
         results.file_scope = Some(ignored_scope);
+        rewrite_unresolved_file_scope_coverage(&mut results);
+        assert!(
+            !results.coverage_line.contains("scanned 0 of 0"),
+            "excluded scope must not look like an empty universe, got: {}",
+            results.coverage_line
+        );
+        assert!(
+            results.coverage_line.contains("unresolved"),
+            "coverage must name unresolved, got: {}",
+            results.coverage_line
+        );
 
         let text = zero_hit_absence_text(
             &results,
@@ -1332,6 +1360,12 @@ mod tests {
 
         let missing = FileScopeResolution::resolve("no/such/dir", ["src/lib.rs"]);
         results.file_scope = Some(missing);
+        rewrite_unresolved_file_scope_coverage(&mut results);
+        assert!(
+            !results.coverage_line.contains("scanned 0 of 0"),
+            "missing scope must not look like 0 of 0, got: {}",
+            results.coverage_line
+        );
         let unresolved_text = zero_hit_absence_text(
             &results,
             AbsenceMode::Literal,
