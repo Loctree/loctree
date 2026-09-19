@@ -2,9 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json;
 use serde_json::Value;
+
+use crate::types::TargetKind;
 
 /// SvelteKit virtual modules that are provided by the framework at runtime.
 /// These don't have actual file sources and should be recognized as valid imports.
@@ -402,7 +405,15 @@ pub(crate) fn resolve_reexport_target(
     }
     let parent = file_path.parent()?;
     let candidate = parent.join(spec);
-    resolve_python_candidate(candidate, root, exts)
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    if ext == "py" || ext == "pyi" {
+        resolve_python_candidate(candidate, root, exts)
+    } else {
+        resolve_with_extensions_hint(candidate, root, exts, Some("ts"))
+    }
 }
 
 pub(crate) fn resolve_python_relative(
@@ -450,7 +461,7 @@ pub(crate) fn resolve_js_relative(
     }
     let parent = file_path.parent()?;
     let candidate = parent.join(spec);
-    resolve_with_extensions(candidate, root, exts)
+    resolve_with_extensions_hint(candidate, root, exts, Some("ts"))
 }
 
 pub(crate) fn resolve_python_candidate(
@@ -475,7 +486,7 @@ pub(crate) fn resolve_python_candidate(
         }
     }
 
-    resolve_with_extensions(candidate, root, exts)
+    resolve_with_extensions_hint(candidate, root, exts, Some("py"))
 }
 
 fn is_namespace_package(dir: &Path) -> bool {
@@ -532,15 +543,100 @@ fn has_known_js_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn detect_directory_dominant_language(dir: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && let Some(ext) = path.extension().and_then(|e| e.to_str())
+        {
+            let lang = crate::analyzer::classify::detect_language(ext);
+            if !lang.is_empty() {
+                *counts.entry(lang).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    match ranked.as_slice() {
+        [(lang, count), rest @ ..] if rest.iter().all(|(_, other)| other < count) => {
+            Some(lang.clone())
+        }
+        _ => None,
+    }
+}
+
+fn is_language_compatible(ext: &str, target_lang: &str) -> bool {
+    match target_lang {
+        "py" => matches!(ext, "py" | "pyi"),
+        "ts" => matches!(
+            ext,
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "svelte" | "vue" | "astro" | "json" | "css"
+        ),
+        "js" => matches!(
+            ext,
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" | "svelte" | "vue" | "astro" | "json" | "css"
+        ),
+        "swift" => matches!(ext, "swift"),
+        "rs" => matches!(ext, "rs"),
+        other => crate::analyzer::classify::detect_language(ext) == other || ext == other,
+    }
+}
+
+fn order_extensions<'a>(
+    exts: &'a HashSet<String>,
+    candidate_parent: Option<&Path>,
+    lang_hint: Option<&str>,
+) -> Vec<&'a str> {
+    let mut all: Vec<&'a str> = exts.iter().map(String::as_str).collect();
+    all.sort();
+
+    let preferred_lang = lang_hint
+        .map(str::to_string)
+        .or_else(|| candidate_parent.and_then(detect_directory_dominant_language));
+
+    if let Some(pref) = preferred_lang {
+        if lang_hint.is_some() {
+            let mut compatible: Vec<&'a str> = all
+                .into_iter()
+                .filter(|ext| is_language_compatible(ext, &pref))
+                .collect();
+            compatible.sort();
+            compatible
+        } else {
+            let (mut matching, mut rest): (Vec<&'a str>, Vec<&'a str>) = all
+                .into_iter()
+                .partition(|ext| is_language_compatible(ext, &pref));
+            matching.sort();
+            rest.sort();
+            matching.extend(rest);
+            matching
+        }
+    } else {
+        all
+    }
+}
+
 pub(crate) fn resolve_with_extensions(
     candidate: PathBuf,
     root: &Path,
     exts: Option<&HashSet<String>>,
 ) -> Option<String> {
+    resolve_with_extensions_hint(candidate, root, exts, None)
+}
+
+pub(crate) fn resolve_with_extensions_hint(
+    candidate: PathBuf,
+    root: &Path,
+    exts: Option<&HashSet<String>>,
+    lang_hint: Option<&str>,
+) -> Option<String> {
     if !has_known_js_extension(&candidate)
         && let Some(set) = exts
     {
-        for ext in set {
+        let ordered = order_extensions(set, candidate.parent(), lang_hint);
+        for ext in ordered {
             let mut new_name = candidate.as_os_str().to_os_string();
             new_name.push(".");
             new_name.push(ext);
@@ -553,7 +649,10 @@ pub(crate) fn resolve_with_extensions(
 
     if candidate.exists() {
         // If the candidate is a directory, try to resolve to an index file
-        if candidate.is_dir() && !has_known_js_extension(&candidate) {
+        if candidate.is_dir()
+            && !has_known_js_extension(&candidate)
+            && lang_hint != Some("py")
+        {
             for index_name in [
                 "index.ts",
                 "index.tsx",
@@ -573,7 +672,7 @@ pub(crate) fn resolve_with_extensions(
         canonical_rel(&candidate, root).or_else(|| canonical_abs(&candidate))
     } else {
         // Candidate doesn't exist, try to find it with index files
-        if !has_known_js_extension(&candidate) {
+        if !has_known_js_extension(&candidate) && lang_hint != Some("py") {
             let dir_path = candidate.clone();
             for index_name in [
                 "index.ts",
@@ -596,11 +695,12 @@ pub(crate) fn resolve_with_extensions(
 }
 
 fn canonical_rel(path: &Path, root: &Path) -> Option<String> {
-    path.canonicalize().ok().and_then(|p| {
-        p.strip_prefix(root)
-            .ok()
-            .map(|q| q.to_string_lossy().to_string())
-    })
+    let p = path.canonicalize().ok()?;
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    p.strip_prefix(&canon_root)
+        .or_else(|_| p.strip_prefix(root))
+        .ok()
+        .map(|q| q.to_string_lossy().to_string())
 }
 
 fn canonical_abs(path: &Path) -> Option<String> {
@@ -1035,7 +1135,6 @@ pub(crate) fn resolve_rust_import(
     if source.starts_with("std::")
         || source.starts_with("core::")
         || source.starts_with("alloc::")
-        || !source.contains("::")
     {
         return None;
     }
@@ -1057,10 +1156,117 @@ pub(crate) fn resolve_rust_import(
         };
         resolve_rust_module_path(remainder, current_dir)
     } else {
+        if let Some(resolved) = resolve_cross_crate_import(source, file_path, crate_root, root) {
+            return Some(resolved);
+        }
+        if !source.contains("::") {
+            return None;
+        }
         resolve_rust_module_path(source, crate_root)
     };
 
     module_path.and_then(|p| canonical_rel(&p, root).or_else(|| canonical_abs(&p)))
+}
+
+static WORKSPACE_MEMBERS_CACHE: Lazy<
+    Mutex<HashMap<PathBuf, Option<Vec<crate::analyzer::cargo_manifest::CrateManifest>>>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn get_workspace_members(
+    crate_root: &Path,
+    root: &Path,
+) -> Option<Vec<crate::analyzer::cargo_manifest::CrateManifest>> {
+    let ws_root = find_workspace_root_dir(crate_root, root)?;
+    let ws_root_canon = ws_root.canonicalize().unwrap_or_else(|_| ws_root.clone());
+
+    if let Ok(cache) = WORKSPACE_MEMBERS_CACHE.lock()
+        && let Some(cached) = cache.get(&ws_root_canon)
+    {
+        return cached.clone();
+    }
+
+    let parsed = crate::analyzer::cargo_manifest::parse_workspace_root(&ws_root)
+        .ok()
+        .map(|ws| ws.resolved_members);
+
+    if let Ok(mut cache) = WORKSPACE_MEMBERS_CACHE.lock() {
+        cache.insert(ws_root_canon, parsed.clone());
+    }
+
+    parsed
+}
+
+fn find_workspace_root_dir(crate_root: &Path, root: &Path) -> Option<PathBuf> {
+    // 1. Check root directory
+    let root_manifest = root.join("Cargo.toml");
+    if root_manifest.exists()
+        && let Ok(content) = std::fs::read_to_string(&root_manifest)
+        && content.contains("[workspace]")
+    {
+        return Some(root.to_path_buf());
+    }
+
+    // 2. Walk up from crate_root
+    let mut current = Some(crate_root);
+    while let Some(dir) = current {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.exists()
+            && let Ok(content) = std::fs::read_to_string(&manifest)
+            && content.contains("[workspace]")
+        {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
+
+    None
+}
+
+fn resolve_cross_crate_import(
+    source: &str,
+    _file_path: &Path,
+    crate_root: &Path,
+    root: &Path,
+) -> Option<String> {
+    let (crate_ident, remainder) = match source.split_once("::") {
+        Some((c, r)) => (c, r),
+        None => (source, ""),
+    };
+
+    let members = get_workspace_members(crate_root, root)?;
+
+    for member in members {
+        let matches = member.lib_name.as_deref() == Some(crate_ident)
+            || member.package_name == crate_ident
+            || member.package_name.replace('-', "_") == crate_ident
+            || member
+                .targets
+                .iter()
+                .any(|t| t.kind == TargetKind::Lib && t.name == crate_ident);
+
+        if !matches {
+            continue;
+        }
+
+        let target = member
+            .targets
+            .iter()
+            .find(|t| t.kind == TargetKind::Lib)
+            .or_else(|| member.targets.iter().find(|t| t.kind == TargetKind::Bin))?;
+
+        let lib_path = &target.path;
+        let search_dir = lib_path.parent()?;
+
+        if !remainder.is_empty()
+            && let Some(mod_file) = resolve_rust_module_path(remainder, search_dir)
+        {
+            return canonical_rel(&mod_file, root).or_else(|| canonical_abs(&mod_file));
+        }
+
+        return canonical_rel(lib_path, root).or_else(|| canonical_abs(lib_path));
+    }
+
+    None
 }
 
 fn resolve_rust_module_path(module: &str, base: &Path) -> Option<PathBuf> {
@@ -1723,5 +1929,165 @@ mod tests {
         fs::write(dir.path().join("dist/utils.js"), "export {}").unwrap();
         let resolver = TsPathResolver::from_tsconfig(dir.path()).unwrap();
         assert!(resolver.resolve("./utils", None).is_none());
+    }
+
+    #[test]
+    fn w3_03_crosslang_resolution_deterministic() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        // Create sibling files with different language extensions
+        fs::write(src.join("helper.py"), "def run(): pass\n").unwrap();
+        fs::write(src.join("helper.swift"), "func run() {}\n").unwrap();
+        fs::write(src.join("helper.ts"), "export function run() {}\n").unwrap();
+
+        // HashSet with extensions in non-deterministic order
+        let mut exts = HashSet::new();
+        exts.insert("swift".to_string());
+        exts.insert("py".to_string());
+        exts.insert("ts".to_string());
+
+        // 1. Python candidate resolution must deterministically choose .py, never .swift
+        for _ in 0..10 {
+            let res = resolve_python_candidate(src.join("helper"), dir.path(), Some(&exts));
+            assert!(res.is_some());
+            let path = res.unwrap();
+            assert!(
+                path.ends_with("helper.py"),
+                "Expected helper.py, got: {path}"
+            );
+        }
+
+        // 2. Python candidate resolution must NEVER resolve to .swift even if .py does not exist
+        fs::remove_file(src.join("helper.py")).unwrap();
+        let res_no_py = resolve_python_candidate(src.join("helper"), dir.path(), Some(&exts));
+        assert!(
+            res_no_py.is_none(),
+            "Python candidate must not resolve to swift or other languages, got: {:?}",
+            res_no_py
+        );
+
+        // 3. Two runs on the same fixture must yield identical edge resolution
+        fs::write(src.join("helper.py"), "def run(): pass\n").unwrap();
+        let run1 = resolve_with_extensions(src.join("helper"), dir.path(), Some(&exts));
+        let run2 = resolve_with_extensions(src.join("helper"), dir.path(), Some(&exts));
+        assert_eq!(run1, run2);
+    }
+
+    #[test]
+    fn w3_03_cross_crate_reexport_consumers_visible() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Workspace manifest
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/crate_a\", \"crates/crate_b\"]\n",
+        )
+        .unwrap();
+
+        // Crate A
+        let crate_a_dir = root.join("crates/crate_a");
+        fs::create_dir_all(crate_a_dir.join("src")).unwrap();
+        fs::write(
+            crate_a_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate-a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"crate_a\"\npath = \"src/lib.rs\"\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_a_dir.join("src/lib.rs"),
+            "pub mod internal;\npub use internal::ExportedType;\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_a_dir.join("src/internal.rs"),
+            "pub struct ExportedType;\n",
+        )
+        .unwrap();
+
+        // Crate B
+        let crate_b_dir = root.join("crates/crate_b");
+        fs::create_dir_all(crate_b_dir.join("src")).unwrap();
+        fs::write(
+            crate_b_dir.join("Cargo.toml"),
+            "[package]\nname = \"crate-b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\nname = \"crate_b\"\npath = \"src/lib.rs\"\n\n[dependencies]\ncrate_a = { path = \"../crate_a\" }\n",
+        )
+        .unwrap();
+        fs::write(
+            crate_b_dir.join("src/lib.rs"),
+            "pub use crate_a::ExportedType;\n",
+        )
+        .unwrap();
+
+        let file_b = crate_b_dir.join("src/lib.rs");
+        let crate_b_root = crate_b_dir.join("src");
+
+        // 1. Direct cross-crate re-export resolution
+        let resolved = resolve_rust_import("crate_a::ExportedType", &file_b, &crate_b_root, root);
+        assert!(resolved.is_some(), "Expected cross-crate import to resolve");
+        let resolved_path = resolved.unwrap();
+        assert!(
+            resolved_path.contains("crates/crate_a/src/lib.rs"),
+            "Expected resolved path to point to crate_a lib.rs, got: {resolved_path}"
+        );
+
+        // 2. Direct submodule resolution across crates
+        let resolved_sub =
+            resolve_rust_import("crate_a::internal::ExportedType", &file_b, &crate_b_root, root);
+        assert!(resolved_sub.is_some(), "Expected submodule import to resolve");
+        let resolved_sub_path = resolved_sub.unwrap();
+        assert!(
+            resolved_sub_path.contains("crates/crate_a/src/internal.rs"),
+            "Expected resolved path to point to internal.rs, got: {resolved_sub_path}"
+        );
+
+        // 3. Impact analysis: re-export in crate A consumed in crate B -> impact B->A visible
+        use crate::impact::{analyze_impact, ImpactOptions};
+        use crate::snapshot::{GraphEdge, Snapshot};
+
+        let mut snapshot = Snapshot::new(vec!["crates".to_string()]);
+        let internal_path = "crates/crate_a/src/internal.rs";
+        let lib_a_path = "crates/crate_a/src/lib.rs";
+        let lib_b_path = "crates/crate_b/src/lib.rs";
+
+        // Edge 1: lib_a reexports internal
+        snapshot.edges.push(GraphEdge {
+            from: lib_a_path.to_string(),
+            to: internal_path.to_string(),
+            label: "reexport".to_string(),
+        });
+        // Edge 2: lib_b consumes lib_a reexport
+        snapshot.edges.push(GraphEdge {
+            from: lib_b_path.to_string(),
+            to: resolved_path.clone(),
+            label: "reexport".to_string(),
+        });
+
+        let impact_internal =
+            analyze_impact(&snapshot, internal_path, &ImpactOptions::default());
+        assert!(
+            impact_internal
+                .direct_consumers
+                .iter()
+                .any(|c| c.file == lib_a_path),
+            "Crate A lib.rs must be a direct consumer of internal.rs"
+        );
+        assert!(
+            impact_internal
+                .transitive_consumers
+                .iter()
+                .any(|c| c.file == lib_b_path),
+            "Crate B lib.rs must be a transitive consumer of internal.rs via re-export chain"
+        );
+
+        let impact_lib_a = analyze_impact(&snapshot, lib_a_path, &ImpactOptions::default());
+        assert!(
+            impact_lib_a
+                .direct_consumers
+                .iter()
+                .any(|c| c.file == lib_b_path),
+            "Crate B lib.rs must be visible as a direct consumer of crate A lib.rs"
+        );
     }
 }
