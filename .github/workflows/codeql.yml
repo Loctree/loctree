@@ -26,6 +26,16 @@ jobs:
             build-mode: none
           - language: java-kotlin
             build-mode: manual
+          # Languages below were covered by org-level CodeQL default setup
+          # until it was disabled (advanced and default setups conflict:
+          # GitHub rejects advanced SARIF uploads while default is enabled).
+          # This matrix is the single source of CodeQL truth for the repo.
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: actions
+            build-mode: none
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
