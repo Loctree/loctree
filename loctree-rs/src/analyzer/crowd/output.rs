@@ -81,9 +81,16 @@ pub fn format_crowd(crowd: &Crowd, _verbose: bool) -> String {
 
         // Show shortened path that's still unique (last 2-3 path segments)
         let display_path = shorten_path(&member.file, 50);
+        // importer_count follows re-export chains; name the direct slice when
+        // the two diverge so "importers" never reads as direct-only.
+        let direct_suffix = if member.importer_count_direct != member.importer_count {
+            format!(" ({} direct)", member.importer_count_direct)
+        } else {
+            String::new()
+        };
         lines.push(format!(
-            "  {:<50} {} {} importers",
-            display_path, bar, member.importer_count
+            "  {:<50} {} {} importers{}",
+            display_path, bar, member.importer_count, direct_suffix
         ));
     }
 

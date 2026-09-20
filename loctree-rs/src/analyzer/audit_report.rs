@@ -1171,6 +1171,7 @@ mod tests {
                         matched: "test".into(),
                     },
                     importer_count: 0,
+                    importer_count_direct: 0,
                     similarity_scores: Vec::new(),
                     is_test: true,
                 })
@@ -1187,6 +1188,7 @@ mod tests {
                     matched: "auth".into(),
                 },
                 importer_count: 4,
+                importer_count_direct: 4,
                 similarity_scores: Vec::new(),
                 is_test: false,
             }],
