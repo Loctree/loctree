@@ -1,5 +1,6 @@
 // Rust analyzer module structure
 mod imports;
+mod includes;
 mod naming;
 mod preprocess;
 mod tauri;
@@ -790,6 +791,28 @@ pub(crate) fn analyze_rust_file(
         }
     }
 
+    // W5-03: Extract include_str!, include_bytes!, include!, and build.rs reads
+    let stripped_for_includes = strip_comments(content);
+    let includes = includes::extract_rust_includes(&stripped_for_includes, &relative);
+    for inc in includes {
+        if inc.is_dynamic {
+            let mut imp = ImportEntry::new(inc.raw.clone(), ImportKind::Dynamic);
+            imp.line = Some(inc.line);
+            imp.resolution = crate::types::ImportResolutionKind::Dynamic;
+            imp.raw_path = format!("{}!({})", inc.macro_name, inc.raw);
+            if !analysis.dynamic_imports.contains(&inc.raw) {
+                analysis.dynamic_imports.push(inc.raw.clone());
+            }
+            analysis.imports.push(imp);
+        } else {
+            let mut imp = ImportEntry::new(inc.raw.clone(), ImportKind::Static);
+            imp.line = Some(inc.line);
+            imp.resolution = crate::types::ImportResolutionKind::Unknown;
+            imp.raw_path = format!("{}!(\"{}\")", inc.macro_name, inc.raw);
+            analysis.imports.push(imp);
+        }
+    }
+
     // public items - process with proper kind detection
     // rust_pub_decl_regexes() returns [fn, struct, enum, trait, type, union] in order
     let kinds = ["function", "struct", "enum", "trait", "type", "union"];
@@ -1159,8 +1182,9 @@ pub(crate) fn analyze_rust_file(
     // This reduces false positives by ~15% for Rust codebases
     extract_type_alias_qualified_paths(content, &analysis.imports, &mut analysis.local_uses);
 
-    // Detect bare function calls like `func_name(...)` in the same file
-    // This catches local function calls without path qualification
+    // Detect bare function calls like `func_name(...)` in the same file.
+    // Definition sites (`fn foo(`) are excluded inside the extractor so a
+    // Rust `pub fn` does not count as its own callsite.
     extract_bare_function_calls(&production_content, &mut analysis.local_uses);
 
     // Detect type names used in struct/enum field definitions
@@ -1324,6 +1348,48 @@ fn call_local() {
     }
 
     #[test]
+    fn w1_02_rust_pub_fn_without_callers_is_dead() {
+        let content = r#"
+pub fn orphan() {}
+pub fn live() {}
+fn caller() {
+    live();
+}
+"#;
+        let analysis = analyze_rust_file(content, "src/helpers.rs".to_string(), &[]);
+        assert!(
+            analysis.exports.iter().any(|e| e.name == "orphan"),
+            "orphan must be an export: {:?}",
+            analysis.exports
+        );
+        assert!(
+            !analysis.local_uses.iter().any(|n| n == "orphan"),
+            "pub fn definition must not count as its own callsite: {:?}",
+            analysis.local_uses
+        );
+        assert!(
+            analysis.local_uses.iter().any(|n| n == "live"),
+            "live must remain a local use: {:?}",
+            analysis.local_uses
+        );
+
+        let dead = crate::analyzer::dead_parrots::find_dead_exports(
+            std::slice::from_ref(&analysis),
+            false,
+            None,
+            crate::analyzer::dead_parrots::DeadFilterConfig::default(),
+        );
+        assert!(
+            dead.iter().any(|d| d.symbol == "orphan"),
+            "orphan pub fn with no callers must be dead: {dead:?}"
+        );
+        assert!(
+            !dead.iter().any(|d| d.symbol == "live"),
+            "called pub fn must not be dead: {dead:?}"
+        );
+    }
+
+    #[test]
     fn rust_enum_variants_are_indexed_with_honest_kind_and_owner() {
         let content = r#"
 #[derive(clap::Subcommand)]
@@ -1431,5 +1497,223 @@ pub fn pub_plain_export() {}
                 "{name} is a pub export and must not appear in local_symbols"
             );
         }
+    }
+
+    #[test]
+    fn w5_03_build_script_include_edges() {
+        use crate::analyzer::resolvers::resolve_rust_import;
+        use crate::impact::{ImpactOptions, analyze_impact};
+        use crate::snapshot::{GraphEdge, Snapshot};
+        use crate::types::ImportResolutionKind;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let src_dir = root.join("src");
+        let data_dir = root.join("data");
+        let plugins_dir = root.join("plugins");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        std::fs::create_dir_all(&plugins_dir).expect("create plugins dir");
+
+        // 1. Fixture: const S: &str = include_str!("../data/x.json")
+        let x_json = data_dir.join("x.json");
+        std::fs::write(&x_json, r#"{"test": true}"#).expect("write x.json");
+
+        let icon_png = data_dir.join("icon.png");
+        std::fs::write(&icon_png, [0u8, 1, 2, 3]).expect("write icon.png");
+
+        let wasm_file = plugins_dir.join("session-manager.wasm");
+        std::fs::write(&wasm_file, [0x00, 0x61, 0x73, 0x6d]).expect("write wasm");
+
+        let schema_sql = root.join("schema.sql");
+        std::fs::write(&schema_sql, "CREATE TABLE users (id INTEGER);").expect("write schema.sql");
+
+        let license = root.join("LICENSE");
+        std::fs::write(&license, "MIT").expect("write LICENSE");
+
+        let main_rs_path = src_dir.join("main.rs");
+        let main_content = r#"
+const S: &str = include_str!("../data/x.json");
+const B: &[u8] = include_bytes!("../data/icon.png");
+const L: &str = include_str!("LICENSE");
+const DYN: &str = include_str!(UNRESOLVED_DYNAMIC_VAR);
+fn main() {}
+"#;
+        std::fs::write(&main_rs_path, main_content).expect("write main.rs");
+
+        // Analyze src/main.rs
+        let analysis_main = analyze_rust_file(main_content, "src/main.rs".to_string(), &[]);
+
+        // Acceptance Check 1: include_str!("../data/x.json") has an import entry and resolves
+        let imp_x = analysis_main
+            .imports
+            .iter()
+            .find(|i| i.source == "../data/x.json")
+            .expect("include_str import for ../data/x.json must exist");
+        assert_eq!(imp_x.kind, ImportKind::Static);
+
+        let resolved_x = resolve_rust_import(&imp_x.source, &main_rs_path, &src_dir, root);
+        assert_eq!(resolved_x.as_deref(), Some("data/x.json"));
+
+        // Acceptance Check 1b: bare extensionless include (include_str!("LICENSE"))
+        // resolves against the crate/repo roots — no slash or dot required.
+        let imp_license = analysis_main
+            .imports
+            .iter()
+            .find(|i| i.source == "LICENSE")
+            .expect("include_str import for LICENSE must exist");
+        let resolved_license =
+            resolve_rust_import(&imp_license.source, &main_rs_path, &src_dir, root);
+        assert_eq!(resolved_license.as_deref(), Some("LICENSE"));
+
+        // Acceptance Check 2: Unresolved path with variable -> jawny unresolved, nie cicho brak
+        let imp_dyn = analysis_main
+            .imports
+            .iter()
+            .find(|i| i.source == "UNRESOLVED_DYNAMIC_VAR")
+            .expect("include_str with variable must produce explicit import entry");
+        assert_eq!(imp_dyn.kind, ImportKind::Dynamic);
+        assert_eq!(imp_dyn.resolution, ImportResolutionKind::Dynamic);
+        assert!(imp_dyn.resolved_path.is_none());
+        assert!(
+            analysis_main
+                .dynamic_imports
+                .contains(&"UNRESOLVED_DYNAMIC_VAR".to_string())
+        );
+
+        // Also check include_bytes!
+        let imp_bytes = analysis_main
+            .imports
+            .iter()
+            .find(|i| i.source == "../data/icon.png")
+            .expect("include_bytes import for ../data/icon.png must exist");
+        let resolved_bytes = resolve_rust_import(&imp_bytes.source, &main_rs_path, &src_dir, root);
+        assert_eq!(resolved_bytes.as_deref(), Some("data/icon.png"));
+
+        // Check build.rs
+        let build_rs_path = root.join("build.rs");
+        let build_content = r#"
+fn main() {
+    println!("cargo:rerun-if-changed=plugins/session-manager.wasm");
+    println!("cargo:rerun-if-changed=build.rs");
+    let wasm = std::fs::read("plugins/session-manager.wasm");
+    let schema = fs::read_to_string("schema.sql");
+    let dyn_wasm = fs::read(DYNAMIC_PLUGIN_PATH);
+}
+"#;
+        std::fs::write(&build_rs_path, build_content).expect("write build.rs");
+
+        let analysis_build = analyze_rust_file(build_content, "build.rs".to_string(), &[]);
+
+        // Check rerun-if-changed / fs_read edges
+        let imp_wasm = analysis_build
+            .imports
+            .iter()
+            .find(|i| i.source == "plugins/session-manager.wasm")
+            .expect("plugins/session-manager.wasm must be in build.rs imports");
+        let resolved_wasm = resolve_rust_import(&imp_wasm.source, &build_rs_path, root, root);
+        assert_eq!(
+            resolved_wasm.as_deref(),
+            Some("plugins/session-manager.wasm")
+        );
+
+        let imp_schema = analysis_build
+            .imports
+            .iter()
+            .find(|i| i.source == "schema.sql")
+            .expect("schema.sql must be in build.rs imports");
+        let resolved_schema = resolve_rust_import(&imp_schema.source, &build_rs_path, root, root);
+        assert_eq!(resolved_schema.as_deref(), Some("schema.sql"));
+
+        // Build.rs self-dependency must be absent
+        assert!(
+            !analysis_build
+                .imports
+                .iter()
+                .any(|i| i.source == "build.rs"),
+            "build.rs must not import itself"
+        );
+
+        // Dynamic file read in build.rs
+        let imp_build_dyn = analysis_build
+            .imports
+            .iter()
+            .find(|i| i.source == "DYNAMIC_PLUGIN_PATH")
+            .expect("DYNAMIC_PLUGIN_PATH must be in build.rs imports as dynamic");
+        assert_eq!(imp_build_dyn.kind, ImportKind::Dynamic);
+        assert_eq!(imp_build_dyn.resolution, ImportResolutionKind::Dynamic);
+        assert!(
+            analysis_build
+                .dynamic_imports
+                .contains(&"DYNAMIC_PLUGIN_PATH".to_string())
+        );
+
+        // Impact verification on snapshot
+        let mut snapshot = Snapshot::new(vec![root.display().to_string()]);
+        snapshot.edges.push(GraphEdge {
+            from: "src/main.rs".to_string(),
+            to: resolved_x.clone().unwrap(),
+            label: "import".to_string(),
+        });
+        snapshot.edges.push(GraphEdge {
+            from: "src/main.rs".to_string(),
+            to: resolved_bytes.unwrap(),
+            label: "import".to_string(),
+        });
+        snapshot.edges.push(GraphEdge {
+            from: "build.rs".to_string(),
+            to: resolved_wasm.unwrap(),
+            label: "import".to_string(),
+        });
+        snapshot.edges.push(GraphEdge {
+            from: "build.rs".to_string(),
+            to: resolved_schema.unwrap(),
+            label: "import".to_string(),
+        });
+
+        let impact_x = analyze_impact(&snapshot, "data/x.json", &ImpactOptions::default());
+        assert_eq!(impact_x.direct_consumers.len(), 1);
+        assert_eq!(impact_x.direct_consumers[0].file, "src/main.rs");
+
+        let impact_wasm = analyze_impact(
+            &snapshot,
+            "plugins/session-manager.wasm",
+            &ImpactOptions::default(),
+        );
+        assert_eq!(impact_wasm.direct_consumers.len(), 1);
+        assert_eq!(impact_wasm.direct_consumers[0].file, "build.rs");
+
+        let impact_schema = analyze_impact(&snapshot, "schema.sql", &ImpactOptions::default());
+        assert_eq!(impact_schema.direct_consumers.len(), 1);
+        assert_eq!(impact_schema.direct_consumers[0].file, "build.rs");
+
+        // End-to-end scan_roots test
+        let parsed = crate::args::ParsedArgs::default();
+        let py_stdlib = std::collections::HashSet::new();
+        let scan_cfg = crate::analyzer::root_scan::ScanConfig {
+            roots: &[root.to_path_buf()],
+            parsed: &parsed,
+            extensions: None,
+            focus_set: &None,
+            exclude_set: &None,
+            ignore_exact: std::collections::HashSet::new(),
+            ignore_prefixes: Vec::new(),
+            py_stdlib: &py_stdlib,
+            cached_analyses: None,
+            collect_edges: true,
+            custom_command_macros: &[],
+            command_detection: crate::analyzer::ast_js::CommandDetectionConfig::default(),
+        };
+        let scan_results = crate::analyzer::root_scan::scan_roots(scan_cfg).expect("scan_roots");
+        let ctx = &scan_results.contexts[0];
+        let has_edge_to_x = ctx
+            .graph_edges
+            .iter()
+            .any(|(from, to, _)| from.ends_with("main.rs") && to.ends_with("data/x.json"));
+        assert!(
+            has_edge_to_x,
+            "scan_roots must produce graph edge to data/x.json: {:?}",
+            ctx.graph_edges
+        );
     }
 }

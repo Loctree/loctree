@@ -191,6 +191,7 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
             parsed.slice_target = Some(opts.target.clone());
             parsed.slice_consumers = opts.consumers;
             parsed.slice_rescan = opts.rescan;
+            parsed.include_untracked = opts.include_untracked;
             parsed.root_list = if let Some(ref root) = opts.root {
                 vec![root.clone()]
             } else {
@@ -269,6 +270,7 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
             parsed.search_exported_only = opts.exported_only;
             parsed.search_lang = opts.lang.clone();
             parsed.search_limit = opts.limit;
+            parsed.include_untracked = opts.include_untracked;
             // Discover / Mode::Search must honor find --root/--project (same as
             // literal/regex). Hardcoding cwd silently searched the wrong universe.
             parsed.root_list = opts.scan_roots();
@@ -636,20 +638,15 @@ pub fn dispatch_command(parsed_cmd: &ParsedCommand) -> DispatchResult {
         }
         Command::Help(opts) if opts.command.is_some() => {
             let cmd_name = opts.command.clone().unwrap();
-            if let Some(message) = Command::retired_command_message(&cmd_name) {
-                eprintln!("{}", message.trim_end());
-                return DispatchResult::Exit(1);
-            }
             if let Some(text) = Command::format_command_help(&cmd_name) {
                 println!("{}", text);
                 return DispatchResult::Exit(0);
-            } else {
-                eprintln!(
-                    "Unknown command '{}'. Run 'loct --help' for available commands.",
-                    cmd_name
-                );
-                return DispatchResult::Exit(1);
             }
+            eprintln!(
+                "{}",
+                crate::cli::parser::format_unknown_help_topic(&cmd_name)
+            );
+            return DispatchResult::Exit(1);
         }
         Command::Help(_) => {
             return DispatchResult::ShowHelp;
@@ -934,6 +931,7 @@ mod tests {
             with_shadows: false,
             with_ambient: false,
             with_dynamic: false,
+            workspace_closed: false,
         });
         let global = GlobalOptions {
             json: true,
@@ -1015,6 +1013,7 @@ mod tests {
             consumers: true,
             depth: None,
             rescan: false,
+            include_untracked: false,
         });
         let global = GlobalOptions {
             json: true,

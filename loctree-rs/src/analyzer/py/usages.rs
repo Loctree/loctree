@@ -28,10 +28,23 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
                 i += 2; // skip `->`
             } else {
                 i += 1; // skip `:`
+                // Check if this `:` is just a block colon ending the statement/line
+                let mut lookahead = i;
+                while lookahead < len && (bytes[lookahead] == b' ' || bytes[lookahead] == b'\t') {
+                    lookahead += 1;
+                }
+                if lookahead >= len
+                    || bytes[lookahead] == b'\n'
+                    || bytes[lookahead] == b'\r'
+                    || bytes[lookahead] == b'#'
+                {
+                    i = lookahead;
+                    continue;
+                }
             }
 
             // Skip whitespace
-            while i < len && bytes[i].is_ascii_whitespace() {
+            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
                 i += 1;
             }
 
@@ -63,6 +76,7 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
                         let ident = extract_ascii_ident(bytes, ident_start, i);
                         if !ident.is_empty()
                             && !SKIP_TYPE_HINTS.contains(&ident.as_str())
+                            && !PYTHON_KEYWORDS.contains(&ident.as_str())
                             && !local_uses.contains(&ident)
                         {
                             local_uses.push(ident);
@@ -227,7 +241,23 @@ pub(super) fn extract_python_function_calls(content: &str, local_uses: &mut Vec<
                 && !PYTHON_KEYWORDS.contains(&ident.as_str())
                 && !local_uses.contains(&ident)
             {
-                local_uses.push(ident);
+                // Check if this identifier was preceded by `def ` or `class `
+                let mut prev = start;
+                while prev > 0 && (bytes[prev - 1] == b' ' || bytes[prev - 1] == b'\t') {
+                    prev -= 1;
+                }
+                let is_def = prev >= 3
+                    && &bytes[prev - 3..prev] == b"def"
+                    && (prev == 3
+                        || !bytes[prev - 4].is_ascii_alphanumeric() && bytes[prev - 4] != b'_');
+                let is_class = prev >= 5
+                    && &bytes[prev - 5..prev] == b"class"
+                    && (prev == 5
+                        || !bytes[prev - 6].is_ascii_alphanumeric() && bytes[prev - 6] != b'_');
+
+                if !is_def && !is_class {
+                    local_uses.push(ident);
+                }
             }
         } else {
             i += 1;

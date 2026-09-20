@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use crate::aicx::summarize_entry;
-use crate::context_render::chunk_ref;
+use crate::context_render::{aicx_read_chunk_footer, chunk_ref};
 use crate::pack::{
     AuthorityLabel, AuthoritySlice, ContextPack, MemoryEntry, MemorySlice, RiskCacheScope,
     RiskSlice, RuntimeIdiomTag, RuntimeSlice,
@@ -159,12 +159,9 @@ fn render_header(input: &PillInput<'_>) -> String {
     ));
     // `AutoScope::dirty` is the canonical worktree-dirty signal captured at
     // scope discovery. Fall back to the risk slice if discovery never ran.
-    let dirty = input.scope.dirty || input.pack.risk.dirty_worktree;
-    let worktree = if dirty {
-        "dirty worktree"
-    } else {
-        "clean worktree"
-    };
+    // Git probe failure is fail-closed: never render clean/fresh/RepoVerified
+    // identity when pack.risk.git_unknown (G-DIRTY-IDENTITY).
+    let worktree = git_worktree_label(input);
     if snapshot_is_missing(input) {
         header.push_str(&format!("_no snapshot - run `loct scan` · {worktree}_\n\n"));
     } else {
@@ -209,16 +206,24 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     lines.push(String::new());
 
     // Where you stand
-    let worktree = if input.pack.risk.dirty_worktree {
-        "dirty"
-    } else {
-        "clean"
-    };
     let branch = input.scope.branch.as_deref().unwrap_or("<detached>");
-    lines.push(format!(
-        "**Where you stand.** Branch `{branch}`, {worktree} worktree, snapshot {}.",
-        snapshot_state_label(input)
-    ));
+    let stand = if git_is_unknown(input) {
+        format!(
+            "**Where you stand.** Branch `{branch}`, git: unknown, snapshot {}.",
+            snapshot_state_label(input)
+        )
+    } else {
+        let worktree = if input.pack.risk.dirty_worktree {
+            "dirty"
+        } else {
+            "clean"
+        };
+        format!(
+            "**Where you stand.** Branch `{branch}`, {worktree} worktree, snapshot {}.",
+            snapshot_state_label(input)
+        )
+    };
+    lines.push(stand);
     if !input.scope.commit_hints.is_empty() {
         lines.push(format!(
             "Last {n} commits: {commits}",
@@ -397,6 +402,11 @@ fn top_three_warnings(input: &PillInput<'_>, m: &Metrics) -> Vec<String> {
             "{} high-fan-in file(s) exceed threshold — review impact before edits. (LoctreeDerived)",
             input.pack.risk.high_fan_in.len()
         ))
+    } else if git_is_unknown(input) {
+        Some(
+            "Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)"
+                .to_string(),
+        )
     } else if input.pack.risk.dirty_worktree {
         Some("Worktree is dirty — auto-scope mirrors uncommitted edits, not committed state. (RepoVerified)".to_string())
     } else {
@@ -500,9 +510,25 @@ fn snapshot_is_missing(input: &PillInput<'_>) -> bool {
         || input.pack.risk.snapshot_health.as_deref() == Some("missing_snapshot")
 }
 
+fn git_is_unknown(input: &PillInput<'_>) -> bool {
+    input.pack.risk.git_unknown
+}
+
+fn git_worktree_label(input: &PillInput<'_>) -> &'static str {
+    if git_is_unknown(input) {
+        "git: unknown"
+    } else if input.scope.dirty || input.pack.risk.dirty_worktree {
+        "dirty worktree"
+    } else {
+        "clean worktree"
+    }
+}
+
 fn snapshot_state_label(input: &PillInput<'_>) -> &'static str {
     if snapshot_is_missing(input) {
         "no snapshot - run `loct scan`"
+    } else if git_is_unknown(input) {
+        "unknown"
     } else if input.pack.risk.stale_snapshot {
         "stale"
     } else {
@@ -964,10 +990,10 @@ fn render_memory(input: &PillInput<'_>) -> Section {
             }
             if !input.pack.memory.source_chunks.is_empty() {
                 buf.push_str("### Source chunk pointers\n\n");
-                buf.push_str(&format!(
-                    "_{n} unique chunk(s) reachable via `aicx open <chunk:ref>` (resolved against the operator's local aicx store; absolute paths intentionally redacted to keep this context-pack commitable)._\n\n",
-                    n = input.pack.memory.source_chunks.len()
+                buf.push_str(&aicx_read_chunk_footer(
+                    input.pack.memory.source_chunks.len(),
                 ));
+                buf.push_str("\n\n");
             }
         }
     }
@@ -1949,6 +1975,78 @@ mod tests {
             tldr.contains("**Intent layer.** intent layer stale (")
                 && tldr.contains("karta `03-intent-map.md`"),
             "degraded overlay must surface the stale marker in the TL;DR: {tldr}"
+        );
+    }
+
+    #[test]
+    fn w2_04_pill_git_failure_is_unknown_not_clean() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(".git"), "not-a-git-directory\n").expect("broken .git");
+        std::fs::write(tmp.path().join("src.rs"), "fn main() {}\n").expect("src");
+
+        let mut snapshot = crate::snapshot::Snapshot::new(vec![tmp.path().display().to_string()]);
+        snapshot.metadata.roots = vec![tmp.path().display().to_string()];
+        snapshot
+            .files
+            .push(crate::types::FileAnalysis::new("src.rs".to_string()));
+
+        let opts = crate::pack::ContextOptions {
+            project: Some(tmp.path().to_path_buf()),
+            no_aicx: true,
+            ..crate::pack::ContextOptions::default()
+        };
+        let pack = crate::pack::compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot)
+            .expect("compose pack against broken git");
+        assert!(
+            pack.risk.git_unknown,
+            "broken .git must fail-closed as git_unknown"
+        );
+        assert!(
+            !pack.risk.dirty_worktree,
+            "git probe failure must not claim a dirty worktree"
+        );
+        assert_eq!(
+            pack.risk.cache_scope,
+            crate::pack::RiskCacheScope::Unknown,
+            "git probe failure must not advertise a Clean cache_scope"
+        );
+        assert_eq!(
+            pack.risk.cache_scope_authority,
+            AuthorityLabel::StaleOrUnknown,
+            "unknown git identity is not RepoVerified"
+        );
+
+        let scope = AutoScope {
+            dirty: false,
+            ..AutoScope::default()
+        };
+        let input = input_with(&pack, &scope, AicxRenderStatus::Disabled);
+        let md = render_pill(input);
+        let preview: String = md.lines().take(12).collect::<Vec<_>>().join("\n");
+        eprintln!("W2-04 pill preview:\n{preview}");
+        assert!(
+            md.contains("git: unknown"),
+            "pill must render git: unknown, got:\n{md}"
+        );
+        assert!(
+            md.contains(
+                "Git identity is unknown — do not treat the worktree as clean. (StaleOrUnknown)"
+            ),
+            "pill TL;DR must fail-closed on git identity, got:\n{md}"
+        );
+        assert!(
+            !md.contains("clean worktree"),
+            "pill must not fail-open as clean worktree:\n{md}"
+        );
+        assert!(
+            !md.contains("snapshot fresh"),
+            "pill must not claim a fresh snapshot when git is unknown:\n{md}"
+        );
+        assert!(
+            !md.contains(
+                "Worktree is dirty — auto-scope mirrors uncommitted edits, not committed state. (RepoVerified)"
+            ),
+            "pill must not stamp RepoVerified on unknown git identity:\n{md}"
         );
     }
 }

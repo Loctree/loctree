@@ -142,6 +142,34 @@ pub(super) fn format_unknown_subcommand_error(input: &str) -> String {
     message
 }
 
+/// Help-topic refusal: parser-rejected names (retired `sniff`/`zombie`, typos)
+/// must not look like a live command. Suggest a live neighbour when one is close.
+pub(crate) fn format_unknown_help_topic(topic: &str) -> String {
+    let suggestion = match topic {
+        "sniff" | "zombie" => Some("findings"),
+        _ => suggest_similar_command(topic),
+    };
+    let mut message = format!("unknown topic '{topic}'");
+    if let Some(suggestion) = suggestion {
+        message.push_str(&format!(", did you mean '{suggestion}'?"));
+    } else {
+        message.push('.');
+    }
+    message.push_str("\nRun 'loct --help' for available commands.");
+    message
+}
+
+/// Shared unknown-flag refusal for slice/impact so `--markdown` (context-only)
+/// and other strays name the real vocabulary instead of a bare "Unknown option".
+pub(crate) fn format_unknown_analysis_option(command: &str, arg: &str, accepted: &str) -> String {
+    match arg {
+        "--markdown" | "--md" => format!(
+            "Unknown option '{arg}' for '{command}' command. did you mean `loct context --markdown`, or global `--json`? Accepted: {accepted}."
+        ),
+        _ => format!("Unknown option '{arg}' for '{command}' command. Accepted: {accepted}."),
+    }
+}
+
 /// Check if argument looks like a jq filter expression
 pub(super) fn is_jq_filter(arg: &str) -> bool {
     let trimmed = arg.trim();
@@ -239,5 +267,48 @@ mod tests {
         assert!(matches!(parse_color_mode("never"), Ok(ColorMode::Never)));
         assert!(matches!(parse_color_mode("no"), Ok(ColorMode::Never)));
         assert!(parse_color_mode("invalid").is_err());
+    }
+
+    #[test]
+    fn w4_01_help_matches_parser_vocabulary() {
+        use crate::cli::command::Command;
+
+        for dead in ["sniff", "zombie"] {
+            assert!(
+                Command::format_command_help(dead).is_none(),
+                "help must not advertise parser-rejected command {dead}"
+            );
+            let msg = format_unknown_help_topic(dead);
+            assert!(
+                msg.contains("unknown topic"),
+                "help {dead} must be unknown topic: {msg}"
+            );
+            assert!(
+                msg.contains("did you mean"),
+                "help {dead} must include did-you-mean: {msg}"
+            );
+        }
+
+        let extra_topics = ["jq", "sniff", "zombie"];
+        for topic in SUBCOMMANDS.iter().copied().chain(extra_topics) {
+            let Some(text) = Command::format_command_help(topic) else {
+                continue;
+            };
+            assert!(
+                !text.contains("loct sniff"),
+                "{topic} help advertises retired sniff"
+            );
+            assert!(
+                !text.contains("loct zombie"),
+                "{topic} help advertises retired zombie"
+            );
+            if topic == "jq" {
+                continue;
+            }
+            assert!(
+                is_subcommand(topic),
+                "help advertises '{topic}' but parser SUBCOMMANDS does not include it"
+            );
+        }
     }
 }

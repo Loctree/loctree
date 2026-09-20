@@ -62,6 +62,11 @@ pub struct QueryReceipt {
     /// Human-readable reasons whenever authority is not `fresh`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+    /// How many secret/token/IP/home-path replacements the AICX overlay
+    /// scrub applied before this pack was marked commitable. Zero is omitted
+    /// from the wire so legacy receipts stay byte-compatible.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub redactions: u32,
 }
 
 impl QueryReceipt {
@@ -164,6 +169,10 @@ pub fn commits_identity_compatible(a: &str, b: &str) -> bool {
 
 fn short(sha: &str) -> &str {
     if sha.len() > 8 { &sha[..8] } else { sha }
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 fn live_head_full(root: &Path) -> Option<String> {

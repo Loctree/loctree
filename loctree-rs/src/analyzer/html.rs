@@ -162,18 +162,226 @@ pub(crate) fn render_html_report(path: &Path, sections: &[ReportSection]) -> io:
         ..Default::default()
     };
 
-    // Check if this project has Tauri command data
-    let has_tauri = sections.iter().any(|s| {
-        !s.missing_handlers.is_empty()
-            || !s.unused_handlers.is_empty()
-            || !s.unregistered_handlers.is_empty()
-            || !s.command_bridges.is_empty()
-            || s.command_counts.0 > 0
-            || s.command_counts.1 > 0
-    });
+    // Check if this project has a Tauri backend or configuration (from manifest/config)
+    let has_tauri = detect_tauri_for_report(path, sections);
 
     let html = report_leptos::render_report(&leptos_sections, &js_assets, has_tauri);
     fs::write(path, html)
+}
+
+/// Check if a Cargo.toml file declares `tauri` or `tauri-build` as a dependency.
+fn cargo_toml_has_tauri(cargo_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(cargo_path) else {
+        return false;
+    };
+    if let Ok(toml_val) = toml::from_str::<toml::Value>(&content)
+        && toml_contains_tauri_dependency(&toml_val)
+    {
+        return true;
+    }
+    // Fallback line check in case of custom or invalid TOML syntax
+    content.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "[dependencies.tauri]"
+            || trimmed == "[dev-dependencies.tauri]"
+            || trimmed == "[build-dependencies.tauri]"
+            || trimmed.starts_with("[dependencies.tauri.")
+            || (trimmed.starts_with("tauri")
+                && trimmed.split_once('=').is_some_and(|(k, _)| {
+                    let k = k.trim();
+                    k == "tauri" || k == "tauri-build"
+                }))
+    })
+}
+
+fn toml_contains_tauri_dependency(val: &toml::Value) -> bool {
+    let Some(table) = val.as_table() else {
+        return false;
+    };
+    for dep_key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(deps) = table.get(dep_key).and_then(|v| v.as_table())
+            && (deps.contains_key("tauri") || deps.contains_key("tauri-build"))
+        {
+            return true;
+        }
+    }
+    if let Some(ws) = table.get("workspace").and_then(|v| v.as_table())
+        && let Some(deps) = ws.get("dependencies").and_then(|v| v.as_table())
+        && (deps.contains_key("tauri") || deps.contains_key("tauri-build"))
+    {
+        return true;
+    }
+    if let Some(targets) = table.get("target").and_then(|v| v.as_table()) {
+        for (_target_name, target_val) in targets {
+            if let Some(target_table) = target_val.as_table() {
+                for dep_key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+                    if let Some(deps) = target_table.get(dep_key).and_then(|v| v.as_table())
+                        && (deps.contains_key("tauri") || deps.contains_key("tauri-build"))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if a package.json file declares `@tauri-apps/*` dependencies.
+fn package_json_has_tauri(pkg_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(pkg_path) else {
+        return false;
+    };
+    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&content) {
+        for key in ["dependencies", "devDependencies", "peerDependencies"] {
+            if let Some(deps) = json_val.get(key).and_then(|v| v.as_object())
+                && (deps.contains_key("@tauri-apps/api")
+                    || deps.contains_key("@tauri-apps/cli")
+                    || deps.keys().any(|k| k.starts_with("@tauri-apps/")))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Detect whether a directory represents a Tauri project by inspecting its
+/// manifests and configurations (tauri.conf.json, src-tauri, Cargo.toml with
+/// tauri dependency, or package.json with @tauri-apps).
+pub(crate) fn is_tauri_project_dir(raw_root: &Path) -> bool {
+    let root = if raw_root.is_file() {
+        raw_root.parent().unwrap_or(raw_root)
+    } else {
+        raw_root
+    };
+
+    if !root.exists() {
+        return false;
+    }
+
+    if root.file_name().is_some_and(|n| n == "src-tauri") {
+        return true;
+    }
+
+    // 1. Direct tauri config files
+    if root.join("tauri.conf.json").is_file()
+        || root.join("tauri.conf.json5").is_file()
+        || root.join("Tauri.toml").is_file()
+    {
+        return true;
+    }
+
+    // 2. src-tauri directory (standard Tauri layout)
+    let src_tauri = root.join("src-tauri");
+    if src_tauri.is_dir() {
+        return true;
+    }
+    if src_tauri.join("tauri.conf.json").is_file()
+        || src_tauri.join("tauri.conf.json5").is_file()
+        || src_tauri.join("Tauri.toml").is_file()
+    {
+        return true;
+    }
+    if cargo_toml_has_tauri(&src_tauri.join("Cargo.toml")) {
+        return true;
+    }
+
+    // 3. Cargo.toml in root
+    if cargo_toml_has_tauri(&root.join("Cargo.toml")) {
+        return true;
+    }
+
+    // 4. package.json in root
+    if package_json_has_tauri(&root.join("package.json")) {
+        return true;
+    }
+
+    // 5. Monorepo / workspace direct subdirectories check (1 level down)
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str == "node_modules"
+                    || name_str == "target"
+                    || name_str == ".git"
+                    || name_str == ".loctree"
+                    || name_str == "dist"
+                    || name_str == "build"
+                {
+                    continue;
+                }
+                if p.join("tauri.conf.json").is_file()
+                    || p.join("tauri.conf.json5").is_file()
+                    || p.join("Tauri.toml").is_file()
+                    || p.join("src-tauri").is_dir()
+                    || cargo_toml_has_tauri(&p.join("Cargo.toml"))
+                    || cargo_toml_has_tauri(&p.join("src-tauri").join("Cargo.toml"))
+                    || package_json_has_tauri(&p.join("package.json"))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Determine whether this report covers a Tauri project by checking the
+/// analyzed section roots and report directory for Tauri manifests and configs.
+///
+/// Unlike earlier versions (which derived `has_tauri` from non-empty gap sections,
+/// creating a circular failure mode where clean Tauri projects lacked the Tauri tab
+/// and non-Tauri projects with gaps falsely got the gate), this detection relies
+/// strictly on manifest and configuration ground truth.
+pub(crate) fn detect_tauri_for_report(path: &Path, sections: &[ReportSection]) -> bool {
+    // 1. Check sections root directories
+    for s in sections {
+        if !s.root.is_empty() {
+            let root = Path::new(&s.root);
+            if root.exists() {
+                if is_tauri_project_dir(root) {
+                    return true;
+                }
+                // If s.root is ".loctree" inside the repo, check its parent repo root
+                if root.file_name().is_some_and(|n| n == ".loctree")
+                    && let Some(parent) = root.parent()
+                    && is_tauri_project_dir(parent)
+                {
+                    return true;
+                }
+            }
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                let joined = parent.join(root);
+                if joined.exists() && is_tauri_project_dir(&joined) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 2. Check path.parent() (e.g. if path is <root>/report.html or <root>/.loctree/report.html)
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        if is_tauri_project_dir(parent) {
+            return true;
+        }
+        // If report is inside `<repo>/.loctree/report.html`, check the repo root
+        if parent.file_name().is_some_and(|n| n == ".loctree")
+            && let Some(repo_root) = parent.parent()
+            && is_tauri_project_dir(repo_root)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Write JS assets to output directory
@@ -488,5 +696,362 @@ mod tests {
                 card.id
             );
         }
+    }
+
+    #[test]
+    fn w2_06_fixture_tauri_conf_zero_gaps_shows_tauri_surface() {
+        // Acceptance fixture 1: projekt z tauri.conf.json i zero gapów → Tauri surface widoczna
+        let tauri_tmp = tempdir().expect("tauri tmp dir");
+        let tauri_root = tauri_tmp.path();
+        fs::write(
+            tauri_root.join("tauri.conf.json"),
+            r#"{"build":{},"tauri":{"bundle":{"identifier":"com.test.app"}}}"#,
+        )
+        .expect("write tauri.conf.json");
+        let tauri_out = tauri_root.join("report.html");
+
+        let tauri_section = ReportSection {
+            root: tauri_root.display().to_string(),
+            files_analyzed: 10,
+            total_loc: 500,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 10,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: Vec::new(),
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (0, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        };
+
+        let tauri_sections = [tauri_section];
+        render_html_report(&tauri_out, &tauri_sections).expect("render tauri report");
+        let tauri_html = fs::read_to_string(&tauri_out).expect("read tauri html");
+        let tauri_detected = super::detect_tauri_for_report(&tauri_out, &tauri_sections);
+
+        assert!(
+            tauri_detected,
+            "tauri-clean fixture must detect Tauri from tauri.conf.json"
+        );
+        assert!(
+            tauri_html.contains("Tauri coverage"),
+            "tauri-clean fixture with zero gaps must display Tauri surface in HTML"
+        );
+        assert!(
+            tauri_html.contains("data-tab=\"commands\""),
+            "tauri-clean fixture must include commands tab"
+        );
+    }
+
+    #[test]
+    fn w2_06_fixture_nontauri_repo_with_gaps_has_no_tauri_gate() {
+        use crate::analyzer::report::CommandGap;
+
+        // Acceptance fixture 2: non-Tauri repo z gapami → brak Tauri gate
+        let nontauri_tmp = tempdir().expect("nontauri tmp dir");
+        let nontauri_root = nontauri_tmp.path();
+        fs::write(
+            nontauri_root.join("package.json"),
+            r#"{"name":"nontauri-app","dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .expect("write package.json");
+        let nontauri_out = nontauri_root.join("report.html");
+
+        let nontauri_section = ReportSection {
+            root: nontauri_root.display().to_string(),
+            files_analyzed: 5,
+            total_loc: 250,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 10,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: vec![
+                CommandGap {
+                    name: "reattach-workspace".to_string(),
+                    implementation_name: None,
+                    locations: vec![("src/frontend.js".to_string(), 42)],
+                    confidence: None,
+                    string_literal_matches: vec![],
+                },
+                CommandGap {
+                    name: "seek-to-timestamp".to_string(),
+                    implementation_name: None,
+                    locations: vec![("src/frontend.js".to_string(), 60)],
+                    confidence: None,
+                    string_literal_matches: vec![],
+                },
+            ],
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (2, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        };
+
+        let nontauri_sections = [nontauri_section];
+        render_html_report(&nontauri_out, &nontauri_sections).expect("render nontauri report");
+        let nontauri_html = fs::read_to_string(&nontauri_out).expect("read nontauri html");
+        let nontauri_detected = super::detect_tauri_for_report(&nontauri_out, &nontauri_sections);
+
+        assert!(
+            !nontauri_detected,
+            "nontauri-gaps fixture must not detect Tauri when no manifest exists"
+        );
+        assert!(
+            !nontauri_html.contains("Tauri coverage"),
+            "nontauri-gaps fixture must NOT display Tauri surface in HTML"
+        );
+        assert!(
+            !nontauri_html.contains("data-tab=\"commands\""),
+            "nontauri-gaps fixture must NOT include commands tab"
+        );
+    }
+
+    #[test]
+    fn w2_06_tauri_detection_not_derived_from_gaps() {
+        use crate::analyzer::report::CommandGap;
+
+        // Fixture 1: Tauri project with tauri.conf.json and ZERO gaps
+        let tauri_tmp = tempdir().expect("tauri tmp dir");
+        let tauri_root = tauri_tmp.path();
+        fs::write(
+            tauri_root.join("tauri.conf.json"),
+            r#"{"build":{},"tauri":{"bundle":{"identifier":"com.test.app"}}}"#,
+        )
+        .expect("write tauri.conf.json");
+        let tauri_out = tauri_root.join("report.html");
+
+        let tauri_section = ReportSection {
+            root: tauri_root.display().to_string(),
+            files_analyzed: 10,
+            total_loc: 500,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 10,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: Vec::new(),
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (0, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        };
+
+        let tauri_sections = [tauri_section];
+
+        // Render report for tauri-clean fixture
+        render_html_report(&tauri_out, &tauri_sections).expect("render tauri report");
+        let tauri_html = fs::read_to_string(&tauri_out).expect("read tauri html");
+
+        let tauri_detected = super::detect_tauri_for_report(&tauri_out, &tauri_sections);
+        assert!(
+            tauri_detected,
+            "tauri-clean fixture must detect Tauri from tauri.conf.json"
+        );
+        assert!(
+            tauri_html.contains("Tauri coverage"),
+            "tauri-clean fixture with zero gaps must display Tauri surface in HTML"
+        );
+        assert!(
+            tauri_html.contains("data-tab=\"commands\""),
+            "tauri-clean fixture must include commands tab"
+        );
+
+        // Fixture 2: Non-Tauri repository WITH gap data (e.g. custom JS event false-positive)
+        let nontauri_tmp = tempdir().expect("nontauri tmp dir");
+        let nontauri_root = nontauri_tmp.path();
+        fs::write(
+            nontauri_root.join("package.json"),
+            r#"{"name":"nontauri-app","dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .expect("write package.json");
+        let nontauri_out = nontauri_root.join("report.html");
+
+        let nontauri_section = ReportSection {
+            root: nontauri_root.display().to_string(),
+            files_analyzed: 5,
+            total_loc: 250,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 10,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: vec![
+                CommandGap {
+                    name: "reattach-workspace".to_string(),
+                    implementation_name: None,
+                    locations: vec![("src/frontend.js".to_string(), 42)],
+                    confidence: None,
+                    string_literal_matches: vec![],
+                },
+                CommandGap {
+                    name: "seek-to-timestamp".to_string(),
+                    implementation_name: None,
+                    locations: vec![("src/frontend.js".to_string(), 60)],
+                    confidence: None,
+                    string_literal_matches: vec![],
+                },
+            ],
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (2, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        };
+
+        let nontauri_sections = [nontauri_section];
+
+        // Render report for nontauri-gaps fixture
+        render_html_report(&nontauri_out, &nontauri_sections).expect("render nontauri report");
+        let nontauri_html = fs::read_to_string(&nontauri_out).expect("read nontauri html");
+
+        let nontauri_detected = super::detect_tauri_for_report(&nontauri_out, &nontauri_sections);
+        assert!(
+            !nontauri_detected,
+            "nontauri-gaps fixture must not detect Tauri when no manifest exists"
+        );
+        assert!(
+            !nontauri_html.contains("Tauri coverage"),
+            "nontauri-gaps fixture must NOT display Tauri surface in HTML"
+        );
+        assert!(
+            !nontauri_html.contains("data-tab=\"commands\""),
+            "nontauri-gaps fixture must NOT include commands tab"
+        );
+
+        // Also test manifest variants (src-tauri, Cargo.toml with tauri dependency)
+        let src_tauri_tmp = tempdir().expect("src-tauri tmp");
+        fs::create_dir_all(src_tauri_tmp.path().join("src-tauri")).expect("create src-tauri");
+        assert!(super::is_tauri_project_dir(src_tauri_tmp.path()));
+
+        let cargo_tauri_tmp = tempdir().expect("cargo tauri tmp");
+        fs::write(
+            cargo_tauri_tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"desktop\"\n[dependencies]\ntauri = \"2.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        assert!(super::is_tauri_project_dir(cargo_tauri_tmp.path()));
+
+        // Emit JSON report for runtime proof logging
+        let proof = serde_json::json!({
+            "fixtures": [
+                {
+                    "fixture": "tauri-clean",
+                    "has_tauri": tauri_detected,
+                    "surface_visible": tauri_html.contains("Tauri coverage"),
+                    "missing_handlers_count": 0,
+                    "unused_handlers_count": 0
+                },
+                {
+                    "fixture": "nontauri-gaps",
+                    "has_tauri": nontauri_detected,
+                    "surface_visible": nontauri_html.contains("Tauri coverage"),
+                    "missing_handlers_count": 2,
+                    "unused_handlers_count": 0
+                }
+            ]
+        });
+        println!("RUNTIME_PROOF_JSON: {}", proof);
     }
 }

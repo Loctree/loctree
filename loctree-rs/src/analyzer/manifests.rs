@@ -272,6 +272,7 @@ fn summarize_pyproject_toml(root: &Path) -> Option<PyProjectSummary> {
 
     let mut scripts = Vec::new();
     let mut entry_points = Vec::new();
+    let mut script_entries = Vec::new();
     let mut project_name = None;
 
     if let Some(project) = table.get("project").and_then(|v| v.as_table()) {
@@ -281,12 +282,32 @@ fn summarize_pyproject_toml(root: &Path) -> Option<PyProjectSummary> {
             .map(|s| s.to_string());
 
         if let Some(project_scripts) = project.get("scripts").and_then(|v| v.as_table()) {
-            scripts = project_scripts.keys().cloned().collect();
+            for (key, val) in project_scripts {
+                scripts.push(key.clone());
+                if let Some(val_str) = val.as_str() {
+                    script_entries.push(ManifestEntry {
+                        key: key.clone(),
+                        path: val_str.to_string(),
+                    });
+                }
+            }
             scripts.sort();
         }
 
         if let Some(project_entries) = project.get("entry-points").and_then(|v| v.as_table()) {
-            entry_points = project_entries.keys().cloned().collect();
+            for (group_key, group_val) in project_entries {
+                entry_points.push(group_key.clone());
+                if let Some(group_table) = group_val.as_table() {
+                    for (k, v) in group_table {
+                        if let Some(v_str) = v.as_str() {
+                            script_entries.push(ManifestEntry {
+                                key: k.clone(),
+                                path: v_str.to_string(),
+                            });
+                        }
+                    }
+                }
+            }
             entry_points.sort();
         }
     }
@@ -300,9 +321,17 @@ fn summarize_pyproject_toml(root: &Path) -> Option<PyProjectSummary> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         if let Some(poetry_scripts) = poetry.get("scripts").and_then(|v| v.as_table()) {
-            for key in poetry_scripts.keys() {
+            for (key, val) in poetry_scripts {
                 if !scripts.contains(key) {
                     scripts.push(key.clone());
+                }
+                if let Some(val_str) = val.as_str()
+                    && !script_entries.iter().any(|e| &e.key == key)
+                {
+                    script_entries.push(ManifestEntry {
+                        key: key.clone(),
+                        path: val_str.to_string(),
+                    });
                 }
             }
             scripts.sort();
@@ -314,5 +343,6 @@ fn summarize_pyproject_toml(root: &Path) -> Option<PyProjectSummary> {
         poetry_name,
         scripts,
         entry_points,
+        script_entries,
     })
 }

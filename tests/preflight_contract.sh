@@ -131,3 +131,53 @@ if ! printf '%s\n' "$ci_executable" | grep -Eq \
   echo "self-hosted CI is not guarded from fork pull requests" >&2
   exit 1
 fi
+
+CODEQL_WORKFLOW="$ROOT_DIR/.github/workflows/codeql.yml"
+codeql_java_setup_step="$(awk '
+  /- name: Set up Java for JetBrains plugin analysis/ { flag=1; print; next }
+  flag && /^      - name: / { exit }
+  flag { print }
+' "$CODEQL_WORKFLOW")"
+codeql_java_build_step="$(awk '
+  /- name: Build JetBrains plugin for CodeQL/ { flag=1; print; next }
+  flag && /^      - name: / { exit }
+  flag { print }
+' "$CODEQL_WORKFLOW")"
+codeql_java_matrix_entry="$(awk '
+  /- language: java-kotlin/ { flag=1; print; next }
+  flag && /^          - language: / { exit }
+  flag && /^    steps:/ { exit }
+  flag { print }
+' "$CODEQL_WORKFLOW")"
+if ! grep -Fq 'name: Analyze (${{ matrix.language }})' "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not keep per-language analyze jobs" >&2
+  exit 1
+fi
+if ! grep -Fq "language: java-kotlin" "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not analyze the JetBrains Kotlin surface" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$codeql_java_matrix_entry" | grep -Fq "build-mode: manual"; then
+  echo "CodeQL workflow does not opt Java/Kotlin into an explicit build" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$codeql_java_setup_step" | grep -Fq "name: Set up Java for JetBrains plugin analysis"; then
+  echo "CodeQL workflow does not declare a dedicated Java setup step for the Kotlin lane" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$codeql_java_setup_step" | grep -Fq "distribution: temurin"; then
+  echo "CodeQL workflow does not request the Temurin Java distribution for the Kotlin lane" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$codeql_java_build_step" | grep -Fq "working-directory: editors/jetbrains"; then
+  echo "CodeQL workflow does not build the JetBrains Gradle project in place" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$codeql_java_build_step" | grep -Fq "./gradlew --no-daemon classes testClasses"; then
+  echo "CodeQL workflow does not compile the JetBrains Gradle sources before analysis" >&2
+  exit 1
+fi
+if ! grep -Fq 'category: "/language:${{ matrix.language }}"' "$CODEQL_WORKFLOW"; then
+  echo "CodeQL workflow does not separate per-language SARIF categories" >&2
+  exit 1
+fi

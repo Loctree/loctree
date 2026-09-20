@@ -15,7 +15,7 @@ use super::classify::is_semantic_code_language;
 use super::dead_parrots::{DeadExport, DeadFilterConfig, find_dead_exports};
 use super::dist::DistResult;
 use super::health_inputs::structural_defects;
-use super::health_score::{HealthIssue, HealthMetrics, calculate_health_score};
+use super::health_score::{HealthIssue, HealthMetrics, HealthScore, calculate_health_score};
 use super::memory_lint::lint_memory_file;
 use super::occurrences::SuggestedNext;
 use super::report::{Confidence, DupSeverity, RankedDup, ReportSection};
@@ -77,7 +77,10 @@ pub struct ForAiSummary {
     /// Priority message for the AI
     pub priority: String,
     /// Health score 0-100 (vector-based with log-normalization)
-    pub health_score: u8,
+    pub health_score: Option<u8>,
+    /// Why `health_score` is null. Present only for the unknown case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_reason: Option<String>,
     /// Breakdown by severity: certain (50%), high (30%), smell (20%)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health_details: Option<super::health_score::HealthDetails>,
@@ -643,8 +646,13 @@ fn compute_summary(
     // single `.h`/`.m` file (36 ObjC files invisible). The repo had
     // command injection in PandocConverter that loctree never surfaced.
     let (coverage_warning, priority) = match coverage_warning_for(analyses, files_analyzed) {
+        Some(warning) if warning.kind == "no_files_analyzed" => {
+            // Zero-input: unknown, not a capped 50 and not HEALTHY praise.
+            let unknown = format!("UNKNOWN: {}", warning.message);
+            (Some(warning), unknown)
+        }
         Some(warning) => {
-            health.health = health.health.min(50);
+            health.health = health.health.map(|h| h.min(50));
             health.details.certain.count += 1;
             health.details.certain.items.push(HealthIssue {
                 kind: "coverage_warning".to_string(),
@@ -676,6 +684,7 @@ fn compute_summary(
         functions_with_params,
         priority,
         health_score: health.health,
+        health_reason: health.reason.clone(),
         health_details: Some(health.details),
         normalized_density: Some(health.normalized_density),
         coverage_warning,
@@ -684,20 +693,27 @@ fn compute_summary(
 
 /// Compute a [`CoverageWarning`] for the for-ai summary when loctree's
 /// parser coverage is structurally insufficient to make a health
-/// verdict. Returns `None` when the surface is healthy (at least one
-/// semantic-code-language file analyzed) **or** when the surface is
-/// genuinely empty (no analyses at all — nothing meaningful to warn
-/// about; spurious warning on cold-start would just be noise).
+/// verdict.
 ///
-/// Today fires on: `files_analyzed > 0` AND zero of those files have a
-/// language listed in [`is_semantic_code_language`]. Catches the
-/// 2026-05-22 `markdown-editor-mac-objc` case (4 analyzed files, all
-/// CSS/Markdown, 36 unparsed `.h`/`.m`).
+/// Fires on:
+/// - `files_analyzed == 0` — empty/unscanned input (G-VACUOUS-HEALTH).
+///   Returns `kind: no_files_analyzed` so callers render unknown, not HEALTHY.
+/// - `files_analyzed > 0` AND zero semantic-code-language files. Catches the
+///   2026-05-22 `markdown-editor-mac-objc` case (4 analyzed files, all
+///   CSS/Markdown, 36 unparsed `.h`/`.m`).
 fn coverage_warning_for(
     analyses: &[FileAnalysis],
     files_analyzed: usize,
 ) -> Option<CoverageWarning> {
-    if files_analyzed == 0 || analyses.is_empty() {
+    if files_analyzed == 0 {
+        return Some(CoverageWarning {
+            kind: "no_files_analyzed".to_string(),
+            files_analyzed: 0,
+            parsed_languages: Vec::new(),
+            message: HealthScore::NO_FILES_ANALYZED_REASON.to_string(),
+        });
+    }
+    if analyses.is_empty() {
         return None;
     }
     let mut parsed_languages: Vec<String> = analyses
@@ -1723,8 +1739,33 @@ mod tests {
 
         assert_eq!(summary.files_analyzed, 0);
         assert_eq!(summary.total_loc, 0);
-        assert_eq!(summary.health_score, 100);
-        assert!(summary.priority.contains("HEALTHY"));
+        assert_eq!(summary.health_score, None);
+        assert_eq!(
+            summary.health_reason.as_deref(),
+            Some(HealthScore::NO_FILES_ANALYZED_REASON)
+        );
+        assert!(summary.priority.starts_with("UNKNOWN:"));
+        assert!(!summary.priority.contains("HEALTHY"));
+        let warning = summary
+            .coverage_warning
+            .as_ref()
+            .expect("zero-input must emit no_files_analyzed");
+        assert_eq!(warning.kind, "no_files_analyzed");
+        assert_eq!(warning.message, HealthScore::NO_FILES_ANALYZED_REASON);
+    }
+
+    #[test]
+    fn w1_04_for_ai_zero_files_json_is_null_not_100() {
+        let summary = compute_summary(&[], &[], None);
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(
+            json["health_score"].is_null(),
+            "JSON health_score must be null, got {json}"
+        );
+        assert_eq!(json["health_reason"], "no files analyzed");
+        assert_eq!(json["coverage_warning"]["kind"], "no_files_analyzed");
+        assert_eq!(json["coverage_warning"]["message"], "no files analyzed");
+        assert_ne!(summary.health_score, Some(100));
     }
 
     #[test]
@@ -1742,7 +1783,7 @@ mod tests {
 
         assert_eq!(summary.files_analyzed, 3);
         assert_eq!(summary.total_loc, 350);
-        assert_eq!(summary.health_score, 100);
+        assert_eq!(summary.health_score, Some(100));
         assert!(summary.priority.contains("HEALTHY"));
     }
 
@@ -1778,8 +1819,8 @@ mod tests {
         let summary = compute_summary(&sections, &analyses, None);
 
         assert!(
-            summary.health_score <= 50,
-            "health_score must be capped at 50 when no semantic-code language analyzed; got {}",
+            summary.health_score.is_some_and(|h| h <= 50),
+            "health_score must be capped at 50 when no semantic-code language analyzed; got {:?}",
             summary.health_score
         );
         let warning = summary
@@ -1821,7 +1862,8 @@ mod tests {
             summary.coverage_warning
         );
         assert_eq!(
-            summary.health_score, 100,
+            summary.health_score,
+            Some(100),
             "no issues + code language present → full health"
         );
         assert!(
@@ -1831,9 +1873,7 @@ mod tests {
         );
     }
 
-    /// Negative: empty analyses (cold start, missing snapshot) must
-    /// stay silent. Firing a warning on an empty corpus would be just
-    /// noise — there is nothing to verify.
+    /// Empty analyses (cold start) is unknown, not HEALTHY 100.
     #[test]
     fn test_compute_summary_coverage_warning_silent_on_empty_analyses() {
         let sections: Vec<ReportSection> = vec![];
@@ -1841,11 +1881,12 @@ mod tests {
 
         let summary = compute_summary(&sections, &analyses, None);
 
-        assert!(
-            summary.coverage_warning.is_none(),
-            "coverage_warning must stay silent on empty corpus"
-        );
-        assert_eq!(summary.health_score, 100);
+        let warning = summary
+            .coverage_warning
+            .as_ref()
+            .expect("zero files must warn, not stay silent HEALTHY");
+        assert_eq!(warning.kind, "no_files_analyzed");
+        assert_eq!(summary.health_score, None);
     }
 
     /// Negative: synthetic analyses without language (test fixtures
@@ -1862,7 +1903,7 @@ mod tests {
             summary.coverage_warning.is_none(),
             "coverage_warning must stay silent for analyses with no language tag"
         );
-        assert_eq!(summary.health_score, 100);
+        assert_eq!(summary.health_score, Some(100));
     }
 
     /// Coverage warning shapes the `certain` dimension too: items must
@@ -1925,7 +1966,7 @@ mod tests {
         assert!(summary.priority.contains("CRITICAL"));
         // Note: missing_handlers is excluded from health score (not available in findings.rs)
         // so health score remains 100 with empty analyses
-        assert_eq!(summary.health_score, 100);
+        assert_eq!(summary.health_score, Some(100));
     }
 
     #[test]
@@ -1947,10 +1988,14 @@ mod tests {
         let clean = compute_summary(&[clean_section], &[], None);
         let lazy = compute_summary(&[lazy_section], &[], None);
 
-        assert_eq!(clean.health_score, 100, "no cycles means no SMELL penalty");
+        assert_eq!(
+            clean.health_score,
+            Some(100),
+            "no cycles means no SMELL penalty"
+        );
         assert!(
             lazy.health_score < clean.health_score,
-            "lazy cycle must lower health (was {}, clean {})",
+            "lazy cycle must lower health (was {:?}, clean {:?})",
             lazy.health_score,
             clean.health_score
         );
@@ -1975,7 +2020,7 @@ mod tests {
         assert!(
             breaking.health_score < structural.health_score,
             "breaking cycle (CERTAIN 50%) must penalize more than structural (SMELL 20%); \
-             got breaking={}, structural={}",
+             got breaking={:?}, structural={:?}",
             breaking.health_score,
             structural.health_score
         );
@@ -2240,12 +2285,13 @@ mod tests {
         let summary = compute_summary(&sections, &analyses, None);
 
         // Should be in valid range
-        assert!(summary.health_score <= 100);
+        assert!(summary.health_score.is_some_and(|h| h <= 100));
         // missing_handlers is now excluded from health score (for consistency with findings.rs)
         // With empty analyses and only missing_handlers, health should be 100
         assert_eq!(
-            summary.health_score, 100,
-            "Expected health = 100 since missing_handlers is excluded, got {}",
+            summary.health_score,
+            Some(100),
+            "Expected health = 100 since missing_handlers is excluded, got {:?}",
             summary.health_score
         );
     }
@@ -2549,13 +2595,13 @@ mod tests {
         // Health score should be reduced slightly (only 1 same_lang twin - SMELL category)
         // With log-normalization, penalty is small for 1 issue in ~1000 LOC
         assert!(
-            summary.health_score < 100,
-            "Expected health < 100 with twins, got {}",
+            summary.health_score.is_some_and(|h| h < 100),
+            "Expected health < 100 with twins, got {:?}",
             summary.health_score
         );
         assert!(
-            summary.health_score > 90,
-            "Expected health > 90 with only 2 minor issues, got {}",
+            summary.health_score.is_some_and(|h| h > 90),
+            "Expected health > 90 with only 2 minor issues, got {:?}",
             summary.health_score
         );
 
@@ -2611,7 +2657,7 @@ mod tests {
         assert_eq!(summary.twins_cross_language, 1);
 
         // Health score should be 100 (cross-lang twins don't penalize)
-        assert_eq!(summary.health_score, 100);
+        assert_eq!(summary.health_score, Some(100));
         assert!(summary.priority.contains("HEALTHY"));
     }
 
@@ -2644,7 +2690,7 @@ mod tests {
         // With empty analyses, it returns 0
         assert_eq!(summary.twins_dead_parrots, 0);
         // With no dead parrots, health should be 100
-        assert_eq!(summary.health_score, 100);
+        assert_eq!(summary.health_score, Some(100));
         // Priority should be HEALTHY since no issues
         assert!(summary.priority.contains("HEALTHY"));
     }

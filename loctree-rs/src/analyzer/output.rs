@@ -838,6 +838,7 @@ pub fn process_root_context(
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs,
             },
         );
@@ -1552,7 +1553,7 @@ Top duplicate exports (showing {} actionable, {} cross-lang silenced):",
             .metrics();
 
             let score = calculate_health_score(&metrics);
-            Some(score.health)
+            score.health
         };
 
         let mut section = ReportSection {

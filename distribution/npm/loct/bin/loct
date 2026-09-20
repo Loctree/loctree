@@ -1,4 +1,6 @@
 #!/usr/bin/env node
 
-// `loct` is a short alias for `loctree` — same runtime binary.
-require('../index.js').runRuntime(process.argv.slice(2));
+// `loct` is the canonical CLI name. It must run the `loct` native binary, NOT
+// the `loctree` one: the `loctree` binary prints its own deprecation banner,
+// so routing `loct` there would nag users who already type the right name.
+require('../index.js').runBinary('loct', process.argv.slice(2));

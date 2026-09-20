@@ -112,8 +112,11 @@ pub struct FindingsSummary {
     pub files: usize,
     /// Total lines of code
     pub loc: usize,
-    /// Health score 0-100 (higher is better)
-    pub health_score: u8,
+    /// Health score 0-100 (higher is better). `null` when no files analyzed.
+    pub health_score: Option<u8>,
+    /// Why `health_score` is null. Omitted when the score is real.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_reason: Option<String>,
     /// Number of dead parrots
     pub dead_parrots: usize,
     /// Number of shadow exports
@@ -933,6 +936,7 @@ fn calculate_summary(input: &SummaryInput) -> FindingsSummary {
 
     let health = calculate_health_score(&health_metrics);
     let health_score = health.health;
+    let health_reason = health.reason.clone();
 
     // React lint summary
     let react_lint_summary = if input.react_lint.is_empty() {
@@ -980,6 +984,7 @@ fn calculate_summary(input: &SummaryInput) -> FindingsSummary {
         files,
         loc,
         health_score,
+        health_reason,
         dead_parrots: input.dead_parrots.len(),
         shadow_exports: input.shadow_exports.len(),
         duplicate_groups: input.duplicates.len(),
@@ -1349,7 +1354,8 @@ mod tests {
         let summary = FindingsSummary {
             files: 100,
             loc: 10000,
-            health_score: 85,
+            health_score: Some(85),
+            health_reason: None,
             dead_parrots: 5,
             shadow_exports: 2,
             duplicate_groups: 10,

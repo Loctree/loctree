@@ -888,7 +888,7 @@ EXAMPLES:
                         if i >= sub_args.len() {
                             return Err("--project requires a directory argument".to_string());
                         }
-                        project = Some(PathBuf::from(&sub_args[i]));
+                        project = Some(parse_cache_project_arg(&sub_args[i])?);
                     }
                     other => return Err(format!("Unknown cache list option: {}", other)),
                 }
@@ -913,7 +913,7 @@ EXAMPLES:
                         if i >= sub_args.len() {
                             return Err("--project requires a directory argument".to_string());
                         }
-                        project = Some(PathBuf::from(&sub_args[i]));
+                        project = Some(parse_cache_project_arg(&sub_args[i])?);
                     }
                     "--older-than" => {
                         i += 1;
@@ -969,6 +969,17 @@ EXAMPLES:
             other
         )),
     }
+}
+
+/// `--project ""` must not parse as cwd. Empty/whitespace is not an address.
+fn parse_cache_project_arg(raw: &str) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err(
+            "Refusing empty --project. Pass an explicit project directory; an empty string is not cwd."
+                .to_string(),
+        );
+    }
+    Ok(PathBuf::from(raw))
 }
 
 /// Parse `loct prune-old-artifacts [PATH] [OPTIONS]` — local `.loctree/` housekeeping.
@@ -1317,6 +1328,33 @@ mod tests {
             parse_cache_command(&args).is_err(),
             "--project without a value must be rejected"
         );
+    }
+
+    /// W4-04 / G-CACHE-GC: empty `--project` is a parser error, not cwd.
+    #[test]
+    fn w4_04_cache_clean_empty_project_refused() {
+        for empty in ["", "   ", "\t"] {
+            let args = vec![
+                "clean".into(),
+                "--project".into(),
+                empty.into(),
+                "--force".into(),
+            ];
+            let err = parse_cache_command(&args)
+                .expect_err("empty --project must be a parser error, not cwd");
+            assert!(
+                err.contains("Refusing empty --project"),
+                "empty {empty:?} must name the empty-project refusal, got: {err}"
+            );
+            assert!(
+                err.contains("empty string is not cwd"),
+                "refusal must say empty is not cwd, got: {err}"
+            );
+        }
+
+        let list_err = parse_cache_command(&["list".into(), "--project".into(), "".into()])
+            .expect_err("empty --project on list is also not cwd");
+        assert!(list_err.contains("Refusing empty --project"));
     }
 
     #[test]

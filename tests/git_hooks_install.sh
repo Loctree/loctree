@@ -18,7 +18,7 @@ git -C "$MAIN_REPO" config user.name "Loctree Test"
 git -C "$MAIN_REPO" config user.email "loctree-test@example.invalid"
 printf '%s\n' "fixture" > "$MAIN_REPO/README.md"
 git -C "$MAIN_REPO" add README.md
-git -C "$MAIN_REPO" commit -qm "test: seed worktree fixture"
+git -C "$MAIN_REPO" commit --no-verify -qm "test: seed worktree fixture"
 git -C "$MAIN_REPO" worktree add -q -b hook-test "$WORKTREE"
 
 # The main checkout deliberately represents an older branch. Its tracked
@@ -38,7 +38,7 @@ cp -R "$ROOT_DIR/tools/hooks" "$WORKTREE/tools/hooks"
 cp "$ROOT_DIR/tools/install-git-hooks.sh" "$WORKTREE/tools/install-git-hooks.sh"
 chmod +x "$WORKTREE/tools/install-git-hooks.sh"
 git -C "$WORKTREE" add tools
-git -C "$WORKTREE" commit -qm "fix(hooks): install safe hook source"
+git -C "$WORKTREE" commit --no-verify -qm "fix(hooks): install safe hook source"
 make -s -C "$WORKTREE" -f "$ROOT_DIR/Makefile" git-hooks
 
 common_dir="$(git -C "$WORKTREE" rev-parse --git-common-dir)"
@@ -138,14 +138,14 @@ cp "$ROOT_DIR/tools/install-git-hooks.sh" \
   "$SOURCE_POLICY_REPO/tools/install-git-hooks.sh"
 chmod +x "$SOURCE_POLICY_REPO/tools/install-git-hooks.sh"
 git -C "$SOURCE_POLICY_REPO" add tools
-git -C "$SOURCE_POLICY_REPO" commit -qm "test: seed hook source policy fixture"
+git -C "$SOURCE_POLICY_REPO" commit --no-verify -qm "test: seed hook source policy fixture"
 
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$EXTERNAL_HOOK"
 chmod +x "$EXTERNAL_HOOK"
 rm "$SOURCE_POLICY_REPO/tools/hooks/pre-commit"
 ln -s "$EXTERNAL_HOOK" "$SOURCE_POLICY_REPO/tools/hooks/pre-commit"
 git -C "$SOURCE_POLICY_REPO" add tools/hooks/pre-commit
-git -C "$SOURCE_POLICY_REPO" commit -qm "test: track symlinked hook source"
+git -C "$SOURCE_POLICY_REPO" commit --no-verify -qm "test: track symlinked hook source"
 if make -s -C "$SOURCE_POLICY_REPO" -f "$ROOT_DIR/Makefile" \
   git-hooks >/dev/null 2>&1; then
   echo "expected git-hooks to reject a symlinked hook source" >&2
@@ -161,7 +161,7 @@ cp "$ROOT_DIR/tools/hooks/pre-commit" \
   "$SOURCE_POLICY_REPO/tools/hooks/pre-commit"
 chmod -x "$SOURCE_POLICY_REPO/tools/hooks/pre-commit"
 git -C "$SOURCE_POLICY_REPO" add tools/hooks/pre-commit
-git -C "$SOURCE_POLICY_REPO" commit -qm "test: track non-executable hook source"
+git -C "$SOURCE_POLICY_REPO" commit --no-verify -qm "test: track non-executable hook source"
 if make -s -C "$SOURCE_POLICY_REPO" -f "$ROOT_DIR/Makefile" \
   git-hooks >/dev/null 2>&1; then
   echo "expected git-hooks to reject a non-executable hook source" >&2
@@ -178,7 +178,7 @@ cp "$ROOT_DIR/tools/hooks/pre-commit" \
   "$SOURCE_POLICY_REPO/tools/hooks/pre-commit"
 chmod +x "$SOURCE_POLICY_REPO/tools/hooks/pre-commit"
 git -C "$SOURCE_POLICY_REPO" add tools/hooks/pre-commit
-git -C "$SOURCE_POLICY_REPO" commit -qm "test: restore executable hook source"
+git -C "$SOURCE_POLICY_REPO" commit --no-verify -qm "test: restore executable hook source"
 git -C "$SOURCE_POLICY_REPO" update-index --assume-unchanged \
   tools/hooks/pre-commit
 printf '%s\n' '#!/bin/sh' 'exit 42' > \
@@ -286,7 +286,7 @@ cp -R "$ROOT_DIR/tools/hooks" "$DORMANT_REPO/tools/hooks"
 cp "$ROOT_DIR/tools/install-git-hooks.sh" "$DORMANT_REPO/tools/install-git-hooks.sh"
 chmod +x "$DORMANT_REPO/tools/install-git-hooks.sh"
 git -C "$DORMANT_REPO" add tools
-git -C "$DORMANT_REPO" commit -qm "fix(hooks): seed dormant policy fixture"
+git -C "$DORMANT_REPO" commit --no-verify -qm "fix(hooks): seed dormant policy fixture"
 git -C "$DORMANT_REPO" worktree add -q -b dormant-test "$DORMANT_WORKTREE"
 dormant_git_dir="$(git -C "$DORMANT_WORKTREE" rev-parse --git-dir)"
 git config --file "$dormant_git_dir/config.worktree" core.hooksPath foreign-hooks

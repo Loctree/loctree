@@ -123,6 +123,12 @@ fn detect_missing_barrels(snapshot: &Snapshot) -> Vec<MissingBarrel> {
     let mut missing = Vec::new();
 
     for (dir, files) in &dir_files {
+        // index.ts / index.js is a JS/TS culture. A stray .ts elsewhere must
+        // not produce barrel advice for Rust/Python/Swift/shell directories.
+        if !directory_uses_js_ts_barrel_culture(files) {
+            continue;
+        }
+
         // Skip if directory has index file
         if has_index_file(files) {
             continue;
@@ -339,6 +345,35 @@ fn is_barrel_file(path: &str) -> bool {
     } else {
         false
     }
+}
+
+fn is_js_ts_barrel_language(lang: &str) -> bool {
+    // classify maps tsx→ts and jsx/mjs/cjs→js; mts/cts stay as the raw ext.
+    matches!(lang, "ts" | "js" | "mts" | "cts")
+}
+
+/// Dominant language of a directory (strict unique max). Ties → none.
+fn directory_dominant_language(files: &[String]) -> Option<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for file in files {
+        let lang = super::classify::language_from_path(file);
+        if lang.is_empty() {
+            continue;
+        }
+        *counts.entry(lang).or_insert(0) += 1;
+    }
+    let mut ranked: Vec<(String, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    match ranked.as_slice() {
+        [(lang, count), rest @ ..] if rest.iter().all(|(_, other)| other < count) => {
+            Some(lang.clone())
+        }
+        _ => None,
+    }
+}
+
+fn directory_uses_js_ts_barrel_culture(files: &[String]) -> bool {
+    directory_dominant_language(files).is_some_and(|lang| is_js_ts_barrel_language(&lang))
 }
 
 /// Format barrel analysis for display
@@ -565,5 +600,264 @@ mod tests {
         assert!(analysis.missing_barrels.is_empty());
         assert!(analysis.deep_chains.is_empty());
         assert!(analysis.inconsistent_paths.is_empty());
+    }
+
+    fn file(path: &str) -> crate::types::FileAnalysis {
+        crate::types::FileAnalysis {
+            path: path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn edge(from: &str, to: &str) -> crate::snapshot::GraphEdge {
+        crate::snapshot::GraphEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            label: "import".to_string(),
+        }
+    }
+
+    fn snapshot_with(
+        files: Vec<crate::types::FileAnalysis>,
+        edges: Vec<crate::snapshot::GraphEdge>,
+    ) -> Snapshot {
+        Snapshot {
+            metadata: crate::snapshot::SnapshotMetadata {
+                ..Default::default()
+            },
+            files,
+            edges,
+            export_index: std::collections::HashMap::new(),
+            command_bridges: Vec::new(),
+            event_bridges: Vec::new(),
+            barrels: Vec::new(),
+            semantic_facts: None,
+            symbol_graph: None,
+        }
+    }
+
+    /// Acceptance: Rust crate + one stray .ts elsewhere → zero barrel advice for Rust dirs.
+    ///
+    /// rust/src has 3 files and 3 external imports, so the old repo-wide guard
+    /// (is_pure_rust_project defeated by tools/stray.ts) would have emitted
+    /// "create index.ts" for the Rust crate.
+    fn rust_crate_plus_stray_ts() -> Snapshot {
+        snapshot_with(
+            vec![
+                file("rust/src/lib.rs"),
+                file("rust/src/a.rs"),
+                file("rust/src/b.rs"),
+                file("rust/bin/main.rs"),
+                file("tools/stray.ts"),
+            ],
+            vec![
+                edge("rust/bin/main.rs", "rust/src/lib.rs"),
+                edge("rust/bin/main.rs", "rust/src/a.rs"),
+                edge("rust/bin/main.rs", "rust/src/b.rs"),
+            ],
+        )
+    }
+
+    /// Acceptance: TS directory without index.ts → "create index.ts" still fires.
+    fn ts_dir_without_index() -> Snapshot {
+        snapshot_with(
+            vec![
+                file("frontend/utils.ts"),
+                file("frontend/types.ts"),
+                file("frontend/helpers.ts"),
+                file("app.ts"),
+            ],
+            vec![
+                edge("app.ts", "frontend/utils.ts"),
+                edge("app.ts", "frontend/types.ts"),
+                edge("app.ts", "frontend/helpers.ts"),
+            ],
+        )
+    }
+
+    #[test]
+    fn w3_02_directory_language_gate_is_per_directory() {
+        assert_eq!(
+            directory_dominant_language(&[
+                "rust/src/lib.rs".into(),
+                "rust/src/a.rs".into(),
+                "rust/src/b.rs".into(),
+            ]),
+            Some("rs".to_string())
+        );
+        assert_eq!(
+            directory_dominant_language(
+                &["frontend/utils.ts".into(), "frontend/types.tsx".into(),]
+            ),
+            Some("ts".to_string())
+        );
+        assert_eq!(
+            directory_dominant_language(&["a.rs".into(), "b.ts".into()]),
+            None,
+            "ties stay silent"
+        );
+        assert!(!directory_uses_js_ts_barrel_culture(&[
+            "rust/src/lib.rs".into(),
+            "rust/src/a.rs".into(),
+        ]));
+        assert!(directory_uses_js_ts_barrel_culture(&[
+            "frontend/utils.ts".into(),
+            "frontend/types.tsx".into(),
+        ]));
+        assert!(
+            directory_uses_js_ts_barrel_culture(&["esm/a.mts".into(), "esm/b.mts".into()]),
+            "mts is TypeScript barrel culture (classify leaves the raw ext)"
+        );
+    }
+
+    #[test]
+    fn w3_02_rust_crate_with_stray_ts_gets_zero_rust_barrel_advice() {
+        // Acceptance: Rust crate + one stray .ts elsewhere → zero barrel advice for Rust dirs.
+        let snapshot = rust_crate_plus_stray_ts();
+        assert!(
+            !is_pure_rust_project(&snapshot),
+            "stray .ts must defeat the repo-wide rust skip"
+        );
+
+        let analysis = analyze_barrel_chaos(&snapshot);
+        assert!(
+            analysis.missing_barrels.is_empty(),
+            "Rust crate + stray .ts must yield zero missing-barrel advice, got {:?}",
+            analysis.missing_barrels
+        );
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .all(|b| !b.directory.starts_with("rust")),
+            "Rust dirs must not get barrel advice: {:?}",
+            analysis.missing_barrels
+        );
+
+        let formatted = format_barrel_analysis(&analysis);
+        assert!(
+            !formatted.contains("rust/src"),
+            "formatted advice leaked a Rust dir:\n{formatted}"
+        );
+        assert!(
+            !formatted.contains("create index.ts"),
+            "stray .ts must not turn on create index.ts for a Rust crate:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn w3_02_ts_directory_without_index_still_advises_create_index_ts() {
+        // Acceptance: TS directory without index.ts → "create index.ts" still fires.
+        let snapshot = ts_dir_without_index();
+        let analysis = analyze_barrel_chaos(&snapshot);
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .any(|b| b.directory == "frontend"),
+            "TS dir without index.ts must still be advised: {:?}",
+            analysis.missing_barrels
+        );
+
+        let formatted = format_barrel_analysis(&analysis);
+        assert!(
+            formatted.contains("create index.ts"),
+            "TS missing-barrel advice must still say create index.ts:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("frontend/"),
+            "formatted advice must name the TS dir:\n{formatted}"
+        );
+    }
+
+    #[test]
+    fn w3_02_barrel_advice_respects_directory_language() {
+        // Mixed repo: both acceptance fixtures in one snapshot (the original hak).
+        // Repo-wide is_pure_rust_project is false because of the .ts files, so
+        // the old guard would advise "create index.ts" for rust/src and pkg.
+        let snapshot = snapshot_with(
+            vec![
+                file("rust/src/lib.rs"),
+                file("rust/src/a.rs"),
+                file("rust/src/b.rs"),
+                file("rust/bin/main.rs"),
+                file("pkg/mod_a.py"),
+                file("pkg/mod_b.py"),
+                file("pkg/mod_c.py"),
+                file("app.py"),
+                file("tools/stray.ts"),
+                file("frontend/utils.ts"),
+                file("frontend/types.ts"),
+                file("frontend/helpers.ts"),
+                file("app.ts"),
+            ],
+            vec![
+                edge("rust/bin/main.rs", "rust/src/lib.rs"),
+                edge("rust/bin/main.rs", "rust/src/a.rs"),
+                edge("rust/bin/main.rs", "rust/src/b.rs"),
+                edge("app.py", "pkg/mod_a.py"),
+                edge("app.py", "pkg/mod_b.py"),
+                edge("app.py", "pkg/mod_c.py"),
+                edge("app.ts", "frontend/utils.ts"),
+                edge("app.ts", "frontend/types.ts"),
+                edge("app.ts", "frontend/helpers.ts"),
+            ],
+        );
+
+        assert!(
+            !is_pure_rust_project(&snapshot),
+            "mixed fixture must defeat the repo-wide rust skip"
+        );
+
+        let analysis = analyze_barrel_chaos(&snapshot);
+
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .all(|b| !b.directory.starts_with("rust")),
+            "Rust dirs must not get barrel advice: {:?}",
+            analysis.missing_barrels
+        );
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .all(|b| b.directory != "pkg"),
+            "Python dirs stay silent (W3-06 owns __init__): {:?}",
+            analysis.missing_barrels
+        );
+        assert!(
+            analysis
+                .missing_barrels
+                .iter()
+                .any(|b| b.directory == "frontend"),
+            "TS dir without index.ts must still be advised: {:?}",
+            analysis.missing_barrels
+        );
+        assert_eq!(
+            analysis
+                .missing_barrels
+                .iter()
+                .map(|b| b.directory.as_str())
+                .collect::<Vec<_>>(),
+            vec!["frontend"],
+            "only the TS dir should be missing a barrel: {:?}",
+            analysis.missing_barrels
+        );
+
+        let formatted = format_barrel_analysis(&analysis);
+        assert!(
+            !formatted.contains("rust/src"),
+            "formatted advice leaked a Rust dir:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("create index.ts"),
+            "TS missing-barrel advice must still say create index.ts:\n{formatted}"
+        );
+        assert!(
+            formatted.contains("frontend/"),
+            "formatted advice must name the TS dir:\n{formatted}"
+        );
     }
 }

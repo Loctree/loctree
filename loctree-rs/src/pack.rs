@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::aicx::redact::redact_secrets;
 use crate::aicx::{
     AicxClient, IntentAuthority, ScopeKeywords, SemanticReadiness, authority_for_intent,
     is_aicx_available, score_intent, summarize_entry,
@@ -33,8 +34,10 @@ use crate::analyzer::classify::{ArtifactClass, artifact_class};
 use crate::analyzer::env_truth::source_reads::collect_source_env_reads;
 use crate::cli::command::GlobalOptions;
 use crate::cli::dispatch::DispatchResult;
-use crate::context_render::chunk_ref;
-use crate::context_scope::{ResolvedScope, ScopeReport, TaskReport, resolve_scope};
+use crate::context_render::{aicx_read_chunk_footer, chunk_ref};
+use crate::context_scope::{
+    ResolvedScope, ScopeMode, ScopeReport, TaskReport, resolve_scope_with_mode,
+};
 use crate::context_stack::{
     PackageManager, ProjectStack, dedup_top_n, detect_project_stack, extract_ci_test_commands,
     read_makefile_test_targets,
@@ -55,6 +58,14 @@ use crate::types::{ImportKind, ImportResolutionKind, OutputMode};
 // 1.1: additive `receipt` field (loctree.receipt.v1 identity binding, W1-A).
 pub const CONTEXT_SCHEMA_VERSION: &str = "1.1";
 const MAKE_RUNTIME_TARGET_LIMIT: usize = 6;
+/// Bare/default context keeps at most this many target files. The pack must
+/// declare how many were kept vs the indexed universe so agents never read a
+/// truncated slice as the whole repo (G-FULL-SCOPE).
+const DEFAULT_SCOPE_TARGET_LIMIT: usize = 8;
+/// `--task` ranker: a file named verbatim in the task outranks substring
+/// token hits (path +5 / export +3) so `launch.sh` is not buried by recency
+/// hotspots that merely share a word (G-TASK-RANKING).
+const EXACT_NAME_TASK_BOOST: usize = 50;
 
 /// Options for composing a ContextPack.
 #[derive(Debug, Clone, Default)]
@@ -68,8 +79,14 @@ pub struct ContextOptions {
     /// Natural-language task hint for context narrowing.
     pub task: Option<String>,
 
-    /// Deterministic structural scope selectors. Repeatable; multiple selectors are ANDed.
+    /// Deterministic structural scope selectors. Repeatable; default combine is AND.
+    /// Comma-joined selectors in one value (`path:a,path:b`) are a union.
     pub scopes: Vec<String>,
+
+    /// How repeated `--scope` flags combine. Default [`ScopeMode::All`] (AND).
+    /// `--scope-mode any` unions them. Comma-joined values stay a union
+    /// regardless of this flag.
+    pub scope_mode: ScopeMode,
 
     /// Include AICX memory overlay.
     pub with_aicx: bool,
@@ -139,6 +156,10 @@ pub enum AuthorityLabel {
 pub struct ContextPack {
     pub schema_version: String,
     pub project: ProjectIdentity,
+    /// How many targets this pack selected versus the indexed universe.
+    /// Silent `truncate(8)` without this field reads as whole-repo truth.
+    #[serde(default)]
+    pub coverage: PackCoverage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<ScopeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +174,17 @@ pub struct ContextPack {
     /// snapshot fingerprint, and the answering binary (`loctree.receipt.v1`).
     #[serde(default)]
     pub receipt: QueryReceipt,
+}
+
+/// Declared target coverage for a ContextPack (bare and `--full`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackCoverage {
+    /// Targets actually composed into this pack.
+    pub selected: usize,
+    /// Indexed files in the snapshot (the universe the selection was drawn from).
+    pub total: usize,
+    /// `true` when `selected < total` — the pack is a slice, not the repo.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -414,6 +446,10 @@ pub struct RiskSlice {
     pub cache_scope_authority: AuthorityLabel,
     pub stale_snapshot: bool,
     pub dirty_worktree: bool,
+    /// Git status/HEAD could not be determined. Fail-closed: never treat
+    /// `dirty_worktree == false` as a verified clean worktree (G-DIRTY-IDENTITY).
+    #[serde(default)]
+    pub git_unknown: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -637,6 +673,7 @@ impl ContextPack {
         Self {
             schema_version: CONTEXT_SCHEMA_VERSION.to_string(),
             project,
+            coverage: PackCoverage::default(),
             scope: None,
             task: None,
             structural: StructuralSlice::default(),
@@ -793,6 +830,7 @@ pub(crate) fn compose_context_pack_with_global(
             );
             retain_context_targets(&mut targets);
         }
+        bind_pack_coverage(&mut pack, &snapshot, targets.len());
         if targets.is_empty() && resolved_scope.is_some() {
             pack.risk = compose_risk_slice(&effective_opts, &snapshot);
         } else if targets.is_empty() && (effective_opts.changed || effective_opts.task.is_some()) {
@@ -862,6 +900,7 @@ pub(crate) fn compose_context_pack_with_global(
         dedup_authority(&mut pack.authority);
     }
     pack.memory.overlay = overlay_state;
+    scrub_context_pack(&mut pack);
     apply_scope_cache_marker(&mut pack);
 
     // Spec: when --with-aicx is requested but the binary is missing, log the
@@ -922,6 +961,7 @@ pub fn compose_context_pack_from_snapshot(
         );
         retain_context_targets(&mut targets);
     }
+    bind_pack_coverage(&mut pack, snapshot, targets.len());
 
     if targets.is_empty() && resolved_scope.is_some() {
         pack.risk = compose_risk_slice(&effective_opts, snapshot);
@@ -986,6 +1026,7 @@ pub fn compose_context_pack_from_snapshot(
         dedup_authority(&mut pack.authority);
     }
     pack.memory.overlay = overlay_state;
+    scrub_context_pack(&mut pack);
     apply_scope_cache_marker(&mut pack);
 
     Ok(pack)
@@ -2531,9 +2572,17 @@ pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSli
 
     let snapshot_root = context_snapshot_root(opts);
     let current_head = current_git_head(&snapshot_root);
+    let git_dirty = git_worktree_dirty(&snapshot_root);
+    let git_unknown = git_dirty.is_none();
     let stale_snapshot = snapshot_commit_is_stale(snapshot, current_head.as_deref());
-    let dirty_worktree = git_worktree_dirty(&snapshot_root).unwrap_or(false);
-    let cache_scope = cache_scope_for(snapshot, &snapshot_root, stale_snapshot, dirty_worktree);
+    let dirty_worktree = git_dirty.unwrap_or(false);
+    let cache_scope = cache_scope_for(
+        snapshot,
+        &snapshot_root,
+        stale_snapshot,
+        dirty_worktree,
+        git_unknown,
+    );
     let importer_counts = importer_counts_direct(snapshot);
 
     let mut scoped_counts: Vec<(String, usize)> = risk_scope_files(opts, snapshot)
@@ -2576,12 +2625,14 @@ pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSli
         hotspots,
         high_fan_in,
         snapshot_health: Some(
-            snapshot_health_label(stale_snapshot, dirty_worktree, empty_corpus).to_string(),
+            snapshot_health_label(stale_snapshot, dirty_worktree, empty_corpus, git_unknown)
+                .to_string(),
         ),
         cache_scope: cache_scope.clone(),
         cache_scope_authority: cache_scope_authority(&cache_scope),
         stale_snapshot,
         dirty_worktree,
+        git_unknown,
     }
 }
 
@@ -3175,7 +3226,8 @@ fn snapshot_commit_is_stale(snapshot: &Snapshot, current_head: Option<&str>) -> 
         return false;
     };
     let Some(current_head) = current_head else {
-        return false;
+        // Fail-closed: a named snapshot commit with no live HEAD is not "fresh".
+        return true;
     };
     !(current_head.starts_with(snapshot_commit) || snapshot_commit.starts_with(current_head))
 }
@@ -3185,6 +3237,7 @@ fn cache_scope_for(
     snapshot_root: &Path,
     stale_snapshot: bool,
     dirty_worktree: bool,
+    git_unknown: bool,
 ) -> RiskCacheScope {
     if snapshot.metadata.roots.is_empty() {
         return RiskCacheScope::Unknown;
@@ -3196,6 +3249,9 @@ fn cache_scope_for(
         snapshot_root,
     );
     if expected != actual {
+        return RiskCacheScope::Unknown;
+    }
+    if git_unknown {
         return RiskCacheScope::Unknown;
     }
     if stale_snapshot {
@@ -3211,11 +3267,15 @@ fn snapshot_health_label(
     stale_snapshot: bool,
     dirty_worktree: bool,
     empty_corpus: bool,
+    git_unknown: bool,
 ) -> &'static str {
     // Empty successful snapshot wins the clean label so agents can separate
     // "verified zero files" from "no authority / missing snapshot".
     if empty_corpus && !stale_snapshot && !dirty_worktree {
         return "empty_snapshot";
+    }
+    if git_unknown {
+        return "unknown";
     }
     match (stale_snapshot, dirty_worktree) {
         (true, true) => "stale_dirty",
@@ -3860,7 +3920,7 @@ fn resolve_context_scope_for_opts(
     if opts.file.is_some() || opts.scopes.is_empty() {
         return Ok(None);
     }
-    resolve_scope(&opts.scopes, project_root, snapshot)
+    resolve_scope_with_mode(&opts.scopes, project_root, snapshot, opts.scope_mode)
         .map(Some)
         .map_err(ContextLoadError::Scope)
 }
@@ -3971,6 +4031,37 @@ fn compose_bare_overlay_state(
     ))
 }
 
+/// Fail-closed scrub of AICX overlay/memory before a pack is marked commitable.
+/// Count is written once onto the receipt so compose+render never double-count.
+fn scrub_context_pack(pack: &mut ContextPack) {
+    let mut count = 0u32;
+    for entry in &mut pack.memory.entries {
+        scrub_field(&mut entry.text, &mut count);
+        scrub_field(&mut entry.source_chunk, &mut count);
+    }
+    for chunk in &mut pack.memory.source_chunks {
+        scrub_field(chunk, &mut count);
+    }
+    if let Some(overlay) = pack.memory.overlay.as_mut() {
+        for thesis in &mut overlay.theses {
+            scrub_field(thesis, &mut count);
+        }
+        for path in &mut overlay.scope_paths {
+            scrub_field(path, &mut count);
+        }
+        scrub_field(&mut overlay.refresh_command, &mut count);
+    }
+    pack.receipt.redactions = count;
+}
+
+fn scrub_field(value: &mut String, count: &mut u32) {
+    let result = redact_secrets(value);
+    if result.count > 0 {
+        *count += result.count;
+        *value = result.text;
+    }
+}
+
 pub fn compose_default_scope(
     snapshot: &Snapshot,
     opts: &ContextOptions,
@@ -4006,7 +4097,7 @@ pub fn compose_default_scope(
     }
 
     stable_dedup_strings(&mut targets);
-    targets.truncate(8);
+    targets.truncate(DEFAULT_SCOPE_TARGET_LIMIT);
     targets
 }
 
@@ -4021,6 +4112,15 @@ fn non_empty_context_path(path: &Path) -> Option<String> {
 
 fn retain_context_targets(targets: &mut Vec<String>) {
     targets.retain(|target| !target.trim().is_empty());
+}
+
+fn bind_pack_coverage(pack: &mut ContextPack, snapshot: &Snapshot, selected: usize) {
+    let total = snapshot.files.len();
+    pack.coverage = PackCoverage {
+        selected,
+        total,
+        truncated: selected < total,
+    };
 }
 
 fn top_hub_files(snapshot: &Snapshot, limit: usize) -> Vec<String> {
@@ -4213,9 +4313,11 @@ fn get_changed_targets(opts: &ContextOptions, snapshot: &Snapshot) -> Vec<String
 }
 
 fn get_task_targets(task: &str, snapshot: &Snapshot) -> Vec<String> {
+    // Keep dots so `launch.sh` is one token, not `launch` + discarded `sh`.
     let tokens: Vec<String> = task
         .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
+        .split(|c: char| !(c.is_alphanumeric() || c == '.'))
+        .map(|t| t.trim_matches('.'))
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_string())
         .collect();
@@ -4229,6 +4331,11 @@ fn get_task_targets(task: &str, snapshot: &Snapshot) -> Vec<String> {
     for file in &snapshot.files {
         let mut score = 0;
         let file_lower = file.path.to_lowercase();
+        let basename = Path::new(&file.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(file.path.as_str())
+            .to_lowercase();
 
         for token in &tokens {
             if file_lower.contains(token) {
@@ -4246,6 +4353,9 @@ fn get_task_targets(task: &str, snapshot: &Snapshot) -> Vec<String> {
                     }
                 }
             }
+        }
+        if tokens.iter().any(|token| token == &basename) {
+            score += EXACT_NAME_TASK_BOOST;
         }
         if score > 0 {
             scores.insert(file.path.clone(), score);
@@ -4420,6 +4530,7 @@ fn merge_risk(dest: &mut RiskSlice, src: RiskSlice) {
     dest.cache_scope_authority = src.cache_scope_authority;
     dest.stale_snapshot = dest.stale_snapshot || src.stale_snapshot;
     dest.dirty_worktree = dest.dirty_worktree || src.dirty_worktree;
+    dest.git_unknown = dest.git_unknown || src.git_unknown;
 }
 
 fn dedup_risk(dest: &mut RiskSlice) {
@@ -4594,6 +4705,16 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
             snapshot_id
         ));
     }
+    md.push_str(&format!(
+        "- **Coverage**: {} of {} targets selected{}\n",
+        pack.coverage.selected,
+        pack.coverage.total,
+        if pack.coverage.truncated {
+            " (truncated — not the whole repo)"
+        } else {
+            ""
+        }
+    ));
     md.push('\n');
 
     md.push_str(
@@ -4632,6 +4753,11 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
         "- **Binary**: `{}`
 ",
         pack.receipt.binary_id
+    ));
+    md.push_str(&format!(
+        "- **Redactions**: {}
+",
+        pack.receipt.redactions
     ));
     for diagnostic in &pack.receipt.diagnostics {
         md.push_str(&format!(
@@ -5098,12 +5224,8 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
 
 ",
             );
-            md.push_str(&format!(
-                "_{n} unique chunk(s) reachable via `aicx open <chunk:ref>` (resolved against the operator's local aicx store; absolute paths intentionally redacted to keep this context-pack commitable)._
-
-",
-                n = pack.memory.source_chunks.len(),
-            ));
+            md.push_str(&aicx_read_chunk_footer(pack.memory.source_chunks.len()));
+            md.push_str("\n\n");
             for chunk in &pack.memory.source_chunks {
                 let opaque = chunk_ref(chunk);
                 md.push_str(&format!(
@@ -6207,6 +6329,111 @@ mod tests {
         assert_eq!(risk.snapshot_health.as_deref(), Some("empty_snapshot"));
         assert_ne!(risk.snapshot_health.as_deref(), Some("missing_snapshot"));
         assert!(!risk.stale_snapshot);
+    }
+
+    fn twelve_file_universe() -> Snapshot {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+        for i in 0..12 {
+            let mut file = FileAnalysis::new(format!("src/file_{i:02}.rs"));
+            file.loc = 80 + i;
+            file.language = "rust".to_string();
+            snapshot.files.push(file);
+        }
+        snapshot
+    }
+
+    #[test]
+    fn w2_04_full_pack_declares_coverage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let snapshot = twelve_file_universe();
+        let bare_opts = ContextOptions {
+            project: Some(tmp.path().to_path_buf()),
+            no_aicx: true,
+            ..ContextOptions::default()
+        };
+        let full_opts = ContextOptions {
+            full: true,
+            ..bare_opts.clone()
+        };
+
+        let bare = compose_context_pack_from_snapshot(&bare_opts, tmp.path(), &snapshot)
+            .expect("bare pack");
+        let full = compose_context_pack_from_snapshot(&full_opts, tmp.path(), &snapshot)
+            .expect("full pack");
+
+        for (label, pack) in [("bare", &bare), ("full", &full)] {
+            assert_eq!(
+                pack.coverage.selected, DEFAULT_SCOPE_TARGET_LIMIT,
+                "{label} selected"
+            );
+            assert_eq!(pack.coverage.total, 12, "{label} total");
+            assert!(pack.coverage.truncated, "{label} must declare truncation");
+            let json = serde_json::to_value(pack).expect("serialize");
+            assert_eq!(json["coverage"]["selected"], 8, "{label} json selected");
+            assert_eq!(json["coverage"]["total"], 12, "{label} json total");
+            assert_eq!(
+                json["coverage"]["truncated"].as_bool(),
+                Some(true),
+                "{label} json truncated"
+            );
+            eprintln!("W2-04 {label} coverage json: {}", json["coverage"]);
+            let md = format_context_pack_markdown(pack);
+            assert!(
+                md.contains(
+                    "**Coverage**: 8 of 12 targets selected (truncated — not the whole repo)"
+                ),
+                "{label} markdown must declare coverage, got:\n{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn w2_04_task_exact_name_outranks_recency() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        let mut named = FileAnalysis::new("launch.sh".to_string());
+        named.loc = 4;
+        snapshot.files.push(named);
+        for i in 0..6 {
+            let mut hotspot = FileAnalysis::new(format!("src/fix_permissions_{i}.rs"));
+            hotspot.loc = 900;
+            hotspot.exports.push(ExportSymbol::new(
+                "fix_permissions".to_string(),
+                "function",
+                "named",
+                Some(1),
+            ));
+            snapshot.files.push(hotspot);
+        }
+
+        let ranked = get_task_targets("fix launch.sh permissions", &snapshot);
+        eprintln!("W2-04 task ranking: {ranked:?}");
+        assert_eq!(
+            ranked.first().map(String::as_str),
+            Some("launch.sh"),
+            "exact-name file must outrank substring recency stand-ins: {ranked:?}"
+        );
+
+        let opts = ContextOptions {
+            project: Some(tmp.path().to_path_buf()),
+            no_aicx: true,
+            task: Some("fix launch.sh permissions".to_string()),
+            ..ContextOptions::default()
+        };
+        let pack =
+            compose_context_pack_from_snapshot(&opts, tmp.path(), &snapshot).expect("task pack");
+        assert!(
+            pack.structural
+                .files
+                .iter()
+                .any(|file| file.path == "launch.sh"),
+            "pack targets must include launch.sh, got {:?}",
+            pack.structural
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// W1-A negative control (audit wrong-commit class LCT-D/E/L): a snapshot
@@ -8025,6 +8252,122 @@ python_version = "3.12"
         assert!(!json.contains("retrieval_mode"), "{json}");
         assert!(!json.contains("low_lexical_match"), "{json}");
         assert!(json.contains("\"relevance\":1"));
+    }
+
+    fn w5_01_leaky_overlay() -> crate::aicx::overlay::OverlayRenderState {
+        crate::aicx::overlay::OverlayRenderState {
+            schema_version: "loctree.overlay.intent.v1".to_string(),
+            repo_id: "loctree-suite".to_string(),
+            store_revision: format!("sr1:{}", "a".repeat(64)),
+            overlay_revision: format!("ov1:{}", "b".repeat(64)),
+            snapshot_commit: "abc1234".to_string(),
+            anchor_catalog_revision: format!("acr1:{}", "c".repeat(64)),
+            producer_version: "aicx 0.12.2-test".to_string(),
+            freshness: crate::aicx::overlay::OverlayFreshness::Fresh,
+            key_transition: None,
+            theses: vec![
+                "token sk-test_abcdefghijklmnopqrstuvwxyz12".to_string(),
+                "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK8=\n-----END RSA PRIVATE KEY-----"
+                    .to_string(),
+                "wrote /Users/alice/.ssh/id_rsa".to_string(),
+            ],
+            scope_paths: Vec::new(),
+            refresh_command: "aicx overlay --repo /tmp/loctree --format json".to_string(),
+            refresh_recommended: false,
+        }
+    }
+
+    #[test]
+    fn w5_01_aicx_overlay_redacts_secrets() {
+        let mut pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some("/tmp/proj".to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: None,
+        });
+        pack.memory.entries.push(MemoryEntry {
+            kind: "decision".to_string(),
+            // Fake PEM fixture exercising the redaction path (W5-01) — not a credential.
+            // nosemgrep: generic.secrets.security.detected-private-key.detected-private-key
+            text: "token sk-test_abcdefghijklmnopqrstuvwxyz12 pem -----BEGIN RSA PRIVATE KEY----- MIIBOgIBAAJBAK8= -----END RSA PRIVATE KEY----- path /Users/alice/.ssh/id_rsa".to_string(),
+            authority: AuthorityLabel::AicxOperator,
+            source_chunk: "/tmp/aicx/store/s1.md".to_string(),
+            agent: "claude".to_string(),
+            date: "2026-09-19".to_string(),
+            timestamp: None,
+            session_id: "s1".to_string(),
+            project: "loctree-suite".to_string(),
+            relevance: 9,
+            retrieval_score: None,
+            retrieval_label: None,
+            retrieval_mode: None,
+            low_lexical_match: false,
+        });
+        pack.memory.overlay = Some(w5_01_leaky_overlay());
+        scrub_context_pack(&mut pack);
+
+        let md = format_context_pack_markdown(&pack);
+        eprintln!(
+            "W5-01 runtime proof: redactions={} markdown has [redacted]={}",
+            pack.receipt.redactions,
+            md.contains("[redacted]")
+        );
+        assert!(
+            pack.receipt.redactions >= 3,
+            "receipt must count overlay+entry redactions, got {}",
+            pack.receipt.redactions
+        );
+        assert!(
+            md.contains("[redacted]"),
+            "pack markdown must show [redacted]: {md}"
+        );
+        assert!(
+            md.contains("**Redactions**:"),
+            "receipt markdown must list the redaction count: {md}"
+        );
+        assert!(
+            !md.contains("sk-test_"),
+            "fake token must not survive pack markdown: {md}"
+        );
+        assert!(
+            !md.contains("BEGIN RSA"),
+            "PEM material must not survive pack markdown: {md}"
+        );
+        assert!(
+            !md.contains("/Users/alice"),
+            "abs home path must not survive pack markdown: {md}"
+        );
+        let overlay = pack.memory.overlay.as_ref().expect("overlay");
+        let joined = overlay.theses.join("\n");
+        assert!(joined.contains("[redacted]"), "{joined}");
+        assert!(!joined.contains("sk-test_"), "{joined}");
+        assert!(!joined.contains("BEGIN RSA"), "{joined}");
+        assert!(!joined.contains("/Users/alice"), "{joined}");
+        assert_eq!(
+            overlay.store_revision,
+            format!("sr1:{}", "a".repeat(64)),
+            "hex overlay revision must not be treated as base64"
+        );
+    }
+
+    #[test]
+    fn w5_01_pack_advertises_aicx_read_only() {
+        let mut pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some("/tmp/proj".to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: None,
+        });
+        pack.memory.source_chunks = vec!["/tmp/aicx/store/s1.md".to_string()];
+        let md = format_context_pack_markdown(&pack);
+        assert!(
+            md.contains("`aicx read <chunk:ref>`"),
+            "pack must advertise aicx read: {md}"
+        );
+        assert!(
+            !md.contains("aicx open"),
+            "pack must not advertise aicx open: {md}"
+        );
     }
 
     #[cfg(unix)]

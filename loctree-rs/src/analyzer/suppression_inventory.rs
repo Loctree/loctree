@@ -30,9 +30,15 @@
 
 use regex::Regex;
 use serde::Serialize;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
+
+use crate::fs_utils::{
+    GitIgnoreChecker, build_ignore_matchers, is_allowed_hidden, load_loctreeignore, should_ignore,
+};
+use crate::types::Options;
 
 /// Kind of silencer detected at a source-side call site.
 ///
@@ -182,10 +188,16 @@ pub struct SilencerInventory {
     pub total: usize,
     /// Total unique files touched by any matched silencer.
     pub total_files: usize,
+    /// Walk entries skipped because they matched `.gitignore` or `.loctignore`.
+    ///
+    /// Directory prunes count as one entry (the ignored directory itself), not
+    /// every file inside — the point is an honest exclusion receipt, not a
+    /// second walk of vendored trees.
+    pub excluded_by_ignore: usize,
 }
 
 impl SilencerInventory {
-    fn from_matches(matches: Vec<SilencerMatch>) -> Self {
+    fn from_matches(matches: Vec<SilencerMatch>, excluded_by_ignore: usize) -> Self {
         let mut counts: HashMap<SilencerKind, usize> = HashMap::new();
         let mut files: HashMap<SilencerKind, HashSet<String>> = HashMap::new();
         let mut all_files: HashSet<String> = HashSet::new();
@@ -210,6 +222,7 @@ impl SilencerInventory {
             files_per_kind: files_out,
             total,
             total_files,
+            excluded_by_ignore,
         }
     }
 }
@@ -282,10 +295,17 @@ static SHELLCHECK_RE: LazyLock<Regex> =
 
 /// Recursively walk the project and return every literal silencer occurrence.
 ///
-/// The walk uses `walkdir` and applies a fixed set of always-skipped
-/// directories (`target/`, `node_modules/`, `.git/`, `dist/`, `build/`,
-/// `.venv/`, `venv/`, `__pycache__/`). Hidden directories are skipped except
-/// `.github/` (CI silencers belong in the inventory).
+/// Walk policy matches the repo scanner (`root_scan` / `gather_files`):
+/// - heavy dirs (`target/`, `node_modules/`, `.git/`, `.venv/`, `venv/`,
+///   `__pycache__/`) are pruned without descending
+/// - hidden names use [`is_allowed_hidden`] (`.github`, `.env`, truth configs)
+/// - `.gitignore` via [`GitIgnoreChecker`] (same libgit2 engine as the scan)
+/// - `.loctignore` / `.loctreeignore` via [`load_loctreeignore`] +
+///   [`build_ignore_matchers`] + [`should_ignore`]
+///
+/// `include_ignored` (the global `--include-ignored` knob) opts `.loctignore`
+/// paths back in. It does **not** override `.gitignore`, matching
+/// `GlobalOptions::include_ignored`.
 ///
 /// The optional `extra_ignore_globs` (intended for `.semgrepignore` patterns)
 /// are matched against each candidate file's repo-relative path.
@@ -299,11 +319,42 @@ pub fn scan_repo(
     filter: &HashSet<SilencerKind>,
     extra_ignore_globs: &[String],
 ) -> Vec<SilencerMatch> {
+    scan_repo_inner(root, filter, extra_ignore_globs, false).matches
+}
+
+struct ScanOutcome {
+    matches: Vec<SilencerMatch>,
+    excluded_by_ignore: usize,
+}
+
+fn scan_repo_inner(
+    root: &Path,
+    filter: &HashSet<SilencerKind>,
+    extra_ignore_globs: &[String],
+    include_ignored: bool,
+) -> ScanOutcome {
     use walkdir::WalkDir;
 
     let mut matches: Vec<SilencerMatch> = Vec::new();
     let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let ignore_matcher = build_ignore_matcher(extra_ignore_globs);
+    let excluded_by_ignore = Cell::new(0usize);
+
+    // `--include-ignored` keeps `.loctignore` paths in the walk (same contract
+    // as the scanner). Gitignore still applies.
+    let loctignore_patterns = if include_ignored {
+        Vec::new()
+    } else {
+        load_loctreeignore(&canonical_root)
+    };
+    let loct_matchers = build_ignore_matchers(&loctignore_patterns, &canonical_root);
+    let options = Options {
+        ignore_paths: loct_matchers.ignore_paths,
+        ignore_globs: loct_matchers.ignore_globs,
+        use_gitignore: true,
+        ..Options::default()
+    };
+    let git_checker = GitIgnoreChecker::new(&canonical_root);
 
     let walker = WalkDir::new(&canonical_root)
         .follow_links(false)
@@ -313,24 +364,18 @@ pub fn scan_repo(
             if entry.depth() == 0 {
                 return true;
             }
-            // Always skip these heavy/irrelevant dirs.
+            // Same heavy-dir prune as `gather_files` — not an ignore-file skip.
             if matches!(
                 name.as_ref(),
-                "target"
-                    | "node_modules"
-                    | ".git"
-                    | "dist"
-                    | "build"
-                    | ".venv"
-                    | "venv"
-                    | "__pycache__"
-                    | ".cargo"
-                    | ".npm"
+                "target" | "node_modules" | ".git" | ".venv" | "venv" | "__pycache__"
             ) {
                 return false;
             }
-            // Skip other dotfiles/dotdirs except `.github/` (CI silencers count).
-            if name.starts_with('.') && name != ".github" {
+            if name.starts_with('.') && !is_allowed_hidden(name.as_ref()) {
+                return false;
+            }
+            if should_ignore(entry.path(), &options, git_checker.as_ref()) {
+                excluded_by_ignore.set(excluded_by_ignore.get() + 1);
                 return false;
             }
             true
@@ -373,16 +418,33 @@ pub fn scan_repo(
             .then(a.kind.cmp(&b.kind))
     });
 
-    matches
+    ScanOutcome {
+        matches,
+        excluded_by_ignore: excluded_by_ignore.get(),
+    }
 }
 
 /// Convenience wrapper that scans the repo and aggregates into an `Inventory`.
+///
+/// Honors `.gitignore` and `.loctignore`. Pass `include_ignored = true` to
+/// opt `.loctignore` paths back in (does not override `.gitignore`).
 pub fn inventory(
     root: &Path,
     filter: &HashSet<SilencerKind>,
     extra_ignore_globs: &[String],
 ) -> SilencerInventory {
-    SilencerInventory::from_matches(scan_repo(root, filter, extra_ignore_globs))
+    inventory_with_ignore(root, filter, extra_ignore_globs, false)
+}
+
+/// Same as [`inventory`], with the scanner's `--include-ignored` contract.
+pub fn inventory_with_ignore(
+    root: &Path,
+    filter: &HashSet<SilencerKind>,
+    extra_ignore_globs: &[String],
+    include_ignored: bool,
+) -> SilencerInventory {
+    let outcome = scan_repo_inner(root, filter, extra_ignore_globs, include_ignored);
+    SilencerInventory::from_matches(outcome.matches, outcome.excluded_by_ignore)
 }
 
 fn is_supported_ext(ext: &str) -> bool {
@@ -1506,5 +1568,126 @@ mod tests {
         assert_eq!(inv.files_per_kind.get("dead-code"), Some(&1));
         assert_eq!(inv.total, 2);
         assert_eq!(inv.total_files, 1);
+    }
+
+    fn init_git_fixture(root: &Path) {
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root)
+            .output()
+            .ok();
+        // Isolate from the developer machine's global excludesFile so the
+        // GitIgnoreChecker sees only this fixture's `.gitignore`.
+        std::process::Command::new("git")
+            .args(["config", "core.excludesFile", ""])
+            .current_dir(root)
+            .output()
+            .ok();
+    }
+
+    #[test]
+    fn w1_05_suppressions_respect_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        init_git_fixture(tmp.path());
+        write(tmp.path(), ".gitignore", "tmp/\n");
+        write(tmp.path(), "src/keep.rs", "// nosemgrep\nfn keep() {}\n");
+        write(
+            tmp.path(),
+            "tmp/vendored.rs",
+            "// nosemgrep\nfn noise() {}\n",
+        );
+
+        let outcome = scan_repo_inner(tmp.path(), &HashSet::new(), &[], false);
+        let files: Vec<_> = outcome
+            .matches
+            .iter()
+            .filter(|m| m.kind == SilencerKind::Nosemgrep)
+            .map(|m| m.file.as_str())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.contains("keep.rs")),
+            "tracked source must remain visible, got: {:?}",
+            files
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.contains("vendored") || f.contains("tmp/")),
+            "gitignored tmp/vendored.rs must not appear, got: {:?}",
+            files
+        );
+        assert!(
+            outcome.excluded_by_ignore >= 1,
+            "gitignore prune must name at least one excluded path, got {}",
+            outcome.excluded_by_ignore
+        );
+
+        // `--include-ignored` opts loctignore back in; it must not un-ignore
+        // gitignored trees (GlobalOptions contract).
+        let with_include = scan_repo_inner(tmp.path(), &HashSet::new(), &[], true);
+        assert!(
+            !with_include
+                .matches
+                .iter()
+                .any(|m| m.file.contains("vendored") || m.file.contains("tmp/")),
+            "--include-ignored must not override .gitignore, got: {:?}",
+            with_include
+                .matches
+                .iter()
+                .map(|m| m.file.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn w1_05_suppressions_respect_loctignore() {
+        let tmp = TempDir::new().unwrap();
+        init_git_fixture(tmp.path());
+        write(tmp.path(), ".loctignore", "parked/\n");
+        write(tmp.path(), "src/keep.rs", "// nosemgrep\nfn keep() {}\n");
+        write(
+            tmp.path(),
+            "parked/skip.rs",
+            "// nosemgrep\nfn parked() {}\n",
+        );
+
+        let default = scan_repo_inner(tmp.path(), &HashSet::new(), &[], false);
+        let files: Vec<_> = default
+            .matches
+            .iter()
+            .filter(|m| m.kind == SilencerKind::Nosemgrep)
+            .map(|m| m.file.as_str())
+            .collect();
+        assert!(
+            files.iter().any(|f| f.contains("keep.rs")),
+            "non-loctignored source must remain visible, got: {:?}",
+            files
+        );
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.contains("skip.rs") || f.contains("parked/")),
+            "loctignored parked/skip.rs must not appear, got: {:?}",
+            files
+        );
+        assert!(
+            default.excluded_by_ignore >= 1,
+            "loctignore prune must name at least one excluded path, got {}",
+            default.excluded_by_ignore
+        );
+
+        let opted_in = scan_repo_inner(tmp.path(), &HashSet::new(), &[], true);
+        assert!(
+            opted_in
+                .matches
+                .iter()
+                .any(|m| m.file.contains("skip.rs") || m.file.contains("parked/")),
+            "--include-ignored must opt .loctignore paths back in, got: {:?}",
+            opted_in
+                .matches
+                .iter()
+                .map(|m| m.file.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

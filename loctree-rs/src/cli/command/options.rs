@@ -160,6 +160,9 @@ pub struct SliceOptions {
 
     /// Force rescan before slicing (includes uncommitted files)
     pub rescan: bool,
+
+    /// Scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
 }
 
 impl Default for SliceOptions {
@@ -170,6 +173,7 @@ impl Default for SliceOptions {
             consumers: true,
             depth: None,
             rescan: false,
+            include_untracked: false,
         }
     }
 }
@@ -260,8 +264,14 @@ pub struct FindOptions {
     /// Project roots to scan (`--root` / `--project`). Empty means cwd.
     pub roots: Vec<PathBuf>,
 
+    /// Filter out generated and minified artifact files from results. Opt-in.
+    pub no_generated: bool,
+
     /// Find where a symbol is defined/exported
     pub where_symbol: bool,
+
+    /// Scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
 }
 
 impl FindOptions {
@@ -314,6 +324,12 @@ pub struct OccurrencesOptions {
 
     /// Maximum number of occurrences to return in the current page.
     pub limit: Option<usize>,
+
+    /// Filter out generated and minified artifact files from results. Opt-in.
+    pub no_generated: bool,
+
+    /// Scan untracked files in-memory without mutating the snapshot.
+    pub include_untracked: bool,
 }
 
 /// Options for the `findings` command.
@@ -360,6 +376,9 @@ pub struct DeadOptions {
     /// Include dynamically generated symbols (exec/eval/compile templates) in analysis.
     /// By default these are excluded as they're generated at runtime, not actual dead code.
     pub with_dynamic: bool,
+
+    /// Treat `pub` items in library crates as crate-internal (closed workspace).
+    pub workspace_closed: bool,
 }
 
 /// Options for the `cycles` command.
@@ -465,6 +484,9 @@ pub struct FollowOptions {
 
     /// Root directories to analyze.
     pub roots: Vec<PathBuf>,
+
+    /// Treat `pub` items in library crates as crate-internal (closed workspace).
+    pub workspace_closed: bool,
 }
 
 impl Default for FollowOptions {
@@ -474,6 +496,7 @@ impl Default for FollowOptions {
             handler: None,
             limit: None,
             roots: Vec::new(),
+            workspace_closed: false,
         }
     }
 }
@@ -671,7 +694,7 @@ pub struct DiffOptions {
     /// Show only new problems (added dead exports, new cycles, new missing handlers)
     pub problems_only: bool,
 
-    /// Automatically scan target branch using git worktree (zero-friction diff)
+    /// Automatically scan the --since ref by exporting its tree (no git worktree)
     pub auto_scan_base: bool,
 
     /// Disable the artifact fence (include exports from generated/vendored files)
@@ -1220,6 +1243,9 @@ pub struct BodyOptions {
     /// Optional file qualification (repo-relative path or path suffix) to
     /// disambiguate a symbol defined in more than one file.
     pub file: Option<String>,
+
+    /// Project root to scan (defaults to current directory).
+    pub root: Option<PathBuf>,
 }
 
 /// Options for `loct prune-old-artifacts` — local `.loctree/` housekeeping.

@@ -136,6 +136,22 @@ pub enum MatchMode {
     Regex,
 }
 
+impl MatchMode {
+    /// Coarse agent-facing interpretation: `fixed_string`, `multi_literal`, or `regex`.
+    ///
+    /// Identifier/whole-token scans are still exact-string truth; they collapse
+    /// to `fixed_string` so a zero-hit receipt has three named buckets, not five.
+    pub fn interpreted_as(self) -> &'static str {
+        match self {
+            MatchMode::MultiLiteral => "multi_literal",
+            MatchMode::Regex => "regex",
+            MatchMode::IdentifierBoundary
+            | MatchMode::WholeTokenBoundary
+            | MatchMode::FixedString => "fixed_string",
+        }
+    }
+}
+
 /// Agent-readable role derived from [`OccurrenceKind`].
 ///
 /// This is deliberately coarser than `occurrence_kind`: agents need a compact
@@ -677,12 +693,55 @@ impl IndexedUniverse {
         Self::from_counts(analyses.len(), analyses.len(), stats, ignored_files)
     }
 
+    /// Overlay untracked accounting without pretending those files are indexed.
+    ///
+    /// `scan_complete` stays an indexed-universe claim: extra untracked scans
+    /// increase `scanned_files` but do not flip completeness false.
+    pub fn declare_untracked(&mut self, count: usize, included: bool, scanned: usize) {
+        self.untracked = UniverseSlice {
+            inclusion: if included {
+                UniverseInclusion::Included
+            } else if count == 0 {
+                UniverseInclusion::Excluded
+            } else {
+                UniverseInclusion::Conditional
+            },
+            files: Some(count),
+            note: if included {
+                "scanned in-memory via --include-untracked; snapshot was not mutated".to_string()
+            } else if count == 0 {
+                "no untracked source files outside the snapshot".to_string()
+            } else {
+                "present on disk but not scanned; pass --include-untracked".to_string()
+            },
+        };
+        // Do not fold untracked scans into `scanned_files`: that field (and
+        // `scan_complete`) is an indexed-universe claim. Overlay hits live in
+        // `untracked` so coverage still distinguishes the two.
+        let _ = scanned;
+        if !included
+            && count > 0
+            && !self
+                .exclusions
+                .iter()
+                .any(|entry| entry.kind == "untracked")
+        {
+            self.exclusions.push(UniverseExclusion {
+                kind: "untracked".to_string(),
+                files: Some(count),
+                reason: "untracked source files exist; pass --include-untracked to scan them without a full rescan".to_string(),
+            });
+        }
+    }
+
     /// Compact human line mirroring the JSON contract without hiding unknowns.
     pub fn summary_line(&self) -> String {
         format!(
-            "universe: indexed={}, scanned={}, tracked=unknown, untracked=unknown, ignored={}, generated={}, fixtures={}, exclusions={}{}",
+            "universe: indexed={}, scanned={}, tracked={}, untracked={}, ignored={}, generated={}, fixtures={}, exclusions={}{}",
             self.indexed_files,
             self.scanned_files,
+            Self::optional_count(self.tracked.files),
+            Self::optional_count(self.untracked.files),
             self.ignored.files.unwrap_or(0),
             self.generated.files.unwrap_or(0),
             self.fixtures.files.unwrap_or(0),
@@ -693,6 +752,12 @@ impl IndexedUniverse {
                 "; coverage incomplete"
             }
         )
+    }
+
+    fn optional_count(files: Option<usize>) -> String {
+        files
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     /// True when any exclusion boundary is declared (including the permanent
@@ -753,10 +818,11 @@ pub struct LiteralScopeStats {
 
 /// Resolution receipt for an explicitly requested file scope.
 ///
-/// A selector is authoritative only when it resolves to exactly one indexed
-/// snapshot path. `indexed` remains separate from `resolved` so an ambiguous
-/// basename reports that indexed candidates exist without silently searching
-/// all of them or laundering the ambiguity into a polished zero.
+/// A selector is authoritative when it resolves to exactly one indexed snapshot
+/// path, **or** to one or more snapshot paths under a directory / path prefix.
+/// `indexed` remains separate from `resolved` so an ambiguous basename reports
+/// that indexed candidates exist without silently searching all of them or
+/// laundering the ambiguity into a polished zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FileScopeResolution {
     pub requested: String,
@@ -769,9 +835,11 @@ pub struct FileScopeResolution {
 
 impl FileScopeResolution {
     /// Resolve a CLI/MCP selector against the canonical paths stored in the
-    /// snapshot. Full relative paths and unique suffixes win first; a unique
-    /// extensionless basename (for example `adapter_brute_force`) is accepted
-    /// as the final compatibility form.
+    /// snapshot. Directories and path prefixes expand to every indexed file
+    /// under them. Full relative paths and unique suffixes win for a single
+    /// file; a unique extensionless basename (for example
+    /// `adapter_brute_force`) is accepted as the final compatibility form.
+    /// Unresolved and ambiguous basename selectors stay fail-loud.
     pub fn resolve<'a, I>(requested: &str, snapshot_paths: I) -> Self
     where
         I: IntoIterator<Item = &'a str>,
@@ -782,37 +850,56 @@ impl FileScopeResolution {
             .map(normalize_scope_path)
             .collect::<Vec<_>>();
 
-        let mut matched_paths = paths
+        let mut prefix_paths = paths
             .iter()
-            .filter(|path| {
-                **path == normalized
-                    || path.ends_with(&format!("/{normalized}"))
-                    || normalized.ends_with(&format!("/{path}"))
-            })
+            .filter(|path| scope_selects_as_prefix(&normalized, path))
             .cloned()
             .collect::<Vec<_>>();
+        prefix_paths.sort();
+        prefix_paths.dedup();
 
-        if matched_paths.is_empty()
-            && !normalized.is_empty()
-            && !normalized.contains('/')
-            && !normalized.contains('.')
-        {
-            matched_paths = paths
+        let mut matched_paths = if !prefix_paths.is_empty() {
+            prefix_paths
+        } else {
+            let mut exact_or_suffix = paths
                 .iter()
                 .filter(|path| {
-                    path.rsplit('/').next().is_some_and(|filename| {
-                        filename.rsplit_once('.').map_or(filename, |(stem, _)| stem) == normalized
-                    })
+                    **path == normalized
+                        || path.ends_with(&format!("/{normalized}"))
+                        || normalized.ends_with(&format!("/{path}"))
                 })
                 .cloned()
-                .collect();
-        }
+                .collect::<Vec<_>>();
+
+            if exact_or_suffix.is_empty()
+                && !normalized.is_empty()
+                && !normalized.contains('/')
+                && !normalized.contains('.')
+            {
+                exact_or_suffix = paths
+                    .iter()
+                    .filter(|path| {
+                        path.rsplit('/').next().is_some_and(|filename| {
+                            filename.rsplit_once('.').map_or(filename, |(stem, _)| stem)
+                                == normalized
+                        })
+                    })
+                    .cloned()
+                    .collect();
+            }
+            exact_or_suffix
+        };
 
         matched_paths.sort();
         matched_paths.dedup();
+        let prefix_family = !matched_paths.is_empty()
+            && matched_paths
+                .iter()
+                .all(|path| scope_selects_as_prefix(&normalized, path));
         let (resolved, status) = match matched_paths.len() {
             0 => (false, "unresolved"),
             1 => (true, "resolved"),
+            _ if prefix_family => (true, "resolved"),
             _ => (false, "ambiguous"),
         };
 
@@ -826,13 +913,18 @@ impl FileScopeResolution {
         }
     }
 
-    /// Convert a resolution receipt into the scanner's exact path scope.
-    /// Unresolved or ambiguous selectors intentionally match no path.
+    /// Convert a resolution receipt into the scanner's path scope.
+    ///
+    /// A resolved directory/prefix uses the selector itself so
+    /// [`path_matches_scope`] keeps every expanded snapshot file. Unresolved
+    /// or ambiguous selectors intentionally match no path.
     pub fn scan_scope(&self) -> FileScope<'_> {
-        let file = if self.resolved {
-            self.matched_paths.first().map(String::as_str)
-        } else {
+        let file = if !self.resolved {
             Some("")
+        } else if self.matched_paths.len() > 1 {
+            Some(self.normalized.as_str())
+        } else {
+            self.matched_paths.first().map(String::as_str)
         };
         FileScope { file }
     }
@@ -883,6 +975,9 @@ pub struct OccurrenceResults {
     /// Detailed scope statistics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<LiteralScopeStats>,
+    /// Number of occurrences skipped in generated / minified artifact files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_skipped: Option<usize>,
     /// Required universe declaration. Unlike legacy `scope`, this names
     /// tracked/untracked/ignored policy and every known exclusion boundary.
     pub universe: IndexedUniverse,
@@ -919,15 +1014,18 @@ pub struct OccurrenceResults {
 ///
 /// Forms accepted:
 /// - multiple strings → each is one pattern
-/// - a single string with unescaped `|` where every segment is a *simple*
-///   literal (no regex metacharacters) → split into OR of exact literals
+/// - a single string with unescaped `|` and two or more non-empty segments →
+///   split into OR of exact literals (per-term). A metacharacter in a term
+///   (`.` in `foo.bar`, `(` in `init(`) is that term's exact text, not a
+///   veto of the split. Real regex OR is `--regex`.
 ///
 /// This closes the loctree-fail class where agents type
 /// `find 'global_async_runtime|get_tokio_runtime'`, get `fixed_string` total 0
-/// (looking for the pipe character), and fall back to `grep -E`.
+/// (looking for the pipe character), and fall back to `grep -E` — and the
+/// follow-on class where `foo.bar|baz` used to degrade the same way because
+/// `.` / `(` in *any* term vetoed the split.
 ///
-/// Escaped `\|` keeps the pipe inside a segment. Segments that look like real
-/// regex (contain `.+*?[]()…`) do **not** trigger split — use `--regex`.
+/// Escaped `\|` keeps the pipe inside a segment.
 pub fn expand_literal_patterns(raw_queries: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in raw_queries {
@@ -949,9 +1047,29 @@ pub fn expand_literal_patterns(raw_queries: &[String]) -> Vec<String> {
     out
 }
 
+/// Grep-muscle-memory trap: `loct find --literal needle .` treats `.` as a
+/// second exact-literal pattern (every period in the tree) instead of cwd.
+///
+/// A single-query `'.'` stays legal (the caller asked to search for a dot).
+/// Two-or-more positionals with a bare `.` is the path-as-pattern override.
+pub fn positional_dot_query_error(raw_queries: &[String]) -> Option<&'static str> {
+    if raw_queries.len() >= 2 && raw_queries.iter().any(|q| q == ".") {
+        Some(
+            "positional '.' looks like a scan root (grep-style), not a literal query. \
+             Omit it, or pass `--root .`. To search for a literal dot, use a single quoted query.",
+        )
+    } else {
+        None
+    }
+}
+
 fn looks_like_multi_literal_or(q: &str) -> bool {
-    let parts = split_unescaped_pipes(q);
-    parts.len() >= 2 && parts.iter().all(|s| is_simple_literal_segment(s.trim()))
+    split_unescaped_pipes(q)
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .count()
+        >= 2
 }
 
 /// Split on `|` that is not preceded by an odd number of backslashes.
@@ -977,19 +1095,6 @@ fn split_unescaped_pipes(q: &str) -> Vec<String> {
     }
     parts.push(cur);
     parts
-}
-
-fn is_simple_literal_segment(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    // Reject regex metacharacters; allow identifier / path-ish tokens.
-    !s.chars().any(|c| {
-        matches!(
-            c,
-            '\\' | '[' | ']' | '(' | ')' | '{' | '}' | '+' | '*' | '?' | '^' | '$' | '.'
-        )
-    })
 }
 
 fn push_unique_pattern(out: &mut Vec<String>, pattern: &str) {
@@ -1026,10 +1131,14 @@ pub fn merge_occurrence_results(
     let mut scope = parts[0].scope.clone();
     let mut near_matches = Vec::new();
     let mut file_scope = parts[0].file_scope.clone();
+    let mut generated_skipped: Option<usize> = None;
 
     for part in parts {
         if coverage_line.is_empty() && !part.coverage_line.is_empty() {
             coverage_line = part.coverage_line.clone();
+        }
+        if let Some(n) = part.generated_skipped {
+            *generated_skipped.get_or_insert(0) += n;
         }
         // Prefer the richest universe declaration.
         if part.universe.indexed_files >= universe.indexed_files {
@@ -1081,7 +1190,7 @@ pub fn merge_occurrence_results(
     let role = role_summary(&occurrences);
     let shape = hit_shape(&occurrences);
 
-    OccurrenceResults {
+    let mut res = OccurrenceResults {
         query: display_query.to_string(),
         query_kind: query_kind(display_query),
         match_mode: MatchMode::MultiLiteral,
@@ -1097,6 +1206,7 @@ pub fn merge_occurrence_results(
         source: "literal",
         coverage_line,
         scope,
+        generated_skipped,
         universe,
         file_scope,
         scope_classifications,
@@ -1105,7 +1215,11 @@ pub fn merge_occurrence_results(
         role_summary: role,
         file_context: Vec::new(),
         hit_shape: shape,
+    };
+    if res.generated_skipped.is_some() {
+        res.refresh_coverage_line();
     }
+    res
 }
 
 /// Scan one or more exact-literal patterns and merge into a single result set.
@@ -1154,6 +1268,36 @@ impl OccurrenceResults {
     pub fn declare_snapshot_universe(&mut self, snapshot: &Snapshot, scope: FileScope<'_>) {
         let scanned_files = self.scope.as_ref().map_or(0, |stats| stats.files_scanned);
         self.universe = IndexedUniverse::from_snapshot(snapshot, scope, scanned_files);
+        self.refresh_coverage_line();
+    }
+
+    /// Overlay untracked accounting after [`Self::declare_snapshot_universe`].
+    ///
+    /// Rebuilds the coverage line so `untracked=N` is visible without flipping
+    /// indexed `scan_complete`.
+    pub fn declare_untracked_overlay(&mut self, count: usize, included: bool, scanned: usize) {
+        self.universe.declare_untracked(count, included, scanned);
+        self.refresh_coverage_line();
+        if !included && count > 0 && self.total == 0 {
+            let hint = SuggestedNext {
+                command: "loct find --literal <query> --include-untracked".to_string(),
+                reason: "untracked source files exist outside the snapshot; scan them in-memory without a full rescan".to_string(),
+            };
+            if !self
+                .suggested_next
+                .iter()
+                .any(|next| next.command.contains("--include-untracked"))
+            {
+                self.suggested_next.insert(0, hint);
+            }
+        }
+    }
+
+    pub fn refresh_coverage_line(&mut self) {
+        let skipped_part = match self.generated_skipped {
+            Some(n) => format!("; generated_skipped: {n}"),
+            None => String::new(),
+        };
         if let Some(stats) = &mut self.scope {
             stats.files_in_universe = self.universe.indexed_files;
             stats.files_scanned = self.universe.scanned_files;
@@ -1166,14 +1310,28 @@ impl OccurrenceResults {
                 templates: stats.templates,
             };
             self.coverage_line = format!(
-                "{}; {}",
+                "{}{}; {}",
                 coverage_line_for(stats.files_scanned, stats.files_in_universe, &artifacts),
+                skipped_part,
                 self.universe.summary_line()
             );
         } else {
-            self.coverage_line = self.universe.summary_line();
+            self.coverage_line = format!("{}{}", self.universe.summary_line(), skipped_part);
         }
     }
+}
+
+/// Determine whether a file path or content represents a generated or minified artifact.
+pub fn is_generated_or_minified_file(path: &str, content: Option<&str>) -> bool {
+    if scope_classification(path) == ScopeClassification::Generated {
+        return true;
+    }
+    let class = crate::analyzer::classify::artifact_class(path, content);
+    matches!(
+        class,
+        crate::analyzer::classify::ArtifactClass::Generated
+            | crate::analyzer::classify::ArtifactClass::Vendored
+    )
 }
 
 #[inline]
@@ -1194,6 +1352,8 @@ pub struct ScanOptions {
     /// Treat `-` as part of the token (tighter boundary). Opt-in, no default
     /// regression.
     pub whole_token: bool,
+    /// Exclude generated and minified artifact files from results. Opt-in.
+    pub no_generated: bool,
 }
 
 /// Output-shaping controls applied *after* scanning, shared by every surface so
@@ -1217,9 +1377,10 @@ pub struct ReportOptions {
 /// set into the exact occurrence scanner.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileScope<'a> {
-    /// Relative path/prefix to keep, e.g. `src/app.css`. Leading `./` and
-    /// platform separators are normalized. A file matches when it is exactly
-    /// this path or ends with `/<scope>`.
+    /// Relative path/prefix to keep, e.g. `src/app.css` or `src/cli`. Leading
+    /// `./` and platform separators are normalized. A file matches when it is
+    /// exactly this path, ends with `/<scope>`, or lives under that directory
+    /// / path prefix.
     pub file: Option<&'a str>,
 }
 
@@ -2143,6 +2304,7 @@ where
     let mut occurrences = Vec::new();
     let mut files_scanned = 0;
     let mut stats = crate::analyzer::classify::ArtifactFenceStats::default();
+    let mut generated_skipped = 0;
 
     for (path, content) in files {
         if !scope.matches(path) {
@@ -2158,7 +2320,13 @@ where
             stats.record(class);
         }
         files_scanned += 1;
-        occurrences.extend(scan_text_with(path, content, ident, opts));
+        let is_gen = opts.no_generated && is_generated_or_minified_file(path, Some(content));
+        let hits = scan_text_with(path, content, ident, opts);
+        if is_gen {
+            generated_skipped += hits.len();
+        } else {
+            occurrences.extend(hits);
+        }
     }
     occurrences.sort_by(|a, b| {
         a.file
@@ -2174,9 +2342,15 @@ where
 
     let files_in_universe = files_scanned;
     let universe = IndexedUniverse::from_counts(files_in_universe, files_scanned, stats, 0);
+    let skipped_part = if opts.no_generated {
+        format!("; generated_skipped: {generated_skipped}")
+    } else {
+        String::new()
+    };
     let coverage_line = format!(
-        "{}; {}",
+        "{}{}; {}",
         coverage_line_for(files_scanned, files_in_universe, &stats),
+        skipped_part,
         universe.summary_line()
     );
 
@@ -2208,6 +2382,11 @@ where
             generated: stats.generated,
             templates: stats.templates,
         }),
+        generated_skipped: if opts.no_generated {
+            Some(generated_skipped)
+        } else {
+            None
+        },
         universe,
         file_scope: None,
         scope_classifications,
@@ -2277,9 +2456,22 @@ pub fn scan_files_with_regex<'a, I>(
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
+    scan_files_with_regex_opts(files, re, scope, ScanOptions::default())
+}
+
+pub fn scan_files_with_regex_opts<'a, I>(
+    files: I,
+    re: &regex::Regex,
+    scope: FileScope<'_>,
+    opts: ScanOptions,
+) -> OccurrenceResults
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
     let mut occurrences = Vec::new();
     let mut files_scanned = 0;
     let mut stats = crate::analyzer::classify::ArtifactFenceStats::default();
+    let mut generated_skipped = 0;
 
     for (path, content) in files {
         if !scope.matches(path) {
@@ -2293,7 +2485,13 @@ where
             stats.record(class);
         }
         files_scanned += 1;
-        occurrences.extend(scan_text_regex(path, content, re));
+        let is_gen = opts.no_generated && is_generated_or_minified_file(path, Some(content));
+        let hits = scan_text_regex(path, content, re);
+        if is_gen {
+            generated_skipped += hits.len();
+        } else {
+            occurrences.extend(hits);
+        }
     }
     occurrences.sort_by(|a, b| {
         a.file
@@ -2309,9 +2507,15 @@ where
 
     let files_in_universe = files_scanned;
     let universe = IndexedUniverse::from_counts(files_in_universe, files_scanned, stats, 0);
+    let skipped_part = if opts.no_generated {
+        format!("; generated_skipped: {generated_skipped}")
+    } else {
+        String::new()
+    };
     let coverage_line = format!(
-        "{}; {}",
+        "{}{}; {}",
         coverage_line_for(files_scanned, files_in_universe, &stats),
+        skipped_part,
         universe.summary_line()
     );
 
@@ -2350,6 +2554,11 @@ where
             generated: stats.generated,
             templates: stats.templates,
         }),
+        generated_skipped: if opts.no_generated {
+            Some(generated_skipped)
+        } else {
+            None
+        },
         universe,
         file_scope: None,
         scope_classifications,
@@ -2370,6 +2579,46 @@ where
 /// present. Languages without symbol coverage keep the lexical role (never
 /// invent a definition).
 pub fn enrich_with_snapshot(results: &mut OccurrenceResults, snapshot: &Snapshot) {
+    if results.occurrences.is_empty() && results.generated_skipped.is_none() {
+        return;
+    }
+
+    if results.generated_skipped.is_some() {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in results.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = results.generated_skipped {
+                    *n += newly_skipped;
+                }
+                results.occurrences = kept;
+                results.total = results.occurrences.len();
+                results.emitted = results.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &results.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                results.files_matched = seen.len();
+                results.refresh_coverage_line();
+            } else {
+                results.occurrences = kept;
+            }
+        }
+    }
+
     if results.occurrences.is_empty() || results.query.is_empty() {
         return;
     }
@@ -3097,13 +3346,33 @@ fn rust_source_target_path(
 }
 
 fn normalize_scope_path(path: &str) -> String {
-    path.trim().trim_start_matches("./").replace('\\', "/")
+    path.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// True when `path` is the selector itself, a file whose path continues the
+/// selector (`src/lib` → `src/lib.rs`), or a snapshot file nested under that
+/// directory/prefix (`src/cli` → `src/cli/dispatch.rs`).
+fn scope_selects_as_prefix(scope: &str, path: &str) -> bool {
+    if scope.is_empty() {
+        return false;
+    }
+    if path == scope || path.starts_with(&format!("{scope}/")) {
+        return true;
+    }
+    path.starts_with(scope) && path[scope.len()..].starts_with('.')
 }
 
 pub fn path_matches_scope(path: &str, scope: &str) -> bool {
     let path = normalize_scope_path(path);
     let scope = normalize_scope_path(scope);
-    !scope.is_empty() && (path == scope || path.ends_with(&format!("/{scope}")))
+    if scope.is_empty() {
+        return false;
+    }
+    path == scope || path.ends_with(&format!("/{scope}")) || scope_selects_as_prefix(&scope, &path)
 }
 
 #[cfg(test)]
@@ -3596,6 +3865,64 @@ mod tests {
         assert!(ambiguous.indexed);
         assert_eq!(ambiguous.status, "ambiguous");
         assert_eq!(ambiguous.matched_paths.len(), 2);
+    }
+
+    #[test]
+    fn w1_01_find_file_scope_expands_directories() {
+        // G-FIND-FILE-DIR: `--file <dir>` / `--file <prefix>` must scan the
+        // snapshot files under that selector, not collapse to scanned 0 of 0.
+        let paths = [
+            "src/cli/dispatch.rs",
+            "src/cli/entrypoint.rs",
+            "src/lib.rs",
+            "docs/guide.md",
+        ];
+
+        let dir = FileScopeResolution::resolve("src/cli", paths);
+        assert!(dir.resolved, "directory selectors must resolve");
+        assert_eq!(dir.status, "resolved");
+        assert_eq!(
+            dir.matched_paths,
+            vec!["src/cli/dispatch.rs", "src/cli/entrypoint.rs"]
+        );
+        let dir_scope = dir.scan_scope();
+        assert!(dir_scope.matches("src/cli/dispatch.rs"));
+        assert!(dir_scope.matches("src/cli/entrypoint.rs"));
+        assert!(!dir_scope.matches("src/lib.rs"));
+        assert!(!dir_scope.matches("docs/guide.md"));
+
+        let prefix = FileScopeResolution::resolve("src/cli/dispatch", paths);
+        assert!(prefix.resolved, "partial path prefixes must resolve");
+        assert_eq!(prefix.matched_paths, vec!["src/cli/dispatch.rs"]);
+        assert!(prefix.scan_scope().matches("src/cli/dispatch.rs"));
+        assert!(!prefix.scan_scope().matches("src/cli/entrypoint.rs"));
+
+        let missing = FileScopeResolution::resolve("no/such/dir", paths);
+        assert!(!missing.resolved);
+        assert!(!missing.indexed);
+        assert_eq!(missing.status, "unresolved");
+        assert!(
+            !missing.scan_scope().matches("src/cli/dispatch.rs"),
+            "unresolved must stay fail-loud, never 0-of-0 over the whole universe"
+        );
+
+        let hits = scan_files_with_scope(
+            [
+                ("src/cli/dispatch.rs", "fn handle_find() { TOKEN_W1_01 }"),
+                ("src/cli/entrypoint.rs", "fn main() {}"),
+                ("src/lib.rs", "TOKEN_W1_01 in the wrong tree"),
+            ],
+            "TOKEN_W1_01",
+            ScanOptions::default(),
+            dir.scan_scope(),
+        );
+        assert!(
+            hits.scope.as_ref().is_some_and(|s| s.files_scanned > 0),
+            "directory scope must scan N>0 files, got {:?}",
+            hits.scope
+        );
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.occurrences[0].file, "src/cli/dispatch.rs");
     }
 
     #[test]
@@ -4168,7 +4495,10 @@ class AgentConstraints {\n\
         let tight = scan_files_with(
             [("a.css", css)],
             "backdrop",
-            ScanOptions { whole_token: true },
+            ScanOptions {
+                whole_token: true,
+                ..Default::default()
+            },
         );
         assert_eq!(loose.total, 2, "default boundary keeps both hits");
         assert_eq!(
@@ -4429,10 +4759,11 @@ class AgentConstraints {\n\
     }
 
     #[test]
-    fn expand_literal_patterns_keeps_real_regex_unsplit() {
-        // Real regex still goes to --regex; literal must not silently mangle it.
+    fn expand_literal_patterns_splits_regexish_terms_as_literals() {
+        // Pipe still splits; each term is exact-string (not regex). Real regex
+        // OR remains `--regex`.
         let patterns = expand_literal_patterns(&["foo.*|bar+".to_string()]);
-        assert_eq!(patterns, vec!["foo.*|bar+".to_string()]);
+        assert_eq!(patterns, vec!["foo.*".to_string(), "bar+".to_string()]);
     }
 
     #[test]
@@ -4464,5 +4795,187 @@ class AgentConstraints {\n\
             .collect();
         assert!(texts.contains(&"global_async_runtime"));
         assert!(texts.contains(&"get_tokio_runtime"));
+    }
+
+    #[test]
+    fn w3_01_multiliteral_or_with_metachars_splits() {
+        // G-MULTILITERAL-DEGRADE: `.` / `(` in a term must not veto pipe-split.
+        let dotted = expand_literal_patterns(&["foo.bar|baz".to_string()]);
+        assert_eq!(dotted, vec!["foo.bar".to_string(), "baz".to_string()]);
+        let parens = expand_literal_patterns(&["init(|ready".to_string()]);
+        assert_eq!(parens, vec!["init(".to_string(), "ready".to_string()]);
+
+        let files = [
+            ("a.rs", "let x = foo.bar;\n"),
+            ("b.rs", "const baz = 1;\n"),
+            ("c.rs", "fn other() {}\n"),
+        ];
+        let merged = scan_files_for_literal_query(
+            &files,
+            "foo.bar|baz",
+            ScanOptions::default(),
+            FileScope::default(),
+        );
+        assert_eq!(merged.match_mode, MatchMode::MultiLiteral);
+        assert_eq!(merged.match_mode.interpreted_as(), "multi_literal");
+        assert_eq!(
+            merged.total, 2,
+            "both terms must hit as exact literals, not 0"
+        );
+        let texts: Vec<_> = merged
+            .occurrences
+            .iter()
+            .map(|o| o.matched_text.as_str())
+            .collect();
+        assert!(texts.contains(&"foo.bar"));
+        assert!(texts.contains(&"baz"));
+    }
+
+    #[test]
+    fn w3_01_pipe_query_reports_interpretation() {
+        // Zero-hit must name how the query was interpreted — not a silent
+        // fixed_string search for the pipe character.
+        let files = [("a.rs", "fn present() {}\n")];
+        let merged = scan_files_for_literal_query(
+            &files,
+            "no_such_foo.bar|no_such_baz",
+            ScanOptions::default(),
+            FileScope::default(),
+        );
+        assert_eq!(merged.total, 0);
+        assert_eq!(merged.match_mode, MatchMode::MultiLiteral);
+        assert_eq!(merged.match_mode.interpreted_as(), "multi_literal");
+
+        let single = scan_files_with(
+            files.iter().copied(),
+            "no_such_ident",
+            ScanOptions::default(),
+        );
+        assert_eq!(single.total, 0);
+        assert_eq!(single.match_mode.interpreted_as(), "fixed_string");
+        assert_eq!(MatchMode::Regex.interpreted_as(), "regex");
+
+        assert!(
+            positional_dot_query_error(&["runtime-install".into(), ".".into()]).is_some(),
+            "grep-style trailing '.' must be a loud positional error"
+        );
+        assert!(
+            positional_dot_query_error(&[".".into()]).is_none(),
+            "a single-query literal '.' stays a literal search"
+        );
+    }
+
+    #[test]
+    fn w4_06_generated_files_filterable_in_literal_scan() {
+        let files = [
+            ("src/banner.rs", "fn banner_marker() {}\n"),
+            ("dist/bundle.js", "function banner_marker() {}\n"),
+            (
+                "tests/fixtures/mermaid.min.js",
+                "/* minified */ banner_marker();\n",
+            ),
+        ];
+
+        // 1) Default scan (opt-in flag not set): all 3 hits present, matches historical behavior
+        let default_res = scan_files_with(
+            files.iter().copied(),
+            "banner_marker",
+            ScanOptions::default(),
+        );
+        assert_eq!(
+            default_res.total, 3,
+            "default scan should include all 3 hits"
+        );
+        assert_eq!(default_res.files_matched, 3);
+        assert_eq!(default_res.generated_skipped, None);
+        assert!(
+            !default_res.coverage_line.contains("generated_skipped"),
+            "default coverage line should not mention generated_skipped"
+        );
+
+        // 2) Opt-in `--no-generated`: generated and minified files are skipped and counted
+        let no_gen_res = scan_files_with(
+            files.iter().copied(),
+            "banner_marker",
+            ScanOptions {
+                whole_token: false,
+                no_generated: true,
+            },
+        );
+        assert_eq!(no_gen_res.total, 1, "only production source should remain");
+        assert_eq!(no_gen_res.files_matched, 1);
+        assert_eq!(no_gen_res.occurrences[0].file, "src/banner.rs");
+        assert_eq!(
+            no_gen_res.generated_skipped,
+            Some(2),
+            "two generated/minified hits must be counted in generated_skipped"
+        );
+        assert!(
+            no_gen_res.coverage_line.contains("generated_skipped: 2"),
+            "coverage line must include generated_skipped: 2, got: {}",
+            no_gen_res.coverage_line
+        );
+    }
+
+    #[test]
+    fn w4_06_snapshot_records_generated_flag_used_in_enrichment() {
+        use crate::types::FileAnalysis;
+
+        let files = [
+            ("src/core.rs", "fn target_symbol() {}\n"),
+            ("src/custom_codegen.rs", "fn target_symbol() {}\n"),
+        ];
+
+        let mut res = scan_files_with(
+            files.iter().copied(),
+            "target_symbol",
+            ScanOptions {
+                whole_token: false,
+                no_generated: true,
+            },
+        );
+        let mut snapshot = Snapshot::new(vec![".".into()]);
+        let mut f1 = FileAnalysis::new("src/core.rs".into());
+        f1.is_generated = false;
+        let mut f2 = FileAnalysis::new("src/custom_codegen.rs".into());
+        f2.is_generated = true;
+        snapshot.files = vec![f1, f2];
+
+        enrich_with_snapshot(&mut res, &snapshot);
+        assert_eq!(res.total, 1);
+        assert_eq!(res.occurrences[0].file, "src/core.rs");
+        assert_eq!(res.generated_skipped, Some(1));
+        assert!(
+            res.coverage_line.contains("generated_skipped: 1"),
+            "coverage line must reflect snapshot-recorded generated hits, got: {}",
+            res.coverage_line
+        );
+    }
+
+    #[test]
+    fn w4_06_regex_scan_filters_generated_files() {
+        let files = [
+            ("src/banner.rs", "fn banner_marker_foo() {}\n"),
+            ("tests/fixtures/mermaid.min.js", "banner_marker_bar();\n"),
+        ];
+        let re = regex::Regex::new("banner_marker_\\w+").unwrap();
+
+        let default_res = scan_files_with_regex(files.iter().copied(), &re, FileScope::default());
+        assert_eq!(default_res.total, 2);
+        assert_eq!(default_res.generated_skipped, None);
+
+        let no_gen_res = scan_files_with_regex_opts(
+            files.iter().copied(),
+            &re,
+            FileScope::default(),
+            ScanOptions {
+                whole_token: false,
+                no_generated: true,
+            },
+        );
+        assert_eq!(no_gen_res.total, 1);
+        assert_eq!(no_gen_res.occurrences[0].file, "src/banner.rs");
+        assert_eq!(no_gen_res.generated_skipped, Some(1));
+        assert!(no_gen_res.coverage_line.contains("generated_skipped: 1"));
     }
 }

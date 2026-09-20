@@ -89,7 +89,7 @@ write_msg "$tmpdir/f1.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: grok'
 write_staged "$tmpdir/f1.staged" \
     'loctree-rs/src/overlay.rs' \
@@ -105,7 +105,7 @@ write_msg "$tmpdir/f2.msg" \
     '' \
     'Authored-By: claude <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: claude'
 write_staged "$tmpdir/f2.staged" \
     'loctree-rs/src/analyzer/swift.rs'
@@ -119,7 +119,7 @@ write_msg "$tmpdir/f3.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: grok'
 write_staged "$tmpdir/f3.staged" \
     'tools/hooks/commit-msg' \
@@ -135,7 +135,7 @@ write_msg "$tmpdir/f4.msg" \
     '' \
     'Authored-By: codex <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: codex'
 write_staged "$tmpdir/f4.staged" \
     'editors/jetbrains/src/main/kotlin/io/loct/intellij/toolwindow/ResultProjector.kt'
@@ -153,7 +153,7 @@ write_msg "$tmpdir/q1.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: grok'
 write_staged "$tmpdir/q1.staged" \
     'tools/hooks/commit-msg' \
@@ -169,7 +169,7 @@ write_msg "$tmpdir/q2.msg" \
     '' \
     'Authored-By: claude <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: claude'
 write_staged "$tmpdir/q2.staged" \
     'loctree-rs/tests/makieta_ab.rs' \
@@ -184,7 +184,7 @@ write_msg "$tmpdir/q3.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:50:00 CEST' \
+    'time: 2026-07-23T07:50:00+02:00' \
     'runtime: grok'
 write_staged "$tmpdir/q3.staged" \
     'loctree-rs/src/pack.rs'
@@ -198,7 +198,7 @@ write_msg "$tmpdir/q4.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: grok'
 write_staged "$tmpdir/q4.staged" \
     'loctree-rs/src/lib.rs'
@@ -225,7 +225,7 @@ write_msg "$tmpdir/q5.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: grok'
 write_staged "$tmpdir/q5.staged" \
     'loctree-rs/src/pack.rs'
@@ -242,7 +242,7 @@ write_msg "$tmpdir/i1.msg" \
     '' \
     'Authored-By: grok <agents@vetcoders.io>' \
     'session_id: 019e93be-379d-7303-9ad4-ffae468db99f' \
-    'date: 2026-07-23T07:00:00 CEST' \
+    'time: 2026-07-23T07:00:00+02:00' \
     'runtime: grok'
 # Must not exit 2 / missing gate; shape-valid message exits 0.
 set +e

@@ -8,6 +8,8 @@ use super::super::command::{
     Command, ContextOptions, CoverageOptions, FocusOptions, FollowOptions, HotspotsOptions,
     RepoViewOptions, SliceOptions, TraceOptions,
 };
+use super::helpers::format_unknown_analysis_option;
+use crate::context_scope::ScopeMode;
 
 /// Parse `loct slice <target> [options]` command - extract file + dependencies.
 pub(super) fn parse_slice_command(args: &[String]) -> Result<Command, String> {
@@ -23,7 +25,9 @@ OPTIONS:
     --no-consumers       Hide reverse dependencies (old leaf-only behavior)
     --depth <N>          Maximum dependency depth to traverse (default: unlimited)
     --root <PATH>        Project root for resolving relative imports
+    --project <PATH>     Alias for --root (same spelling as context/find)
     --rescan             Force snapshot update before slicing
+    --include-untracked  Slice a fresh untracked file without a full rescan
     --help, -h           Show this help message
 
 EXAMPLES:
@@ -53,15 +57,20 @@ EXAMPLES:
                 opts.depth = Some(value.parse().map_err(|_| "--depth requires a number")?);
                 i += 2;
             }
-            "--root" => {
+            "--root" | "--project" => {
+                let flag = arg.as_str();
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "--root requires a path".to_string())?;
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
                 opts.root = Some(PathBuf::from(value));
                 i += 2;
             }
             "--rescan" => {
                 opts.rescan = true;
+                i += 1;
+            }
+            "--include-untracked" => {
+                opts.include_untracked = true;
                 i += 1;
             }
             _ if !arg.starts_with('-') => {
@@ -76,7 +85,11 @@ EXAMPLES:
                 i += 1;
             }
             _ => {
-                return Err(format!("Unknown option '{}' for 'slice' command.", arg));
+                return Err(format_unknown_analysis_option(
+                    "slice",
+                    arg,
+                    "--consumers/-c, --no-consumers, --depth, --root, --project, --rescan, --include-untracked, --help",
+                ));
             }
         }
     }
@@ -121,6 +134,13 @@ pub(super) fn parse_context_command(args: &[String]) -> Result<Command, String> 
                     .get(i + 1)
                     .ok_or_else(|| "--scope requires a selector or named scope".to_string())?;
                 opts.scopes.push(value.clone());
+                i += 2;
+            }
+            "--scope-mode" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--scope-mode requires a value (all or any)".to_string())?;
+                opts.scope_mode = ScopeMode::parse_cli(value)?;
                 i += 2;
             }
             "--with-aicx" => {
@@ -256,9 +276,10 @@ SCOPES:
     all, dead, cycles, twins, hotspots, trace, commands, events, pipelines
 
 OPTIONS:
-    --handler <NAME>     Handler name for trace scope
-    --limit <N>          Global result bound across aggregate output families
-    --help, -h           Show this help message
+    --handler <NAME>        Handler name for trace scope
+    --limit <N>             Global result bound across aggregate output families
+    --workspace-closed      Treat pub in library crates as crate-internal (dead)
+    --help, -h              Show this help message
 
 EXAMPLES:
     loct follow
@@ -300,6 +321,10 @@ EXAMPLES:
                     .ok_or_else(|| "--limit requires a number".to_string())?;
                 opts.limit = Some(value.parse().map_err(|_| "--limit requires a number")?);
                 i += 2;
+            }
+            "--workspace-closed" => {
+                opts.workspace_closed = true;
+                i += 1;
             }
             _ if !arg.starts_with('-') && !scope_seen && valid_scopes.contains(&arg.as_str()) => {
                 opts.scope = arg.clone();
@@ -723,6 +748,25 @@ mod tests {
                     "tag:cli".to_string(),
                 ]
             );
+            assert_eq!(opts.scope_mode, crate::context_scope::ScopeMode::All);
+        } else {
+            panic!("Expected Context command");
+        }
+    }
+
+    #[test]
+    fn w2_02_parse_scope_mode_any() {
+        let args = vec![
+            "--scope".into(),
+            "path:a".into(),
+            "--scope".into(),
+            "path:b".into(),
+            "--scope-mode".into(),
+            "any".into(),
+        ];
+        let result = parse_context_command(&args).unwrap();
+        if let Command::Context(opts) = result {
+            assert_eq!(opts.scope_mode, crate::context_scope::ScopeMode::Any);
         } else {
             panic!("Expected Context command");
         }
@@ -875,5 +919,34 @@ mod tests {
         } else {
             panic!("Expected Hotspots command");
         }
+    }
+
+    #[test]
+    fn w4_01_slice_accepts_project_as_root_alias() {
+        let result = parse_slice_command(&[
+            "src/main.rs".into(),
+            "--project".into(),
+            "/tmp/sibling".into(),
+        ])
+        .unwrap();
+        if let Command::Slice(opts) = result {
+            assert_eq!(opts.target, "src/main.rs");
+            assert_eq!(opts.root, Some(std::path::PathBuf::from("/tmp/sibling")));
+        } else {
+            panic!("Expected Slice command");
+        }
+    }
+
+    #[test]
+    fn w4_01_slice_refuses_markdown_with_did_you_mean() {
+        let err = parse_slice_command(&["src/main.rs".into(), "--markdown".into()]).unwrap_err();
+        assert!(
+            err.contains("did you mean"),
+            "slice --markdown must refuse with did-you-mean: {err}"
+        );
+        assert!(
+            err.contains("loct context --markdown") || err.contains("--json"),
+            "slice --markdown must point at context --markdown or --json: {err}"
+        );
     }
 }

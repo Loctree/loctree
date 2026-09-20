@@ -32,6 +32,7 @@ mod intent_source;
 pub mod intents;
 mod mcp;
 pub mod overlay;
+pub mod redact;
 mod shell;
 
 use serde::{Deserialize, Serialize};

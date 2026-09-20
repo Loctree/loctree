@@ -11,8 +11,8 @@ pub mod types;
 pub use clustering::{cluster_by_name, detect_name_patterns};
 pub use output::*;
 pub use similarity::{
-    build_import_sets, count_importers, count_importers_transitive, jaccard_similarity,
-    similarity_matrix,
+    build_import_sets, count_importers, count_importers_direct_edges, count_importers_transitive,
+    jaccard_similarity, similarity_matrix,
 };
 pub use types::*;
 
@@ -57,10 +57,14 @@ fn detect_crowd_internal(
     let import_sets = build_import_sets(files);
 
     // Use transitive counting if edges are available
-    let importer_counts = if let Some(edges) = edges {
-        count_importers_transitive(files, edges)
+    let (importer_counts, direct_counts) = if let Some(edges) = edges {
+        (
+            count_importers_transitive(files, edges),
+            count_importers_direct_edges(files, edges),
+        )
     } else {
-        count_importers(files)
+        let direct = count_importers(files);
+        (direct.clone(), direct)
     };
 
     // 3. Calculate similarities between crowd members
@@ -71,6 +75,7 @@ fn detect_crowd_internal(
         .iter()
         .map(|path| {
             let importer_count = importer_counts.get(path).copied().unwrap_or(0);
+            let importer_count_direct = direct_counts.get(path).copied().unwrap_or(0);
             let similarity_scores: Vec<(String, f32)> = similarities
                 .iter()
                 .filter(|(a, b, _)| a == path || b == path)
@@ -93,6 +98,7 @@ fn detect_crowd_internal(
                     matched: pattern.to_string(),
                 },
                 importer_count,
+                importer_count_direct,
                 similarity_scores,
                 is_test,
             }

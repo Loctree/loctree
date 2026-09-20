@@ -150,9 +150,13 @@ impl BodyResult {
     /// CLI `--file` flag and the LSP `loctree/body` `file` param.
     pub fn filtered_to_file(mut self, file: Option<&str>) -> Self {
         if let Some(needle) = file.filter(|f| !f.is_empty()) {
-            let suffix = format!("/{needle}");
-            self.bodies
-                .retain(|b| b.file == needle || b.file.ends_with(&suffix));
+            let needle_norm = needle.replace('\\', "/");
+            let clean_needle = needle_norm.strip_prefix('/').unwrap_or(&needle_norm);
+            let suffix = format!("/{clean_needle}");
+            self.bodies.retain(|b| {
+                let file_norm = b.file.replace('\\', "/");
+                file_norm == clean_needle || file_norm.ends_with(&suffix)
+            });
         }
         self
     }
@@ -167,16 +171,14 @@ fn language_of(path: &str) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// If `line` is a plain assignment whose right-hand side opens a `(` tuple or
-/// `[` list, return the byte offset just after the `=`. This is the signal that
-/// the body is a bracket-delimited collection const (e.g.
-/// `FRAMEWORK_LAUNCHER_MARKERS = (`) rather than a brace body or a `def`.
+/// If `line` is a plain assignment whose right-hand side opens a collection
+/// (`(` tuple, `[` list/slice, `&[` ref-slice, `{` dict/block), return the byte offset
+/// just after the `=` and the extent kind (`EXTENT_BRACKET` or `EXTENT_BRACE`).
 ///
-/// Returns `None` for `==`/`<=`/augmented/walrus operators, for `def f(...):`
-/// (its paren is not preceded by a plain `=`), and for dict/object `{`
-/// assignments (those keep the existing brace-balanced path). The returned
-/// offset is where bracket balancing should begin counting on the first line.
-fn assignment_collection_rhs(line: &str) -> Option<usize> {
+/// Returns `None` for `==`/`<=`/augmented/walrus operators, and for `def f(...):`
+/// (its paren is not preceded by a plain `=`). The returned offset is where
+/// bracket/brace balancing should begin counting on the first line.
+fn assignment_collection_rhs(line: &str) -> Option<(usize, &'static str)> {
     let bytes = line.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -207,8 +209,17 @@ fn assignment_collection_rhs(line: &str) -> Option<usize> {
                 return None;
             }
             let rhs = line[i + 1..].trim_start();
-            if rhs.starts_with('(') || rhs.starts_with('[') {
-                return Some(i + 1);
+            let inner = rhs.strip_prefix('&').map(str::trim_start).unwrap_or(rhs);
+            let inner = inner
+                .strip_prefix("mut")
+                .map(str::trim_start)
+                .unwrap_or(inner);
+            let inner = inner.trim_start();
+            if (inner.starts_with('(') && !rhs.contains("=>")) || inner.starts_with('[') {
+                return Some((i + 1, EXTENT_BRACKET));
+            }
+            if inner.starts_with('{') {
+                return Some((i + 1, EXTENT_BRACE));
             }
             return None;
         }
@@ -416,14 +427,15 @@ fn resolve_extent(lines: &[&str], start_idx: usize, language: &str) -> (usize, &
         return (end_idx, EXTENT_INDENT);
     }
 
-    // Assignment-opened tuple/list collection (`NAME = (`/`[`): balance that
-    // bracket so a multi-line const returns exactly its own body instead of a
-    // fixed window that overshoots into trailing code. Dict/object `{`
-    // assignments fall through to the brace path below.
-    if let Some(close_idx) = assignment_collection_rhs(lines[start_idx])
-        .and_then(|off| extract_bracket_balanced(lines, start_idx, off, language))
+    // Assignment-opened collection (`NAME = (`/`[`/`{` or `NAME = &[`/`&{`): balance
+    // that bracket/brace so a multi-line const returns exactly its own body instead of a
+    // fixed window that overshoots into trailing code.
+    if let Some((close_idx, extent)) =
+        assignment_collection_rhs(lines[start_idx]).and_then(|(off, ext)| {
+            extract_bracket_balanced(lines, start_idx, off, language).map(|c| (c, ext))
+        })
     {
-        return (close_idx, EXTENT_BRACKET);
+        return (close_idx, extent);
     }
 
     // A complete single-line statement (`pub const CAP: usize = 200;`,
@@ -593,10 +605,39 @@ fn read_source(snapshot: &Snapshot, file: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Split a file-qualified symbol like `src/a.rs::helper` into `(Some("src/a.rs"), "helper")`.
+///
+/// Distinguishes file qualification from Rust `Type::method` by checking if the prefix
+/// contains path delimiters (`/`, `\`), a file extension (`.`), or matches an indexed file path.
+fn split_file_qualified_symbol<'a>(
+    symbol: &'a str,
+    snapshot: &Snapshot,
+) -> (Option<&'a str>, &'a str) {
+    if let Some((prefix, rest)) = symbol.split_once("::") {
+        let prefix = prefix.trim();
+        let rest = rest.trim();
+        if !prefix.is_empty()
+            && !rest.is_empty()
+            && (prefix.contains('/')
+                || prefix.contains('\\')
+                || prefix.contains('.')
+                || snapshot.files.iter().any(|f| {
+                    let fp = f.path.replace('\\', "/");
+                    let p = prefix.replace('\\', "/");
+                    fp == p || fp.ends_with(&format!("/{p}"))
+                }))
+        {
+            return (Some(prefix), rest);
+        }
+    }
+    (None, symbol)
+}
+
 pub fn query_symbol_body(snapshot: &Snapshot, symbol: &str, line_cap: Option<usize>) -> BodyResult {
+    let (file_qualifier, target_symbol) = split_file_qualified_symbol(symbol, snapshot);
     let cap = line_cap.unwrap_or(DEFAULT_BODY_LINE_CAP).max(1);
-    let where_result = query_where_symbol(snapshot, symbol);
-    let declarations = module_declarations(snapshot, symbol);
+    let where_result = query_where_symbol(snapshot, target_symbol);
+    let declarations = module_declarations(snapshot, target_symbol);
     let declaration_sites: std::collections::HashSet<(&str, Option<usize>)> = declarations
         .iter()
         .map(|d| (d.declared_in.as_str(), d.line))
@@ -606,6 +647,15 @@ pub fn query_symbol_body(snapshot: &Snapshot, symbol: &str, line_cap: Option<usi
     let mut seen: std::collections::HashSet<(String, usize)> = std::collections::HashSet::new();
 
     for m in &where_result.results {
+        if let Some(file_needle) = file_qualifier {
+            let needle_norm = file_needle.replace('\\', "/");
+            let clean_needle = needle_norm.strip_prefix('/').unwrap_or(&needle_norm);
+            let suffix = format!("/{clean_needle}");
+            let file_norm = m.file.replace('\\', "/");
+            if file_norm != clean_needle && !file_norm.ends_with(&suffix) {
+                continue;
+            }
+        }
         // `pub mod health_score;` is a complete one-line statement, so the
         // extractor would happily return it as a "body". That answers a
         // question nobody asked — the module declaration belongs in the
@@ -649,7 +699,22 @@ pub fn query_symbol_body(snapshot: &Snapshot, symbol: &str, line_cap: Option<usi
         });
     }
 
-    let module_redirect = build_module_redirect(snapshot, symbol, declarations);
+    let declarations = if let Some(file_needle) = file_qualifier {
+        let needle_norm = file_needle.replace('\\', "/");
+        let clean_needle = needle_norm.strip_prefix('/').unwrap_or(&needle_norm);
+        let suffix = format!("/{clean_needle}");
+        declarations
+            .into_iter()
+            .filter(|d| {
+                let df = d.declared_in.replace('\\', "/");
+                df == clean_needle || df.ends_with(&suffix)
+            })
+            .collect()
+    } else {
+        declarations
+    };
+
+    let module_redirect = build_module_redirect(snapshot, target_symbol, declarations);
 
     BodyResult {
         symbol: symbol.to_string(),
@@ -1264,5 +1329,142 @@ mod tests {
         assert_eq!(result.bodies.len(), 1);
         assert!(result.bodies[0].source.contains("pub fn start(&self)"));
         assert!(result.bodies[0].source.contains("println!"));
+    }
+
+    #[test]
+    fn w2_03_body_returns_full_extent_for_ref_slice() {
+        // Multi-line ref-slice (&[...]) must not spill or fall into a truncated window
+        let src = "pub const FAILURE_PHRASES: &[&str] = &[\n    \"failed\",\n    \"failure\",\n    \"timeout\",\n];\n\npub fn next_helper() -> bool {\n    true\n}";
+        let lines: Vec<&str> = src.lines().collect();
+        let b = extract_body(&lines, 0, 200, "rs");
+        assert_eq!(b.end_line, 5, "ref slice ends on line 5 at `];`");
+        assert_eq!(b.total_lines, 5);
+        assert_eq!(b.extent, EXTENT_BRACKET);
+        assert!(
+            !b.truncated,
+            "ref slice within line_cap must not be truncated"
+        );
+        assert!(b.source.contains("FAILURE_PHRASES"));
+        assert!(b.source.contains("\"timeout\""));
+        assert!(
+            !b.source.contains("next_helper"),
+            "must not spill into next helper"
+        );
+
+        // Also test RHS `{`
+        let map_src = "pub const LOOKUP: std::collections::HashMap<&str, i32> = {\n    let mut m = std::collections::HashMap::new();\n    m.insert(\"key\", 42);\n    m\n};\n\npub fn after() {}";
+        let map_lines: Vec<&str> = map_src.lines().collect();
+        let mb = extract_body(&map_lines, 0, 200, "rs");
+        assert_eq!(
+            mb.end_line, 5,
+            "block assignment ends on line 5 at closing brace"
+        );
+        assert_eq!(mb.total_lines, 5);
+        assert_eq!(mb.extent, EXTENT_BRACE);
+        assert!(!mb.truncated);
+        assert!(mb.source.contains("LOOKUP"));
+        assert!(mb.source.contains("insert"));
+        assert!(!mb.source.contains("after"));
+
+        // Single line ref slice
+        let single = "pub const EMPTY_REF: &[&str] = &[];\npub fn following() {}";
+        let single_lines: Vec<&str> = single.lines().collect();
+        let sb = extract_body(&single_lines, 0, 200, "rs");
+        assert_eq!(sb.end_line, 1);
+        assert_eq!(sb.total_lines, 1);
+        assert_eq!(sb.extent, EXTENT_BRACKET);
+        assert!(!sb.truncated);
+        assert!(!sb.source.contains("following"));
+
+        // Also verify through snapshot query_symbol_body
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let source_path = tmp.path().join("slices.rs");
+        std::fs::write(
+            &source_path,
+            "pub const PHRASES: &[&str] = &[\n    \"alpha\",\n    \"beta\",\n];\n\npub fn helper() {}\n",
+        )
+        .expect("write source");
+
+        let mut snapshot = Snapshot::new(vec![tmp.path().to_string_lossy().to_string()]);
+        let mut file = crate::types::FileAnalysis::new(source_path.to_string_lossy().to_string());
+        file.exports.push(crate::types::ExportSymbol {
+            name: "PHRASES".to_string(),
+            kind: "const".to_string(),
+            line: Some(1),
+            export_type: "named".to_string(),
+            params: Vec::new(),
+            symbol_id: Default::default(),
+        });
+        snapshot.files.push(file);
+
+        let result = query_symbol_body(&snapshot, "PHRASES", None);
+        assert_eq!(result.bodies.len(), 1);
+        assert_eq!(result.bodies[0].extent, EXTENT_BRACKET);
+        assert!(!result.bodies[0].truncated);
+        assert_eq!(result.bodies[0].end_line, 4);
+        assert!(!result.bodies[0].source.contains("helper"));
+    }
+
+    #[test]
+    fn test_body_file_qualification_distinguishes_twins() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut snapshot = Snapshot::new(vec![tmp.path().to_string_lossy().to_string()]);
+        for (rel_path, ret_val) in [("src/a.rs", 10), ("src/b.rs", 20)] {
+            let full_path = tmp.path().join(rel_path);
+            std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
+            std::fs::write(
+                &full_path,
+                format!("pub fn helper() -> i32 {{\n    {ret_val}\n}}\n"),
+            )
+            .unwrap();
+
+            let mut file = crate::types::FileAnalysis::new(full_path.to_string_lossy().to_string());
+            file.exports.push(crate::types::ExportSymbol {
+                name: "helper".to_string(),
+                kind: "function".to_string(),
+                line: Some(1),
+                export_type: "named".to_string(),
+                params: Vec::new(),
+                symbol_id: Default::default(),
+            });
+            snapshot.files.push(file);
+        }
+
+        // Unqualified helper returns 2 twin bodies
+        let unqualified = query_symbol_body(&snapshot, "helper", None);
+        assert_eq!(
+            unqualified.bodies.len(),
+            2,
+            "twins should both be found when unqualified"
+        );
+
+        // Qualified path syntax src/a.rs::helper resolves only src/a.rs
+        let qual_a = query_symbol_body(&snapshot, "src/a.rs::helper", None);
+        assert_eq!(
+            qual_a.bodies.len(),
+            1,
+            "path::sym must disambiguate to src/a.rs"
+        );
+        assert!(qual_a.bodies[0].file.ends_with("src/a.rs"));
+        assert!(qual_a.bodies[0].source.contains("10"));
+
+        // Qualified path syntax src/b.rs::helper resolves only src/b.rs
+        let qual_b = query_symbol_body(&snapshot, "src/b.rs::helper", None);
+        assert_eq!(
+            qual_b.bodies.len(),
+            1,
+            "path::sym must disambiguate to src/b.rs"
+        );
+        assert!(qual_b.bodies[0].file.ends_with("src/b.rs"));
+        assert!(qual_b.bodies[0].source.contains("20"));
+
+        // Suffix syntax b.rs::helper also works
+        let qual_suffix = query_symbol_body(&snapshot, "b.rs::helper", None);
+        assert_eq!(qual_suffix.bodies.len(), 1);
+        assert!(qual_suffix.bodies[0].file.ends_with("src/b.rs"));
+
+        // Nonexistent path returns 0 bodies
+        let qual_none = query_symbol_body(&snapshot, "src/c.rs::helper", None);
+        assert_eq!(qual_none.bodies.len(), 0);
     }
 }

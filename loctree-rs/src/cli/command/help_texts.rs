@@ -223,7 +223,9 @@ OPTIONS:
     --no-consumers     Hide reverse dependencies (old dependency-only behavior)
     --depth <N>        Maximum dependency depth to traverse
     --root <PATH>      Project root for resolving imports
+    --project <PATH>   Alias for --root (same spelling as context/find)
     --rescan           Force snapshot update (includes new/uncommitted files)
+    --include-untracked Slice an untracked file in-memory without a full rescan
     --help, -h         Show this help message
 
 EXAMPLES:
@@ -244,7 +246,13 @@ USAGE:
 
 OPTIONS:
     --file <PATH>      Focus the context pack on a specific file
-    --scope <SELECTOR> Deterministic structural filter (repeatable; multiple = AND)
+    --scope <SELECTOR> Deterministic structural filter (repeatable).
+                       Default: multiple --scope flags are AND (intersection).
+                       Comma-joined selectors (`path:a,path:b`) are OR (union).
+                       Kinds: path, tag, import, reach. Unknown kinds fail loudly.
+    --scope-mode <all|any>
+                       Combine repeated --scope flags: all = AND (default),
+                       any = OR/union. Comma-joined values are always a union.
     --changed          Limit to files changed in the current git worktree
     --task <TEXT>      Semantic task hint; ranks within --scope when scope is present
     --with-aicx        Request AICX memory overlay (default; kept for scripts)
@@ -261,6 +269,8 @@ EXAMPLES:
     loct context
     loct context --file Cargo.toml
     loct context --scope \"path:loctree-rs/src/cli/\"
+    loct context --scope path:loctree-rs/src --scope path:loctree-mcp/src --scope-mode any
+    loct context --scope \"path:loctree-rs/src,path:loctree-mcp/src\"
     loct context --scope path:core --task \"hold-mods versus hands-off\"
     loct context --scope path:src/agent/ --task \"fix SSE retry behavior\" --full --markdown
     loct context --scope \"context-pipeline\"
@@ -322,9 +332,10 @@ SCOPES:
     post/observe pairs and @selector targets (Heuristic provenance).
 
 OPTIONS:
-    --handler <NAME>     Handler name for trace scope
-    --limit <N>          Global result bound across aggregate output families
-    --help, -h           Show this help message
+    --handler <NAME>        Handler name for trace scope
+    --limit <N>             Global result bound across aggregate output families
+    --workspace-closed      Treat pub in library crates as crate-internal (dead)
+    --help, -h              Show this help message
 
 EXAMPLES:
     loct follow
@@ -388,6 +399,7 @@ OPTIONS:
     --group-by-file      In literal mode, include a per-file rollup
     --count-only, --slim In literal mode, return counters without occurrences
     --compact            In literal mode, terse path:line human output
+    --include-untracked  Scan git-untracked sources in-memory (no full rescan)
     --offset <N>         In literal mode, zero-based page offset
     --root <PATH>        Project root to scan (default: current directory)
     --project <PATH>     Alias for --root (parity with context --project)
@@ -475,6 +487,7 @@ OPTIONS:
     --group-by-file      Include a per-file occurrence rollup
     --count-only, --slim Return counters without the occurrence list
     --compact            Human output: terse path:line plus one context line
+    --include-untracked  Scan git-untracked sources in-memory (no full rescan)
     --limit <N>          Maximum occurrences in this page
     --offset <N>         Zero-based offset for paged output
     --json               Emit JSON (file, line, column, matched_text, context, source)
@@ -519,6 +532,7 @@ OPTIONS:
     --with-tests         Include test files
     --with-helpers       Include helper files
     --with-shadows       Detect shadow exports (same symbol, multiple files)
+    --workspace-closed   Treat pub in library crates as crate-internal
     --help, -h           Show this help message
 
 EXAMPLES:
@@ -896,6 +910,7 @@ DESCRIPTION:
 OPTIONS:
     --depth <N>          Limit traversal depth (default: unlimited)
     --root <PATH>        Project root (default: current directory)
+    --project <PATH>     Alias for --root (same spelling as context/find)
     --json               Output as JSON for agent consumption
     --help, -h           Show this help message
 
@@ -941,7 +956,7 @@ DESCRIPTION:
 OPTIONS:
     --since <SNAPSHOT>   Base snapshot to compare from (required)
     --to <SNAPSHOT>      Target snapshot (default: current working tree)
-    --auto-scan-base     Auto-create git worktree and scan target branch
+    --auto-scan-base     Export the --since ref tree and scan it (no git worktree)
     --changed-files      Show only the changed-file summary for <ref>..HEAD
     --problems-only      Show only regressions (new dead code, new cycles)
     --help, -h           Show this help message
@@ -1163,51 +1178,6 @@ OUTPUT:
     - LOW: Tests that import unused code
 
     Each gap shows the source location and usage context.";
-
-pub(super) const SNIFF_HELP: &str = "loct sniff - Sniff for code smells (aggregate analysis)
-
-USAGE:
-    loct sniff [OPTIONS]
-
-DESCRIPTION:
-    Aggregates all smell-level findings worth checking:
-
-    Twins:        Same symbol name in multiple files
-                  - Can cause import confusion
-
-    Dead Parrots: Exports with 0 imports
-                  - Potentially unused code
-
-    Crowds:       Files with similar dependency patterns
-                  - Possible duplication or fragmentation
-
-    Output is friendly and non-judgmental. These are hints, not verdicts.
-
-OPTIONS:
-    --path <DIR>           Root directory to analyze (default: current directory)
-    --dead-only            Show only dead parrots (skip twins and crowds)
-    --twins-only           Show only twins (skip dead parrots and crowds)
-    --crowds-only          Show only crowds (skip twins and dead parrots)
-    --include-tests        Include test files in analysis (default: false)
-    --min-crowd-size <N>   Minimum crowd size to report (default: 2)
-    --json                 Output as JSON for programmatic use
-    --help, -h             Show this help message
-
-EXAMPLES:
-    loct sniff                    # Full code smell analysis
-    loct sniff --dead-only        # Only dead parrots
-    loct sniff --twins-only       # Only duplicate names
-    loct sniff --crowds-only      # Only similar file clusters
-    loct sniff --include-tests    # Include test files
-    loct sniff --json             # Machine-readable output
-
-OUTPUT:
-    Aggregates three types of code smells:
-    - TWINS: Same symbol exported from multiple files
-    - DEAD PARROTS: Exports with 0 imports
-    - CROWDS: Files clustering around similar functionality
-
-    Each section provides actionable suggestions for consolidation or cleanup.";
 
 pub(super) const SUPPRESS_HELP: &str = "loct suppress - Mark findings as false positives
 
@@ -1495,63 +1465,6 @@ OUTPUT FORMAT:
 RELATED COMMANDS:
     loct crowd              Find functionally similar components
     loct find <pattern>     Search for CSS selectors or properties";
-
-pub(super) const ZOMBIE_HELP: &str = "loct zombie - Find all zombie code (combined analysis)
-
-USAGE:
-    loct zombie [OPTIONS] [PATHS...]
-
-DESCRIPTION:
-    Combines three sources of dead code into one actionable report:
-
-    DEAD EXPORTS:     Unused exports detected by dead code analysis
-                      (symbols with 0 imports)
-
-    ORPHAN FILES:     Files with 0 importers (not imported by any other file)
-                      Entry points are OK, but others might be dead
-
-    SHADOW EXPORTS:   Same symbol exported by multiple files where some
-                      have 0 imports (likely consolidation candidates)
-
-    This is a comprehensive zombie hunter - finds all forms of potentially
-    dead code in a single scan.
-
-OPTIONS:
-    --include-tests    Include test files in analysis (default: false)
-    --json             Output as JSON for programmatic use
-    --help, -h         Show this help message
-
-ARGUMENTS:
-    [PATHS...]         Root directories to scan (default: current directory)
-
-EXAMPLES:
-    loct zombie                    # Find all zombie code
-    loct zombie --include-tests    # Include test files
-    loct zombie src/               # Analyze specific directory
-    loct zombie --json             # Machine-readable output
-
-OUTPUT FORMAT:
-    Zombie Code Report
-
-    Dead Exports (3):
-      src/utils/old.ts:15 - unusedFunction
-      src/hooks/legacy.ts:8 - useLegacyHook
-      ...
-
-    Orphan Files (0 importers, 2):
-      src/features/settings/SettingsList.tsx (504 LOC)
-      src/components/deprecated/OldButton.tsx (89 LOC)
-
-    Shadow Exports (1):
-      conversationHostStore exported by 2 files, 1 dead
-
-    Total: 6 zombie items, ~950 LOC to review
-
-RELATED COMMANDS:
-    loct dead               Detailed dead export analysis
-    loct twins              Dead parrots and semantic duplicates
-    loct hotspots --leaves  Find leaf nodes (0 importers)
-    loct sniff              Code smell analysis";
 
 pub(super) const HEALTH_HELP: &str = "loct health - Quick health check summary
 

@@ -155,7 +155,7 @@ Settings ▸ **Tools ▸ Loctree** (mirrors the VS Code configuration):
 | `showStatusBar`      | `true`     | Show the status bar widget.                         |
 | `autoDownload`       | `true`     | Download `loctree-lsp` when not found locally.      |
 | `downloadBaseUrl`    | `https://github.com/Loctree/loctree-release` | Override the GitHub repo for downloads. |
-| `downloadTag`        | *(empty)*  | Release tag (e.g. `v0.14.4`). Empty pins to the plugin's own version; `latest` is an explicit opt-in. |
+| `downloadTag`        | *(empty)*  | Release tag (e.g. `v0.14.5-rc1`). Empty pins to the plugin's own version; `latest` is an explicit opt-in. |
 | `diagnosticSeverity` | `WARNING`  | Severity for dead-export diagnostics.              |
 
 ## Build & test

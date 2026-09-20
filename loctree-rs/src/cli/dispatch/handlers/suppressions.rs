@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use super::super::super::command::SuppressionsOptions;
 use super::super::{DispatchResult, GlobalOptions};
 use crate::analyzer::suppression_inventory::{
-    SilencerKind, SilencerMatch, inventory, resolve_ignore_globs,
+    SilencerKind, SilencerMatch, inventory_with_ignore, resolve_ignore_globs,
 };
 
 /// Entry point dispatched from `Command::Suppressions`.
@@ -75,7 +75,9 @@ pub fn handle_suppressions_command(
     // Operators opt back in with --include-fixtures.
     let extra_globs = resolve_ignore_globs(&root, !opts.include_fixtures);
 
-    let inv = inventory(&root, &filter, &extra_globs);
+    // Global `--include-ignored` opts `.loctignore` paths back in. Gitignore
+    // still applies — same contract as the repo scanner.
+    let inv = inventory_with_ignore(&root, &filter, &extra_globs, global.include_ignored);
 
     // Output mode resolution: JSON wins over summary, summary is default.
     let want_json = opts.json || global.json;
@@ -153,6 +155,10 @@ fn print_summary(
     println!(
         "Total: {} silencers across {} files.",
         inv.total, inv.total_files
+    );
+    println!(
+        "Excluded: {} paths by .gitignore/.loctignore.",
+        inv.excluded_by_ignore
     );
     println!(
         "Tip: `loct suppressions --type <kind>` to list one bucket; \

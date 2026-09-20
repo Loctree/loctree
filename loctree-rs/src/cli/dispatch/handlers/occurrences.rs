@@ -9,6 +9,7 @@
 //! `--regex` switches the same command to pattern evaluation over raw file
 //! text, sharing the engine, coverage line and paging with `find --regex`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::super::super::command::{FindOptions, OccurrencesOptions};
@@ -16,7 +17,8 @@ use super::super::{DispatchResult, GlobalOptions, load_or_create_query_snapshot_
 use crate::analyzer::occurrences::{
     FileScope, FileScopeResolution, LiteralOccurrence, MatchMode, OccurrenceResults, ReportOptions,
     ScanOptions, attach_near_matches, enrich_with_snapshot, expand_literal_patterns,
-    scan_files_multi_literal, scan_files_with, scan_files_with_regex,
+    positional_dot_query_error, scan_files_multi_literal, scan_files_with,
+    scan_files_with_regex_opts,
 };
 use crate::analyzer::search::{FuzzySuggestion, literal_fuzzy_suggestions};
 use crate::snapshot::Snapshot;
@@ -54,7 +56,7 @@ pub fn handle_occurrences_command(
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -64,6 +66,7 @@ pub fn handle_occurrences_command(
         &patterns,
         ScanOptions {
             whole_token: opts.whole_token,
+            no_generated: opts.no_generated,
         },
         FileScope::default(),
     );
@@ -75,6 +78,7 @@ pub fn handle_occurrences_command(
                 pattern,
                 ScanOptions {
                     whole_token: opts.whole_token,
+                    no_generated: opts.no_generated,
                 },
             );
             attach_near_matches(&mut probe, &snapshot.files);
@@ -94,7 +98,12 @@ pub fn handle_occurrences_command(
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut results, overlay);
 
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     if global.json {
         match serde_json::to_string_pretty(&results) {
             Ok(json) => println!("{}", json),
@@ -104,7 +113,7 @@ pub fn handle_occurrences_command(
             }
         }
     } else {
-        print_human(&results, opts.compact);
+        print_human(&results, opts.compact, zero_hit_ctx);
     }
 
     DispatchResult::Exit(0)
@@ -156,12 +165,55 @@ fn handle_occurrences_regex(
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
         .collect::<Vec<_>>();
-    let mut results = scan_files_with_regex(borrowed, &re, FileScope::default());
+    let mut results = scan_files_with_regex_opts(
+        borrowed,
+        &re,
+        FileScope::default(),
+        ScanOptions {
+            whole_token: false,
+            no_generated: opts.no_generated,
+        },
+    );
+    if opts.no_generated {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in results.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = results.generated_skipped {
+                    *n += newly_skipped;
+                }
+                results.occurrences = kept;
+                results.total = results.occurrences.len();
+                results.emitted = results.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &results.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                results.files_matched = seen.len();
+                results.refresh_coverage_line();
+            } else {
+                results.occurrences = kept;
+            }
+        }
+    }
     results.declare_snapshot_universe(&snapshot, FileScope::default());
     results.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
@@ -169,7 +221,12 @@ fn handle_occurrences_regex(
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut results, overlay);
 
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     if global.json {
         match serde_json::to_string_pretty(&results) {
             Ok(json) => println!("{}", json),
@@ -179,7 +236,7 @@ fn handle_occurrences_regex(
             }
         }
     } else {
-        print_human(&results, opts.compact);
+        print_human(&results, opts.compact, zero_hit_ctx);
     }
 
     DispatchResult::Exit(0)
@@ -196,9 +253,15 @@ fn handle_occurrences_regex(
 ///
 /// Multi-pattern OR (agent anti-grep surface):
 /// - `loct find A B` → exact OR of A and B
-/// - `loct find 'A|B'` → same, when every segment is a simple literal
-///   (not regex). This prevents the silent fixed_string-0 trap on pipes.
+/// - `loct find 'A|B'` → same, per-term exact literals. A metachar in a
+///   term (`.` / `(`) is that term's text, not a veto of the split.
+///   Real regex OR is `--regex`. This prevents the silent fixed_string-0
+///   trap on pipes.
 pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -> DispatchResult {
+    if let Some(err) = positional_dot_query_error(&opts.queries) {
+        eprintln!("[loct][error] {err}");
+        return DispatchResult::Exit(1);
+    }
     let patterns = literal_find_patterns(opts);
     if patterns.is_empty() {
         eprintln!(
@@ -219,7 +282,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -242,6 +305,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
         &patterns,
         ScanOptions {
             whole_token: opts.whole_token,
+            no_generated: opts.no_generated,
         },
         scan_scope,
     );
@@ -253,6 +317,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
                 pattern,
                 ScanOptions {
                     whole_token: opts.whole_token,
+                    no_generated: opts.no_generated,
                 },
             );
             attach_near_matches(&mut probe, &snapshot.files);
@@ -269,12 +334,14 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
     let file_scope_resolved = file_scope.as_ref().is_none_or(|scope| scope.resolved);
     let file_scoped = file_scope.as_ref().is_some_and(|scope| scope.resolved);
     literal_matches.file_scope = file_scope;
+    rewrite_unresolved_file_scope_coverage(&mut literal_matches);
     literal_matches.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
         count_only: opts.count_only,
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut literal_matches, overlay);
 
     // SECONDARY (strictly separate): fuzzy name-similarity hints, labeled
     // `source: "fuzzy"`. Never merged into `literal_matches`.
@@ -294,12 +361,17 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
     // boundaries remain (outside_snapshot / unreadable / …).
     let multi = patterns.len() > 1 || literal_matches.match_mode == MatchMode::MultiLiteral;
     let looks_like_regex = !multi && query_has_regex_metachars(display_query.as_str());
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     let absence = absence_trust(
         &literal_matches.universe,
         file_scope_resolved,
         file_scoped,
         looks_like_regex,
         literal_matches.total,
+        named_zero_hit_exclusion(&literal_matches, zero_hit_ctx),
     );
 
     if global.json {
@@ -307,6 +379,7 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
             "mode": "literal",
             "query": display_query,
             "patterns": patterns,
+            "interpreted_as": literal_matches.match_mode.interpreted_as(),
             "literal_matches": literal_matches,
             // Mode-stable alias. Without it the envelope key changes with the
             // mode (`literal_matches` here, `regex_matches` under --regex), so a
@@ -339,9 +412,14 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
             }
         }
     } else if opts.compact {
-        print_human(&literal_matches, true);
+        print_human(&literal_matches, true, zero_hit_ctx);
     } else {
-        print_literal_find_human(display_query.as_str(), &literal_matches, &fuzzy_suggestions);
+        print_literal_find_human(
+            display_query.as_str(),
+            &literal_matches,
+            &fuzzy_suggestions,
+            zero_hit_ctx,
+        );
     }
 
     DispatchResult::Exit(0)
@@ -403,7 +481,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
     };
 
     let base = roots.first().cloned().unwrap_or_else(|| PathBuf::from("."));
-    let contents = read_snapshot_contents(&snapshot, &base);
+    let (contents, overlay) = read_literal_contents(&snapshot, &base, opts.include_untracked);
     let borrowed = contents
         .iter()
         .map(|(p, c)| (p.as_str(), c.as_str()))
@@ -419,32 +497,83 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
         .map(FileScopeResolution::scan_scope)
         .unwrap_or_default();
 
-    let mut matches = scan_files_with_regex(borrowed, &re, scan_scope);
+    let mut matches = scan_files_with_regex_opts(
+        borrowed,
+        &re,
+        scan_scope,
+        ScanOptions {
+            whole_token: false,
+            no_generated: opts.no_generated,
+        },
+    );
+    if opts.no_generated {
+        let snapshot_generated: std::collections::HashSet<&str> = snapshot
+            .files
+            .iter()
+            .filter(|f| f.is_generated)
+            .map(|f| f.path.as_str())
+            .collect();
+        if !snapshot_generated.is_empty() {
+            let mut kept = Vec::new();
+            let mut newly_skipped = 0;
+            for occ in matches.occurrences.drain(..) {
+                if snapshot_generated.contains(occ.file.as_str()) {
+                    newly_skipped += 1;
+                } else {
+                    kept.push(occ);
+                }
+            }
+            if newly_skipped > 0 {
+                if let Some(ref mut n) = matches.generated_skipped {
+                    *n += newly_skipped;
+                }
+                matches.occurrences = kept;
+                matches.total = matches.occurrences.len();
+                matches.emitted = matches.total;
+                let mut seen = std::collections::BTreeSet::new();
+                for occ in &matches.occurrences {
+                    seen.insert(occ.file.clone());
+                }
+                matches.files_matched = seen.len();
+                matches.refresh_coverage_line();
+            } else {
+                matches.occurrences = kept;
+            }
+        }
+    }
     // No enrich_with_snapshot: a regex pattern is not a symbol name, so symbol
     // resolution against it would be meaningless. Matches stay raw-text truth.
     matches.declare_snapshot_universe(&snapshot, scan_scope);
     let file_scope_resolved = file_scope.as_ref().is_none_or(|scope| scope.resolved);
     let file_scoped = file_scope.as_ref().is_some_and(|scope| scope.resolved);
     matches.file_scope = file_scope;
+    rewrite_unresolved_file_scope_coverage(&mut matches);
     matches.apply_report(ReportOptions {
         group_by_file: opts.group_by_file,
         count_only: opts.count_only,
         offset: opts.offset,
         limit: opts.limit,
     });
+    apply_untracked_overlay(&mut matches, overlay);
 
+    let zero_hit_ctx = ZeroHitCtx {
+        project_root: Some(base.as_path()),
+        snapshot_stale: snapshot.is_stale(&base),
+    };
     let absence = absence_trust(
         &matches.universe,
         file_scope_resolved,
         file_scoped,
         false,
         matches.total,
+        named_zero_hit_exclusion(&matches, zero_hit_ctx),
     );
 
     if global.json {
         let payload = serde_json::json!({
             "mode": "regex",
             "query": pattern,
+            "interpreted_as": matches.match_mode.interpreted_as(),
             "regex_matches": matches,
             // Mode-stable alias — see the literal branch above.
             "matches": matches,
@@ -468,7 +597,7 @@ pub fn handle_find_regex_command(opts: &FindOptions, global: &GlobalOptions) -> 
             }
         }
     } else {
-        print_regex_find_human(pattern.trim(), &matches);
+        print_regex_find_human(pattern.trim(), &matches, zero_hit_ctx);
     }
 
     DispatchResult::Exit(0)
@@ -485,12 +614,20 @@ struct AbsenceTrust {
     exclusion_caveat: Option<String>,
 }
 
+/// Extra signals the zero-hit printer needs beyond the result payload.
+#[derive(Clone, Copy, Default)]
+struct ZeroHitCtx<'a> {
+    project_root: Option<&'a Path>,
+    snapshot_stale: bool,
+}
+
 fn absence_trust(
     universe: &crate::analyzer::occurrences::IndexedUniverse,
     file_scope_resolved: bool,
     file_scoped: bool,
     looks_like_regex_literal: bool,
     total: usize,
+    named_exclusion: Option<String>,
 ) -> AbsenceTrust {
     let for_scanned =
         file_scope_resolved && universe.scan_complete && (total > 0 || !looks_like_regex_literal);
@@ -505,10 +642,13 @@ fn absence_trust(
     } else {
         "scanned_universe"
     };
-    // Only surface the caveat when absolute trust is withheld — otherwise
-    // agents see a contradictory "absolute + caveat" pair.
+    // Named causes (unresolved / .loctignore path / stale snapshot) beat the
+    // generic outside_snapshot caveat. Only surface a caveat when absolute
+    // trust is withheld — otherwise agents see a contradictory pair.
     let exclusion_caveat = if absolute {
         None
+    } else if named_exclusion.is_some() {
+        named_exclusion
     } else {
         universe.absence_exclusion_caveat()
     };
@@ -520,10 +660,101 @@ fn absence_trust(
     }
 }
 
+/// Unresolved `--file` must not look like an empty-repo scan (`scanned 0 of 0`).
+/// The coverage line becomes a named selector failure instead of a false vacuum.
+fn rewrite_unresolved_file_scope_coverage(results: &mut OccurrenceResults) {
+    let Some(scope) = results.file_scope.as_ref() else {
+        return;
+    };
+    if scope.resolved {
+        return;
+    }
+    results.coverage_line = format!(
+        "file scope status={} requested=`{}` — selector did not resolve; this is not a scanned-0-of-0 empty universe",
+        scope.status, scope.requested
+    );
+}
+
+fn file_scope_loctignore_hint(
+    project_root: Option<&Path>,
+    scope: Option<&FileScopeResolution>,
+) -> Option<String> {
+    let (root, scope) = (project_root?, scope?);
+    if scope.resolved {
+        return None;
+    }
+    crate::fs_utils::loctignore_exclusion_hint(root, &scope.requested)
+}
+
+/// Human zero-hit sentence that names the cause instead of a generic
+/// "absence is (not) trustworthy".
+fn zero_hit_absence_text(
+    results: &OccurrenceResults,
+    mode: AbsenceMode,
+    looks_like_regex: bool,
+    ctx: ZeroHitCtx<'_>,
+) -> String {
+    let interpreted = format!("interpreted_as: {}", results.match_mode.interpreted_as());
+    if !results.universe.scan_complete {
+        return format!(
+            "not found — absence is NOT trustworthy because at least one indexed path could not be scanned ({interpreted})"
+        );
+    }
+
+    let file_scope = results.file_scope.as_ref();
+    let unresolved = file_scope.is_some_and(|scope| !scope.resolved);
+    if unresolved {
+        let requested = file_scope.map(|s| s.requested.as_str()).unwrap_or("");
+        let status = file_scope.map(|s| s.status).unwrap_or("unresolved");
+        if let Some(hint) = file_scope_loctignore_hint(ctx.project_root, file_scope) {
+            return format!(
+                "not found — file scope status={status}; excluded-by-.loctignore `{requested}` — {hint} ({interpreted})"
+            );
+        }
+        if ctx.snapshot_stale {
+            return format!(
+                "not found — file scope status={status}; requested `{requested}` is not in this snapshot, and the snapshot is stale — absence is NOT trustworthy (rescan with `loct scan`) ({interpreted})"
+            );
+        }
+        return format!(
+            "not found — file scope status={status}; requested `{requested}` did not resolve to an indexed path — absence is NOT trustworthy ({interpreted})"
+        );
+    }
+
+    if matches!(mode, AbsenceMode::Literal) && looks_like_regex {
+        return format!(
+            "0 exact-string matches — NOT a trustworthy absence: the query contains regex metacharacters and `--literal` matches literally, so a pattern was never evaluated. For a regex search use a pattern-aware tool. ({interpreted})"
+        );
+    }
+
+    if ctx.snapshot_stale {
+        return format!(
+            "not found — snapshot is stale; absence is NOT trustworthy (rescan with `loct scan`) ({interpreted})"
+        );
+    }
+
+    let file_scoped = file_scope.is_some_and(|scope| scope.resolved);
+    if !file_scoped && let Some(caveat) = results.universe.absence_exclusion_caveat() {
+        let prefix = match mode {
+            AbsenceMode::Regex => "not found — pattern evaluated; ",
+            AbsenceMode::Literal => "not found — literal ",
+        };
+        return format!("{prefix}{caveat} ({interpreted})");
+    }
+    match mode {
+        AbsenceMode::Regex => {
+            format!("not found — pattern evaluated; absence is trustworthy ({interpreted})")
+        }
+        AbsenceMode::Literal => {
+            format!("not found — literal absence is trustworthy ({interpreted})")
+        }
+    }
+}
+
 /// Human render for `find --regex`. Mirrors the literal printer's structure
 /// (coverage line, per-file rollup, page, per-hit role label) but labels the
 /// header as regex and never prints fuzzy suggestions (there are none).
-fn print_regex_find_human(pattern: &str, results: &OccurrenceResults) {
+fn print_regex_find_human(pattern: &str, results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) {
     println!(
         "Regex matches of /{}/ ({} in {} file(s)) [source: regex]",
         pattern, results.total, results.files_matched
@@ -533,7 +764,7 @@ fn print_regex_find_human(pattern: &str, results: &OccurrenceResults) {
     }
     print_file_scope(results);
     if results.total == 0 {
-        print_zero_hit_absence(results, AbsenceMode::Regex, false);
+        print_zero_hit_absence(results, AbsenceMode::Regex, false, ctx);
         return;
     }
     print_file_rollup(results);
@@ -676,54 +907,60 @@ enum AbsenceMode {
 /// guarantee for gitignored / unindexed surfaces (e.g. generated FFI
 /// bindings outside the snapshot). A resolved `--file` scope is absolute
 /// for that one path.
-fn print_zero_hit_absence(results: &OccurrenceResults, mode: AbsenceMode, looks_like_regex: bool) {
-    if !results.universe.scan_complete {
+fn print_zero_hit_absence(
+    results: &OccurrenceResults,
+    mode: AbsenceMode,
+    looks_like_regex: bool,
+    ctx: ZeroHitCtx<'_>,
+) {
+    println!(
+        "  ({})",
+        zero_hit_absence_text(results, mode, looks_like_regex, ctx)
+    );
+    if results
+        .universe
+        .exclusions
+        .iter()
+        .any(|entry| entry.kind == "untracked")
+    {
         println!(
-            "  (not found — absence is NOT trustworthy because at least one indexed path could not be scanned)"
+            "  (pass --include-untracked to scan fresh untracked files without a full rescan)"
         );
-        return;
+    }
+}
+
+fn named_zero_hit_exclusion(results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) -> Option<String> {
+    if let Some(hint) = file_scope_loctignore_hint(ctx.project_root, results.file_scope.as_ref()) {
+        let requested = results
+            .file_scope
+            .as_ref()
+            .map(|s| s.requested.as_str())
+            .unwrap_or("");
+        return Some(format!("excluded-by-.loctignore `{requested}` — {hint}"));
     }
     if results
         .file_scope
         .as_ref()
         .is_some_and(|scope| !scope.resolved)
     {
-        println!(
-            "  (not found in scope — absence is NOT trustworthy because the requested file scope did not resolve to exactly one indexed path)"
-        );
-        return;
+        let requested = results
+            .file_scope
+            .as_ref()
+            .map(|s| s.requested.as_str())
+            .unwrap_or("");
+        let status = results
+            .file_scope
+            .as_ref()
+            .map(|s| s.status)
+            .unwrap_or("unresolved");
+        return Some(format!(
+            "unresolved file scope status={status} requested=`{requested}`"
+        ));
     }
-    if matches!(mode, AbsenceMode::Literal) && looks_like_regex {
-        // NOT a trustworthy absence: the query carries regex metacharacters,
-        // but `--literal` did an exact-string match and never evaluated it as
-        // a pattern. Printing "absence is trustworthy" here would be a FALSE
-        // CLEAN for a security/privacy audit.
-        println!("  (0 exact-string matches — NOT a trustworthy absence: the query contains");
-        println!("   regex metacharacters and `--literal` matches literally, so a pattern was");
-        println!("   never evaluated. For a regex search use a pattern-aware tool.)");
-        return;
+    if ctx.snapshot_stale {
+        return Some("stale snapshot".to_string());
     }
-    let file_scoped = results
-        .file_scope
-        .as_ref()
-        .is_some_and(|scope| scope.resolved);
-    // Repo-wide only: qualify when exclusion boundaries exist.
-    if !file_scoped && let Some(caveat) = results.universe.absence_exclusion_caveat() {
-        let prefix = match mode {
-            AbsenceMode::Regex => "not found — pattern evaluated; ",
-            AbsenceMode::Literal => "not found — literal ",
-        };
-        println!("  ({prefix}{caveat})");
-        return;
-    }
-    match mode {
-        AbsenceMode::Regex => {
-            println!("  (not found — pattern evaluated; absence is trustworthy)");
-        }
-        AbsenceMode::Literal => {
-            println!("  (not found — literal absence is trustworthy)");
-        }
-    }
+    None
 }
 
 /// Detect regex metacharacters that strongly imply the caller meant a *pattern*
@@ -792,6 +1029,79 @@ fn read_snapshot_contents(snapshot: &Snapshot, base: &Path) -> Vec<(String, Stri
     contents
 }
 
+struct UntrackedOverlay {
+    count: usize,
+    included: bool,
+    scanned: usize,
+    known: bool,
+}
+
+fn apply_untracked_overlay(results: &mut OccurrenceResults, overlay: UntrackedOverlay) {
+    if overlay.known {
+        results.declare_untracked_overlay(overlay.count, overlay.included, overlay.scanned);
+    }
+}
+
+/// Snapshot bytes plus optional in-memory untracked overlay.
+///
+/// Untracked files never mutate the snapshot. `--include-untracked` only
+/// appends their contents to this scan.
+fn read_literal_contents(
+    snapshot: &Snapshot,
+    base: &Path,
+    include_untracked: bool,
+) -> (Vec<(String, String)>, UntrackedOverlay) {
+    let mut contents = read_snapshot_contents(snapshot, base);
+    let Some(paths) = crate::snapshot::git_untracked_source_paths(base) else {
+        return (
+            contents,
+            UntrackedOverlay {
+                count: 0,
+                included: include_untracked,
+                scanned: 0,
+                known: false,
+            },
+        );
+    };
+    let indexed: HashSet<String> = snapshot
+        .files
+        .iter()
+        .map(|file| {
+            file.path
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string()
+        })
+        .collect();
+    let extra: Vec<String> = paths
+        .into_iter()
+        .filter(|path| {
+            let normalized = path.replace('\\', "/").trim_start_matches("./").to_string();
+            !indexed.contains(&normalized)
+        })
+        .collect();
+    let count = extra.len();
+    let mut scanned = 0;
+    if include_untracked {
+        for path in &extra {
+            let resolved = resolve_path(base, path);
+            if let Ok(text) = std::fs::read_to_string(&resolved) {
+                contents.push((path.clone(), text));
+                scanned += 1;
+            }
+        }
+    }
+    (
+        contents,
+        UntrackedOverlay {
+            count,
+            included: include_untracked,
+            scanned,
+            known: true,
+        },
+    )
+}
+
 /// Resolve a snapshot-relative path against the scan root. Falls back to the
 /// raw path if joining does not yield an existing file (e.g. already absolute).
 fn resolve_path(base: &Path, rel: &str) -> PathBuf {
@@ -806,9 +1116,9 @@ fn resolve_path(base: &Path, rel: &str) -> PathBuf {
     joined
 }
 
-fn print_human(results: &OccurrenceResults, compact: bool) {
+fn print_human(results: &OccurrenceResults, compact: bool, ctx: ZeroHitCtx<'_>) {
     if compact {
-        print_compact(results);
+        print_compact(results, ctx);
         return;
     }
     // The header names the mode the scan actually ran in. Calling a `--regex`
@@ -834,7 +1144,9 @@ fn print_human(results: &OccurrenceResults, compact: bool) {
         if regex_mode {
             // A compiled pattern that matched nothing is a trustworthy absence;
             // the literal wording ("no exact occurrences") would understate it.
-            print_zero_hit_absence(results, AbsenceMode::Regex, false);
+            print_zero_hit_absence(results, AbsenceMode::Regex, false, ctx);
+        } else if results.file_scope.is_some() {
+            print_zero_hit_absence(results, AbsenceMode::Literal, false, ctx);
         } else {
             print_no_exact_occurrences(results, "  ");
         }
@@ -855,10 +1167,14 @@ fn print_human(results: &OccurrenceResults, compact: bool) {
     print_suggested_next(results);
 }
 
-fn print_compact(results: &OccurrenceResults) {
+fn print_compact(results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) {
     print_file_scope(results);
     if results.total == 0 {
-        print_no_exact_occurrences(results, "");
+        if results.file_scope.is_some() {
+            print_zero_hit_absence(results, AbsenceMode::Literal, false, ctx);
+        } else {
+            print_no_exact_occurrences(results, "");
+        }
         return;
     }
     if results.slim {
@@ -931,7 +1247,12 @@ fn print_page(results: &OccurrenceResults) {
 /// Human output for `find --literal`: literal matches as the primary block,
 /// then fuzzy suggestions in a clearly-labeled separate section that can never
 /// be mistaken for evidence.
-fn print_literal_find_human(query: &str, literal: &OccurrenceResults, fuzzy: &[FuzzySuggestion]) {
+fn print_literal_find_human(
+    query: &str,
+    literal: &OccurrenceResults,
+    fuzzy: &[FuzzySuggestion],
+    ctx: ZeroHitCtx<'_>,
+) {
     let looks_like_regex = query_has_regex_metachars(query);
     println!(
         "=== Literal Matches ({} in {} file(s)) [source: {}] ===",
@@ -942,7 +1263,7 @@ fn print_literal_find_human(query: &str, literal: &OccurrenceResults, fuzzy: &[F
     }
     print_file_scope(literal);
     if literal.total == 0 {
-        print_zero_hit_absence(literal, AbsenceMode::Literal, looks_like_regex);
+        print_zero_hit_absence(literal, AbsenceMode::Literal, looks_like_regex, ctx);
     } else {
         if looks_like_regex {
             println!(
@@ -1071,7 +1392,11 @@ fn print_file_context(results: &OccurrenceResults) {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_group_spans, more_cols_suffix, query_has_regex_metachars};
+    use super::{
+        AbsenceMode, ZeroHitCtx, line_group_spans, more_cols_suffix, query_has_regex_metachars,
+        rewrite_unresolved_file_scope_coverage, zero_hit_absence_text,
+    };
+    use crate::analyzer::occurrences::{FileScopeResolution, ScanOptions, scan_files_with_scope};
 
     #[test]
     fn banner_line_hits_collapse_into_one_row() {
@@ -1167,5 +1492,367 @@ mod tests {
                 "plain literal {literal:?} must not be flagged as regex-like"
             );
         }
+    }
+
+    #[test]
+    fn w1_01_zero_hit_names_loctignore_exclusion() {
+        // G-LITERAL-SCOPE-BLIND / G-DOCS-IGNORE: a zero-hit on a path that
+        // exists but is parked by .loctignore must name that path, not hide
+        // behind generic outside_snapshot / "absence is trustworthy".
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("ignored_w1_01")).expect("mkdir ignored");
+        std::fs::write(
+            root.join("ignored_w1_01/secret.rs"),
+            "TOKEN_W1_01_IGNORED\n",
+        )
+        .expect("write ignored");
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        std::fs::write(root.join("src/lib.rs"), "fn main() {}\n").expect("write src");
+        std::fs::write(root.join(".loctignore"), "ignored_w1_01/\n").expect("loctignore");
+
+        let ignored_scope = FileScopeResolution::resolve("ignored_w1_01", ["src/lib.rs"]);
+        assert!(!ignored_scope.resolved);
+        assert_eq!(ignored_scope.status, "unresolved");
+
+        let mut results = scan_files_with_scope(
+            [("src/lib.rs", "fn main() {}\n")],
+            "TOKEN_W1_01_IGNORED",
+            ScanOptions::default(),
+            ignored_scope.scan_scope(),
+        );
+        results.file_scope = Some(ignored_scope);
+        rewrite_unresolved_file_scope_coverage(&mut results);
+        assert!(
+            !results.coverage_line.contains("scanned 0 of 0"),
+            "excluded scope must not look like an empty universe, got: {}",
+            results.coverage_line
+        );
+        assert!(
+            results.coverage_line.contains("unresolved"),
+            "coverage must name unresolved, got: {}",
+            results.coverage_line
+        );
+
+        let text = zero_hit_absence_text(
+            &results,
+            AbsenceMode::Literal,
+            false,
+            ZeroHitCtx {
+                project_root: Some(root),
+                snapshot_stale: false,
+            },
+        );
+        assert!(
+            text.contains("excluded-by-.loctignore"),
+            "must name .loctignore exclusion, got: {text}"
+        );
+        assert!(
+            text.contains("`ignored_w1_01`"),
+            "must name the excluded path, got: {text}"
+        );
+        assert!(
+            !text.contains("outside_snapshot"),
+            "must not fall back to generic outside_snapshot, got: {text}"
+        );
+
+        let missing = FileScopeResolution::resolve("no/such/dir", ["src/lib.rs"]);
+        results.file_scope = Some(missing);
+        rewrite_unresolved_file_scope_coverage(&mut results);
+        assert!(
+            !results.coverage_line.contains("scanned 0 of 0"),
+            "missing scope must not look like 0 of 0, got: {}",
+            results.coverage_line
+        );
+        let unresolved_text = zero_hit_absence_text(
+            &results,
+            AbsenceMode::Literal,
+            false,
+            ZeroHitCtx {
+                project_root: Some(root),
+                snapshot_stale: false,
+            },
+        );
+        assert!(
+            unresolved_text.contains("unresolved"),
+            "missing scope must name unresolved, not 0 of 0, got: {unresolved_text}"
+        );
+        assert!(
+            unresolved_text.contains("`no/such/dir`"),
+            "must name the requested path, got: {unresolved_text}"
+        );
+
+        let stale_text = zero_hit_absence_text(
+            &results,
+            AbsenceMode::Literal,
+            false,
+            ZeroHitCtx {
+                project_root: Some(root),
+                snapshot_stale: true,
+            },
+        );
+        assert!(
+            stale_text.contains("stale"),
+            "stale snapshot must be named, got: {stale_text}"
+        );
+        assert!(
+            stale_text.contains("interpreted_as:"),
+            "zero-hit must name query interpretation, got: {stale_text}"
+        );
+    }
+
+    #[test]
+    fn w3_01_pipe_query_reports_interpretation() {
+        let mut results = scan_files_with_scope(
+            [("src/lib.rs", "fn present() {}\n")],
+            "absent_term",
+            ScanOptions::default(),
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        results.match_mode = crate::analyzer::occurrences::MatchMode::MultiLiteral;
+        let text =
+            zero_hit_absence_text(&results, AbsenceMode::Literal, false, ZeroHitCtx::default());
+        assert!(
+            text.contains("interpreted_as: multi_literal"),
+            "zero-hit must name multi_literal interpretation, got: {text}"
+        );
+    }
+
+    fn git_init_with_file(root: &std::path::Path, rel: &str, body: &str) {
+        let parent = std::path::PathBuf::from(rel);
+        let parent = parent.parent().unwrap_or(root);
+        std::fs::create_dir_all(root.join(parent)).unwrap();
+        std::fs::write(root.join(rel), body).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "t@t.com"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-m", "seed"]);
+    }
+
+    /// W2-01: tracked `.kdl` layouts must land in the snapshot so literal
+    /// find and slice can see executable argv they carry.
+    #[test]
+    #[serial_test::serial]
+    fn w2_01_kdl_files_indexed() {
+        let (_cache_dir, _cache_env) = crate::snapshot::test_env::isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_init_with_file(
+            root,
+            "layout.kdl",
+            "layout W2_01_KDL_LAYOUT_ARGV {\n    argv \"cargo test\"\n}\n",
+        );
+
+        let snapshot = super::load_or_create_query_snapshot_for_roots(
+            std::slice::from_ref(&root.to_path_buf()),
+            &super::query_global_options(&super::GlobalOptions {
+                quiet: true,
+                force_non_git: false,
+                ..Default::default()
+            }),
+        )
+        .expect("scan fixture with tracked layout.kdl");
+        assert!(
+            snapshot
+                .files
+                .iter()
+                .any(|file| file.path.ends_with("layout.kdl")),
+            "tracked layout.kdl must be in the snapshot; files={:?}",
+            snapshot
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let (contents, overlay) = super::read_literal_contents(&snapshot, root, false);
+        assert!(overlay.known);
+        let borrowed: Vec<(&str, &str)> = contents
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let mut hits = crate::analyzer::occurrences::scan_files_with(
+            borrowed,
+            "W2_01_KDL_LAYOUT_ARGV",
+            crate::analyzer::occurrences::ScanOptions::default(),
+        );
+        hits.declare_snapshot_universe(
+            &snapshot,
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        super::apply_untracked_overlay(&mut hits, overlay);
+        assert!(
+            hits.total > 0,
+            "find --literal must see the token in tracked layout.kdl; coverage={}",
+            hits.coverage_line
+        );
+        assert!(
+            hits.occurrences
+                .iter()
+                .any(|hit| hit.file.ends_with("layout.kdl")),
+            "literal hit must name layout.kdl; got {:?}",
+            hits.occurrences
+                .iter()
+                .map(|hit| hit.file.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let slice = crate::slicer::HolographicSlice::from_path(
+            &snapshot,
+            "layout.kdl",
+            &crate::slicer::SliceConfig::default(),
+        )
+        .expect("slice must bind tracked layout.kdl");
+        assert!(
+            slice
+                .core
+                .iter()
+                .any(|file| file.path.ends_with("layout.kdl")),
+            "slice core must include layout.kdl; target={}",
+            slice.target
+        );
+    }
+
+    /// W2-01: a fresh untracked source file is invisible to literal find
+    /// until `--include-untracked`; coverage must keep indexed vs untracked
+    /// distinct, and the zero-hit path must name the flag.
+    #[test]
+    #[serial_test::serial]
+    fn w2_01_include_untracked_finds_new_file() {
+        let (_cache_dir, _cache_env) = crate::snapshot::test_env::isolated_cache();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_init_with_file(root, "src/lib.rs", "pub fn already_indexed() {}\n");
+
+        let snapshot = super::load_or_create_query_snapshot_for_roots(
+            std::slice::from_ref(&root.to_path_buf()),
+            &super::query_global_options(&super::GlobalOptions {
+                quiet: true,
+                force_non_git: false,
+                ..Default::default()
+            }),
+        )
+        .expect("scan seed");
+        let indexed = snapshot.files.len();
+        assert!(indexed > 0, "seed src/lib.rs must be indexed");
+
+        std::fs::write(
+            root.join("src/fresh.rs"),
+            "pub fn W2_01_UNTRACKED_TOKEN() {}\n",
+        )
+        .unwrap();
+
+        let (contents, overlay) = super::read_literal_contents(&snapshot, root, false);
+        assert!(overlay.known);
+        assert!(
+            overlay.count >= 1,
+            "git must report the untracked .rs file; count={}",
+            overlay.count
+        );
+        assert!(!overlay.included);
+        let borrowed: Vec<(&str, &str)> = contents
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let mut hidden = crate::analyzer::occurrences::scan_files_with(
+            borrowed,
+            "W2_01_UNTRACKED_TOKEN",
+            crate::analyzer::occurrences::ScanOptions::default(),
+        );
+        hidden.declare_snapshot_universe(
+            &snapshot,
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        let untracked_count = overlay.count;
+        super::apply_untracked_overlay(&mut hidden, overlay);
+        assert_eq!(
+            hidden.total, 0,
+            "without --include-untracked the fresh file must be a zero-hit"
+        );
+        assert!(
+            hidden
+                .suggested_next
+                .iter()
+                .any(|next| next.command.contains("--include-untracked")),
+            "zero-hit must suggest --include-untracked; got {:?}",
+            hidden.suggested_next
+        );
+        assert!(
+            hidden.coverage_line.contains("untracked="),
+            "coverage must distinguish untracked from indexed; line={}",
+            hidden.coverage_line
+        );
+        assert_eq!(
+            hidden.universe.indexed_files, indexed,
+            "indexed universe must not absorb the untracked file"
+        );
+        assert_eq!(hidden.universe.untracked.files, Some(untracked_count));
+        assert!(
+            hidden.universe.scan_complete,
+            "scan_complete is an indexed-universe claim and must stay true"
+        );
+
+        let (included_contents, included_overlay) =
+            super::read_literal_contents(&snapshot, root, true);
+        assert!(included_overlay.included);
+        let included_borrowed: Vec<(&str, &str)> = included_contents
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let mut shown = crate::analyzer::occurrences::scan_files_with(
+            included_borrowed,
+            "W2_01_UNTRACKED_TOKEN",
+            crate::analyzer::occurrences::ScanOptions::default(),
+        );
+        shown.declare_snapshot_universe(
+            &snapshot,
+            crate::analyzer::occurrences::FileScope::default(),
+        );
+        let included_count = included_overlay.count;
+        super::apply_untracked_overlay(&mut shown, included_overlay);
+        assert!(
+            shown.total > 0,
+            "with --include-untracked the fresh token must hit; coverage={}",
+            shown.coverage_line
+        );
+        assert!(
+            shown
+                .occurrences
+                .iter()
+                .any(|hit| hit.file.contains("fresh.rs")),
+            "hit must name the untracked file; got {:?}",
+            shown
+                .occurrences
+                .iter()
+                .map(|hit| hit.file.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            shown.universe.indexed_files, indexed,
+            "including untracked must not rewrite indexed_files"
+        );
+        assert_eq!(shown.universe.untracked.files, Some(included_count));
+        assert!(
+            shown.universe.scan_complete,
+            "indexed scan_complete must stay true after the overlay"
+        );
+        assert!(
+            shown.coverage_line.contains("untracked="),
+            "coverage must still name untracked after include; line={}",
+            shown.coverage_line
+        );
     }
 }

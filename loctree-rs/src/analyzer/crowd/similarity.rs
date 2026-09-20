@@ -68,6 +68,51 @@ pub fn count_importers(files: &[crate::types::FileAnalysis]) -> HashMap<String, 
     counts
 }
 
+/// Count direct importers per file from graph edges: every textual in-edge
+/// (imports and re-exports alike — a barrel directly couples to its target),
+/// without following re-export chains. Companion of count_importers_transitive,
+/// which additionally walks re-export chains upstream to real consumers.
+pub fn count_importers_direct_edges(
+    files: &[crate::types::FileAnalysis],
+    edges: &[crate::snapshot::GraphEdge],
+) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+
+    for file in files {
+        let count = count_direct_importers_for_file(&file.path, edges);
+        counts.insert(file.path.clone(), count);
+    }
+
+    counts
+}
+
+/// Count direct importers for a single file: distinct edge sources whose
+/// target matches the file, no re-export traversal.
+fn count_direct_importers_for_file(file: &str, edges: &[crate::snapshot::GraphEdge]) -> usize {
+    edges
+        .iter()
+        .filter(|edge| edge_targets_file(edge, file))
+        .map(|edge| edge.from.as_str())
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// Shared edge-target matching with barrel/index normalization, so the direct
+/// and transitive counters always agree on whether an edge points at a file.
+fn edge_targets_file(edge: &crate::snapshot::GraphEdge, current: &str) -> bool {
+    let current_folder = current
+        .strip_suffix("/index.ts")
+        .or_else(|| current.strip_suffix("/index.tsx"))
+        .or_else(|| current.strip_suffix("/index.js"));
+
+    edge.to == current
+        || edge.to.ends_with(&format!("/{}", current))
+        || (current.contains('/') && edge.to.contains(current))
+        || current_folder
+            .map(|f| edge.to == f || edge.to.ends_with(f))
+            .unwrap_or(false)
+}
+
 /// Count importers using transitive re-export chain tracking
 /// This uses the snapshot edges to follow re-exports like index.ts barrels
 pub fn count_importers_transitive(
@@ -124,20 +169,7 @@ fn count_transitive_importers_for_file(file: &str, edges: &[crate::snapshot::Gra
         }
 
         for edge in edges {
-            // Handle folder references
-            let current_folder = current
-                .strip_suffix("/index.ts")
-                .or_else(|| current.strip_suffix("/index.tsx"))
-                .or_else(|| current.strip_suffix("/index.js"));
-
-            let matches = edge.to == current
-                || edge.to.ends_with(&format!("/{}", current))
-                || (current.contains('/') && edge.to.contains(&current))
-                || current_folder
-                    .map(|f| edge.to == f || edge.to.ends_with(f))
-                    .unwrap_or(false);
-
-            if matches {
+            if edge_targets_file(edge, &current) {
                 if edge.label == "reexport" {
                     // Follow re-export chain
                     if !visited.contains(&edge.from) {
@@ -152,4 +184,54 @@ fn count_transitive_importers_for_file(file: &str, edges: &[crate::snapshot::Gra
     }
 
     importers.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::GraphEdge;
+
+    fn edge(from: &str, to: &str, label: &str) -> GraphEdge {
+        GraphEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn direct_and_transitive_counts_diverge_through_barrel() {
+        // barrel.rs re-exports internal.rs; two consumers import the barrel.
+        let edges = vec![
+            edge("src/barrel.rs", "src/internal.rs", "reexport"),
+            edge("src/consumer_a.rs", "src/barrel.rs", "import"),
+            edge("src/consumer_b.rs", "src/barrel.rs", "import"),
+        ];
+
+        // Direct: only the barrel textually points at internal.rs.
+        assert_eq!(
+            count_direct_importers_for_file("src/internal.rs", &edges),
+            1
+        );
+        // Transitive: the barrel's real consumers surface, the barrel itself
+        // is followed through and not counted.
+        assert_eq!(
+            count_transitive_importers_for_file("src/internal.rs", &edges),
+            2
+        );
+    }
+
+    #[test]
+    fn direct_and_transitive_agree_without_reexports() {
+        let edges = vec![
+            edge("src/a.rs", "src/target.rs", "import"),
+            edge("src/b.rs", "src/target.rs", "import"),
+        ];
+
+        assert_eq!(count_direct_importers_for_file("src/target.rs", &edges), 2);
+        assert_eq!(
+            count_transitive_importers_for_file("src/target.rs", &edges),
+            2
+        );
+    }
 }

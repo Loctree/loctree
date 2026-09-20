@@ -8,6 +8,8 @@ use super::super::command::{
     BodyOptions, Command, CyclesOptions, DeadOptions, FindOptions, ImpactCommandOptions,
     OccurrencesOptions, QueryKind, QueryOptions, TwinsOptions,
 };
+use super::helpers::format_unknown_analysis_option;
+use crate::analyzer::occurrences::positional_dot_query_error;
 
 /// Parse `loct dead [options]` command - detect unused exports.
 pub(super) fn parse_dead_command(args: &[String]) -> Result<Command, String> {
@@ -30,13 +32,15 @@ OPTIONS:
     --with-tests           Include test files in analysis
     --exclude-tests        Exclude test files (default)
     --with-helpers         Include helper/utility files
+    --workspace-closed     Treat pub in library crates as crate-internal
     --help, -h             Show this help message
 
 EXAMPLES:
     loct dead                          # All dead exports
     loct dead --confidence high        # Only high-confidence
     loct dead --path src/components/   # Dead exports in components
-    loct dead --top 50                 # Top 50 dead exports"
+    loct dead --top 50                 # Top 50 dead exports
+    loct dead --workspace-closed       # Flag unused pub in lib crates"
             .to_string());
     }
 
@@ -93,6 +97,10 @@ EXAMPLES:
             }
             "--with-dynamic" | "--include-dynamic" => {
                 opts.with_dynamic = true;
+                i += 1;
+            }
+            "--workspace-closed" => {
+                opts.workspace_closed = true;
                 i += 1;
             }
             _ if !arg.starts_with('-') => {
@@ -239,9 +247,11 @@ OPTIONS:
                                         inside 'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
     --group-by-file                     (literal) Add a per-file occurrence rollup ('by_file')
     --count-only, --slim                (literal) Suppress the full occurrence list, keep counters only
+    --no-generated                      (literal/regex) Filter out generated and minified artifact files from results
     --compact                           (literal) Terse path:line human output
     --offset <N>                        (literal) Zero-based occurrence offset for paged output
     --root <PATH>, --project <PATH>     Project root to scan (default: current directory)
+    --include-untracked                 Scan fresh untracked files in-memory (does not mutate snapshot)
     --path <PATTERN>                    Alias for --file (path/suffix scope in literal mode)
     --or                                Combine multiple QUERY args with OR (legacy behavior)
     --symbol <PATTERN>, -s <PATTERN>    Search for symbols matching regex
@@ -326,6 +336,10 @@ EXAMPLES:
                 opts.compact = true;
                 i += 1;
             }
+            "--include-untracked" => {
+                opts.include_untracked = true;
+                i += 1;
+            }
             "--impact" => {
                 let value = args
                     .get(i + 1)
@@ -354,6 +368,10 @@ EXAMPLES:
             }
             "--whole-token" => {
                 opts.whole_token = true;
+                i += 1;
+            }
+            "--no-generated" => {
+                opts.no_generated = true;
                 i += 1;
             }
             "--group-by-file" => {
@@ -515,6 +533,12 @@ EXAMPLES:
         opts.literal = true;
     }
 
+    if opts.literal
+        && let Some(err) = positional_dot_query_error(&queries)
+    {
+        return Err(err.to_string());
+    }
+
     if opts.literal && !opts.all && opts.limit.is_none() {
         opts.limit = Some(50);
     }
@@ -594,10 +618,12 @@ DESCRIPTION:
 
 OPTIONS:
     --root <PATH>        Project root to scan (default: current directory)
+    --include-untracked  Scan fresh untracked files in-memory (does not mutate snapshot)
     --regex              Evaluate <IDENT> as a regular expression over raw file text
                          (same engine, coverage line and paging as 'find --regex')
     --whole-token        Treat '-' as token-internal: 'backdrop' no longer matches inside
                          'overlay-backdrop'/'--sample-z-overlay-backdrop' (opt-in, no default change)
+    --no-generated       Filter out generated and minified artifact files from results
     --group-by-file      Add a per-file occurrence rollup ('by_file')
     --count-only, --slim Suppress the full occurrence list, keep counters only ('slim')
     --compact            Human output only: print path:line plus one context line per hit
@@ -637,12 +663,20 @@ EXAMPLES:
                 opts.roots.push(PathBuf::from(value));
                 i += 2;
             }
+            "--include-untracked" => {
+                opts.include_untracked = true;
+                i += 1;
+            }
             "--regex" => {
                 opts.regex = true;
                 i += 1;
             }
             "--whole-token" => {
                 opts.whole_token = true;
+                i += 1;
+            }
+            "--no-generated" => {
+                opts.no_generated = true;
                 i += 1;
             }
             "--group-by-file" => {
@@ -824,6 +858,8 @@ OPTIONS:
     --max-lines <N>   Cap source lines returned per body (default: 200)
     --file <PATH>     Qualify an ambiguous symbol to one defining file
                       (exact repo-relative path or path suffix)
+    --root <PATH>     Project root to scan (default: current directory)
+    --project <PATH>  Alias for --root
     --json            Emit JSON (file, start/end line, language, source,
                       truncated, extent)
     --help, -h        Show this help message
@@ -832,13 +868,15 @@ EXAMPLES:
     loct body transcription_session
     loct body handle_query_command --max-lines 80
     loct body build --file src/beta.py
-    loct body query_where_symbol --json"
+    loct body query_where_symbol --json
+    loct body helper --root /path/to/project"
             .to_string());
     }
 
     let mut symbol: Option<String> = None;
     let mut line_cap: Option<usize> = None;
     let mut file: Option<String> = None;
+    let mut root: Option<PathBuf> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -856,6 +894,14 @@ EXAMPLES:
                     .get(i + 1)
                     .ok_or_else(|| "--file requires a path".to_string())?;
                 file = Some(value.clone());
+                i += 2;
+            }
+            "--root" | "--project" => {
+                let flag = args[i].as_str();
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
+                root = Some(PathBuf::from(value));
                 i += 2;
             }
             _ if !arg.starts_with('-') => {
@@ -883,6 +929,7 @@ EXAMPLES:
         symbol,
         line_cap,
         file,
+        root,
     }))
 }
 
@@ -898,6 +945,7 @@ USAGE:
 OPTIONS:
     --depth <N>          Limit traversal depth (default: unlimited)
     --root <PATH>        Project root (default: current directory)
+    --project <PATH>     Alias for --root (same spelling as context/find)
     --help, -h           Show this help message
 
 EXAMPLES:
@@ -919,10 +967,11 @@ EXAMPLES:
                 opts.depth = Some(value.parse().map_err(|_| "--depth requires a number")?);
                 i += 2;
             }
-            "--root" => {
+            "--root" | "--project" => {
+                let flag = arg.as_str();
                 let value = args
                     .get(i + 1)
-                    .ok_or_else(|| "--root requires a path".to_string())?;
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
                 opts.root = Some(PathBuf::from(value));
                 i += 2;
             }
@@ -938,7 +987,11 @@ EXAMPLES:
                 i += 1;
             }
             _ => {
-                return Err(format!("Unknown option '{}' for 'impact' command.", arg));
+                return Err(format_unknown_analysis_option(
+                    "impact",
+                    arg,
+                    "--depth/--max-depth, --root, --project, --help",
+                ));
             }
         }
     }
@@ -1041,6 +1094,17 @@ mod tests {
         let result = parse_dead_command(&args).unwrap();
         if let Command::Dead(opts) = result {
             assert_eq!(opts.confidence, Some("high".into()));
+            assert!(!opts.workspace_closed);
+        } else {
+            panic!("Expected Dead command");
+        }
+    }
+
+    #[test]
+    fn w1_02_parse_dead_workspace_closed() {
+        let result = parse_dead_command(&["--workspace-closed".into()]).unwrap();
+        if let Command::Dead(opts) = result {
+            assert!(opts.workspace_closed);
         } else {
             panic!("Expected Dead command");
         }
@@ -1094,6 +1158,22 @@ mod tests {
         assert!(
             err.contains("mutually exclusive"),
             "expected mutual-exclusion error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn w3_01_positional_dot_is_scan_root_not_pattern() {
+        // G-LITERAL-OVERMATCH residue: `loct find --literal runtime-install .`
+        // used to treat `.` as a second literal (every period) instead of cwd.
+        let err = parse_find_command(&["--literal".into(), "runtime-install".into(), ".".into()])
+            .unwrap_err();
+        assert!(
+            err.contains("positional '.'"),
+            "expected positional-dot hint, got: {err}"
+        );
+        assert!(
+            err.contains("--root"),
+            "hint must name --root as the scan-root flag, got: {err}"
         );
     }
 
@@ -1517,5 +1597,88 @@ mod tests {
             "twins must reject --strict; health hint must not suggest it"
         );
         assert!(result.unwrap_err().contains("Unknown option '--strict'"));
+    }
+
+    #[test]
+    fn test_parse_body_command_options() {
+        let args = vec![
+            "my_sym".into(),
+            "--root".into(),
+            "/some/path".into(),
+            "--file".into(),
+            "src/lib.rs".into(),
+            "--max-lines".into(),
+            "50".into(),
+        ];
+        let result = parse_body_command(&args).unwrap();
+        if let Command::Body(opts) = result {
+            assert_eq!(opts.symbol, "my_sym");
+            assert_eq!(opts.root, Some(PathBuf::from("/some/path")));
+            assert_eq!(opts.file, Some("src/lib.rs".into()));
+            assert_eq!(opts.line_cap, Some(50));
+        } else {
+            panic!("Expected Body command");
+        }
+
+        let args_project = vec!["my_sym".into(), "--project".into(), "/other/path".into()];
+        let result_project = parse_body_command(&args_project).unwrap();
+        if let Command::Body(opts) = result_project {
+            assert_eq!(opts.root, Some(PathBuf::from("/other/path")));
+        } else {
+            panic!("Expected Body command");
+        }
+    }
+
+    #[test]
+    fn w4_01_impact_accepts_project_as_root_alias() {
+        let result = parse_impact_command(&[
+            "src/utils.ts".into(),
+            "--project".into(),
+            "/tmp/sibling".into(),
+        ])
+        .unwrap();
+        if let Command::Impact(opts) = result {
+            assert_eq!(opts.target, "src/utils.ts");
+            assert_eq!(opts.root, Some(PathBuf::from("/tmp/sibling")));
+        } else {
+            panic!("Expected Impact command");
+        }
+    }
+
+    #[test]
+    fn w4_01_impact_refuses_markdown_with_did_you_mean() {
+        let err = parse_impact_command(&["src/utils.ts".into(), "--markdown".into()]).unwrap_err();
+        assert!(
+            err.contains("did you mean"),
+            "impact --markdown must refuse with did-you-mean: {err}"
+        );
+        assert!(
+            err.contains("loct context --markdown") || err.contains("--json"),
+            "impact --markdown must point at context --markdown or --json: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_find_no_generated_flag() {
+        let cmd = parse_find_command(&["foo".into(), "--no-generated".into()])
+            .expect("parse find --no-generated");
+        match cmd {
+            Command::Find(opts) => {
+                assert!(opts.no_generated);
+            }
+            other => panic!("expected Command::Find, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_occurrences_no_generated_flag() {
+        let cmd = parse_occurrences_command(&["foo".into(), "--no-generated".into()])
+            .expect("parse occurrences --no-generated");
+        match cmd {
+            Command::Occurrences(opts) => {
+                assert!(opts.no_generated);
+            }
+            other => panic!("expected Command::Occurrences, got {other:?}"),
+        }
     }
 }

@@ -6,6 +6,13 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.14.5-rc1] - 2026-09-19
+
+### Fixed
+- pin npm trusted-publishing toolchain (#76)
+- install ripgrep for publish gate (#74)
+- let exact-tag recovery publish (#73)
+
 ## [0.14.4] - 2026-08-23
 
 ### Changed

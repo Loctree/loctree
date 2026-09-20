@@ -456,7 +456,43 @@ fn should_rescan_for_unindexed_dirty_path(path: &str) -> bool {
             | "yaml"
             | "zig"
             | "config"
+            | "kdl"
+            | "snap"
+            | "sha256"
+            | "template"
     )
+}
+
+/// Git porcelain `??` paths that look like scan-eligible sources.
+///
+/// Used by `--include-untracked` so a fresh file is visible to literal/slice
+/// without mutating the snapshot. `-uall` lists files inside new directories
+/// instead of collapsing them to a single `?? dir/` entry.
+pub(crate) fn git_untracked_source_paths(root: &Path) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain", "-uall"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if !line.starts_with("?? ") || line.len() < 4 {
+            continue;
+        }
+        let path = unquote_git_status_path(line[3..].trim());
+        if path.ends_with('/') || is_loctree_artifact_path(&path) {
+            continue;
+        }
+        if should_rescan_for_unindexed_dirty_path(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Some(paths)
 }
 
 /// First-scan hygiene: make sure `.loctree/` is gitignored in `root`.
@@ -1089,14 +1125,54 @@ pub(crate) fn collect_declared_entrypoints(summary: &ManifestSummary) -> Vec<Dec
     }
 
     if let Some(py) = &summary.pyproject_toml {
-        for script in &py.scripts {
-            declared.push(DeclaredEntrypoint {
-                source: "pyproject.toml:scripts".to_string(),
-                path: script.clone(),
-                exists: false,
-                resolved: false,
-                note: Some("script entry (no path mapping)".to_string()),
-            });
+        for entry in &py.script_entries {
+            let source = format!("pyproject.toml:scripts:{}", entry.key);
+            let (mod_part, _sym) = entry.path.split_once(':').unwrap_or((&entry.path, ""));
+            let mod_part = mod_part.trim();
+            let mod_rel = mod_part.replace('.', "/");
+
+            let mut resolved_path = None;
+            for cand in [
+                format!("{}.py", mod_rel),
+                format!("{}/__init__.py", mod_rel),
+                format!("src/{}.py", mod_rel),
+                format!("src/{}/__init__.py", mod_rel),
+            ] {
+                if root.join(&cand).exists() {
+                    resolved_path = Some(cand);
+                    break;
+                }
+            }
+
+            if let Some(path) = resolved_path {
+                declared.push(DeclaredEntrypoint {
+                    source,
+                    path,
+                    exists: true,
+                    resolved: true,
+                    note: None,
+                });
+            } else {
+                declared.push(DeclaredEntrypoint {
+                    source,
+                    path: entry.path.clone(),
+                    exists: false,
+                    resolved: false,
+                    note: Some("unresolved script module".to_string()),
+                });
+            }
+        }
+
+        if py.script_entries.is_empty() {
+            for script in &py.scripts {
+                declared.push(DeclaredEntrypoint {
+                    source: "pyproject.toml:scripts".to_string(),
+                    path: script.clone(),
+                    exists: false,
+                    resolved: false,
+                    note: Some("script entry (no path mapping)".to_string()),
+                });
+            }
         }
         for entry in &py.entry_points {
             declared.push(DeclaredEntrypoint {
@@ -1374,6 +1450,8 @@ pub struct PyProjectSummary {
     pub scripts: Vec<String>,
     #[serde(default)]
     pub entry_points: Vec<String>,
+    #[serde(default)]
+    pub script_entries: Vec<ManifestEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1863,6 +1941,13 @@ impl Snapshot {
             let saved_hashes = parse_reuse_fence_file_hashes(&saved);
             let indexed_paths: HashSet<_> =
                 self.files.iter().map(|file| file.path.as_str()).collect();
+            // Untracked sources are overlay-eligible via `--include-untracked`.
+            // They must not fail the indexed reuse fence or every find pays a
+            // full rescan for a file that is not in the snapshot universe.
+            let untracked: HashSet<String> = git_untracked_source_paths(root)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             for dirty_path in dirty_paths {
                 if indexed_paths.contains(dirty_path.as_str()) {
                     let Some(saved_hash) = saved_hashes.get(dirty_path.as_str()) else {
@@ -1871,6 +1956,8 @@ impl Snapshot {
                     if &hash_file_state(root, &dirty_path)? != saved_hash {
                         return Ok(false);
                     }
+                } else if untracked.contains(&dirty_path) {
+                    continue;
                 } else if should_rescan_for_unindexed_dirty_path(&dirty_path) {
                     return Ok(false);
                 }
@@ -4339,6 +4426,7 @@ pub(crate) fn write_auto_artifacts(
             python_library_mode: parsed.python_library,
             include_ambient: false,
             include_dynamic: false,
+            workspace_closed: false,
             dead_ok_globs,
         },
     );
@@ -4532,6 +4620,7 @@ pub(crate) fn write_auto_artifacts(
         changed: false,
         task: None,
         scopes: Vec::new(),
+        scope_mode: crate::context_scope::ScopeMode::All,
         with_aicx: true,
         no_aicx: false,
         project: Some(snapshot_root.to_path_buf()),

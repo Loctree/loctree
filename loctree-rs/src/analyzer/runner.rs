@@ -94,6 +94,14 @@ pub fn default_analyzer_exts() -> HashSet<String> {
         "xml",
         "svg",
         "txt",
+        // W2-01: vc-frame `.kdl` layouts carry executable argv, and tracked
+        // snapshot/hash/template sidecars are literal truth — they must sit
+        // in the indexed universe, not only on disk.
+        "kdl",
+        "snap",
+        "sha256",
+        "template",
+        "sql",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -527,6 +535,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: dead_ok_globs.clone(),
             },
         );
@@ -669,6 +678,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs: dead_ok_globs.clone(),
             },
         );
@@ -884,6 +894,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 python_library_mode: parsed.python_library,
                 include_ambient: false,
                 include_dynamic: false,
+                workspace_closed: false,
                 dead_ok_globs,
             },
         );
@@ -1024,6 +1035,21 @@ mod tests {
             assert!(
                 exts.contains(ext),
                 "{ext} must be in default analyzer extensions so design assets land in the snapshot; got {:?}",
+                exts
+            );
+        }
+    }
+
+    /// W2-01: vc-frame `.kdl` layouts carry executable argv, and tracked
+    /// snapshot/hash/template sidecars are literal truth — they must sit in
+    /// the indexed universe, not only on disk.
+    #[test]
+    fn default_analyzer_exts_includes_kdl_and_tracked_sidecars() {
+        let exts = default_analyzer_exts();
+        for ext in ["kdl", "snap", "sha256", "template"] {
+            assert!(
+                exts.contains(ext),
+                "{ext} must be in default analyzer extensions so tracked layouts/sidecars land in tree/focus/slice; got {:?}",
                 exts
             );
         }

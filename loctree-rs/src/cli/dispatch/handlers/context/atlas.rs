@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::fs_utils::{SanitizedPath, StaticAssetName, copy_static_asset_within, copy_within};
+use crate::fs_utils::SanitizedPath;
 
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -14,6 +15,7 @@ use crate::aicx::overlay::{
     OverlayVerification, load_cached_overlay, overlay_cache_path, refresh_command, short_revision,
     staleness_reason,
 };
+use crate::aicx::redact::redact_secrets;
 use crate::context_render::current_iso_timestamp;
 use crate::pack::{
     ActionSlice, AuthorityLabel, AuthoritySlice, ContextPack, HighFanInFile, HotspotFile,
@@ -23,6 +25,13 @@ use crate::pack::{
 pub const CONTEXT_ATLAS_PROTOCOL: &str = "loctree.context_atlas.v1";
 pub const CONTEXT_ATLAS_DIR: &str = "context-atlas";
 pub const CONTEXT_ATLAS_RUNS_DIR: &str = "runs";
+/// Human-facing identity table and MCP pointer payload cap (G-CONTEXT-CAP).
+pub const ATLAS_IDENTITY_LIST_LIMIT: usize = 20;
+const ATLAS_IDENTITIES_FULL_JSON: &str = "manifest.full.json";
+const ATLAS_STATUS_READY: &str = "atlas_ready";
+const ATLAS_STATUS_HOLLOW: &str = "hollow";
+const ATLAS_STATUS_STALE: &str = "stale";
+const CARD_STATUS_UNREAD_UNUSABLE: &str = "unread/unusable";
 
 /// Stable identity for one persisted atlas scope. The project-wide atlas keeps
 /// the human-readable `project` id; every narrowed scope/task is keyed by a
@@ -114,10 +123,15 @@ pub struct ContextAtlasCard {
     /// Number of base facts in the card's coverage receipt (FactSet size).
     #[serde(default)]
     pub fact_count: usize,
+    /// Hollow-atlas cards are unread/unusable until `loct scan` produces a
+    /// snapshot. Absent when the card is a readable product of a real snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 impl ContextAtlasManifest {
     pub fn pointer_payload(&self) -> serde_json::Value {
+        let (shown, omitted) = bound_atlas_identities(&self.atlases);
         json!({
             "protocol": self.protocol,
             "status": self.status,
@@ -128,7 +142,9 @@ impl ContextAtlasManifest {
             "manifest_json": self.manifest_json,
             "recommended_start": self.recommended_start,
             "identity": self.identity,
-            "atlases": self.atlases,
+            "atlases": shown,
+            "atlases_omitted": omitted,
+            "atlases_full_path": ATLAS_IDENTITIES_FULL_JSON,
             "domain_owners": self.domain_owners,
             "cards": self.cards,
             "message": self.message,
@@ -141,7 +157,10 @@ impl ContextAtlasManifest {
         out.push_str("╭─ Loctree Context Atlas ─────────────────────────────────────────────╮\n");
         out.push_str("│ Repo understanding materialized as small, named cards.              │\n");
         out.push_str("╰─────────────────────────────────────────────────────────────────────╯\n\n");
-        out.push_str("Status: ready\n");
+        out.push_str(&format!("Status: {}\n", self.status));
+        if self.status == ATLAS_STATUS_HOLLOW {
+            out.push_str("Run `loct scan` before reading cards — they are unread/unusable.\n");
+        }
         out.push_str(&format!("Project: {}\n", self.project));
         out.push_str(&format!("Snapshot: {}\n", self.snapshot));
         out.push_str(&format!("Atlas identity: {}\n", self.identity.atlas_id));
@@ -236,6 +255,10 @@ pub fn materialize_context_atlas(
 
     let atlas_root = atlas_dir_for_project(project_root);
     fs::create_dir_all(atlas_root.join(CONTEXT_ATLAS_RUNS_DIR))?;
+    // Exclusive lock covers catalog reload + run-dir write + flat-root
+    // mirror so concurrent scoped contexts cannot tear shared cards or
+    // drop catalog identities (G-ATLAS-SHARED-MUTABLE).
+    let _lock = acquire_atlas_mirror_lock(&atlas_root)?;
     let known_atlases = load_retained_atlases(&atlas_root)?;
     let run_dir = atlas_root
         .join(CONTEXT_ATLAS_RUNS_DIR)
@@ -262,6 +285,10 @@ fn materialize_context_atlas_at(
         .unwrap_or_else(|| project_root.display().to_string());
     let snapshot = snapshot_label(pack);
     let generated_at = current_iso_timestamp();
+    let status = atlas_status(pack);
+    let card_status =
+        (status == ATLAS_STATUS_HOLLOW).then(|| CARD_STATUS_UNREAD_UNUSABLE.to_string());
+    let message = atlas_status_message(status);
 
     // Cards 00 and 03 read the same intent layer — card 00 for the identity
     // revisions, card 03 for the theses — so it is resolved once here.
@@ -334,7 +361,7 @@ fn materialize_context_atlas_at(
     let mut card_receipts: Vec<(String, Vec<FactId>)> = Vec::new();
     for spec in specs {
         let path = atlas_dir.join(spec.filename);
-        fs::write(&path, spec.body.markdown.as_bytes())?;
+        write_atlas_file_atomic(&path, spec.body.markdown.as_bytes())?;
         // The canonical payload is the contract, not a truncation side-effect:
         // write the `.full.json` sibling for every card with a non-empty
         // payload, regardless of whether the on-card fence was capped.
@@ -344,7 +371,7 @@ fn materialize_context_atlas_at(
             } else {
                 let full_filename = full_json_filename(spec.filename);
                 let canonical = canonical_json_pretty(&spec.body.canonical_payload);
-                fs::write(atlas_dir.join(&full_filename), canonical.as_bytes())?;
+                write_atlas_file_atomic(atlas_dir.join(&full_filename), canonical.as_bytes())?;
                 (
                     Some(full_filename),
                     Some(line_count(&canonical)),
@@ -369,6 +396,7 @@ fn materialize_context_atlas_at(
             full_payload_lines,
             payload_hash,
             fact_count: spec.body.coverage_receipt.len(),
+            status: card_status.clone(),
         });
         card_receipts.push((spec.filename.to_string(), spec.body.coverage_receipt));
     }
@@ -389,7 +417,7 @@ fn materialize_context_atlas_at(
 
     let mut manifest = ContextAtlasManifest {
         protocol: CONTEXT_ATLAS_PROTOCOL.to_string(),
-        status: "atlas_ready".to_string(),
+        status: status.to_string(),
         project,
         snapshot,
         generated_at,
@@ -401,17 +429,12 @@ fn materialize_context_atlas_at(
         atlases: known_atlases,
         domain_owners: atlas_domain_owners(),
         cards,
-        message: "This atlas contains the repo understanding an agent would otherwise rediscover manually. Start with manifest.md, then read the recommended cards; broad repo-level answers are incomplete until core, structural, and runtime are read.".to_string(),
+        message,
     };
 
-    let manifest_md = render_manifest(&manifest);
-    fs::write(&manifest_path, manifest_md.as_bytes())?;
+    write_manifest_files(&manifest)?;
     manifest.manifest = manifest_path.display().to_string();
-    fs::write(
-        &manifest_json_path,
-        serde_json::to_string_pretty(&manifest).map_err(io::Error::other)?,
-    )?;
-    fs::write(
+    write_atlas_file_atomic(
         &receipt_path,
         serde_json::to_string_pretty(&json!({
             "protocol": CONTEXT_ATLAS_PROTOCOL,
@@ -580,13 +603,9 @@ fn copy_atlas_payload(
             copy_flat_atlas_file(source_dir, destination_dir, full_path)?;
         }
     }
-    // `copy_static_asset_within` is a no-op when the receipt is absent and
-    // routes the read through `SanitizedPath` anchored at `source_dir`.
-    copy_static_asset_within(
-        source_dir,
-        destination_dir,
-        StaticAssetName::new("receipt.json"),
-    )?;
+    if source_dir.join("receipt.json").is_file() {
+        copy_flat_atlas_file(source_dir, destination_dir, "receipt.json")?;
+    }
     for legacy in ["03-memory-trail.md", "03-memory-trail.full.json"] {
         let _ = fs::remove_file(destination_dir.join(legacy));
     }
@@ -608,21 +627,40 @@ fn copy_flat_atlas_file(source_dir: &Path, destination_dir: &Path, name: &str) -
             format!("atlas artifact path must be one flat component: {name}"),
         ));
     }
-    // Filesystem gate next to the sink: `copy_within` requires the source to
-    // canonicalize underneath `source_dir` (symlinks included) before copying.
-    copy_within(
-        source_dir,
-        &source_dir.join(name),
-        &destination_dir.join(name),
-    )?;
+    // Filesystem gate next to the sink: `SanitizedPath::within` requires the
+    // source to canonicalize underneath `source_dir` (symlinks included)
+    // before the bytes are atomically persisted at the destination.
+    let sanitized = SanitizedPath::within(source_dir, &source_dir.join(name)).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("atlas artifact rejected ({name}): {err}"),
+        )
+    })?;
+    let bytes = fs::read(sanitized.as_path())?;
+    write_atlas_file_atomic(destination_dir.join(name), bytes)?;
     Ok(())
 }
 
 fn write_manifest_files(manifest: &ContextAtlasManifest) -> io::Result<()> {
-    fs::write(&manifest.manifest, render_manifest(manifest).as_bytes())?;
-    fs::write(
-        &manifest.manifest_json,
+    // Path derived from the repo-local atlas dir by this module, never user input.
+    // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+    let manifest_path = Path::new(&manifest.manifest);
+    let dir = manifest_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atlas manifest path has no parent",
+        )
+    })?;
+    write_atlas_file_atomic(manifest_path, render_manifest(manifest).as_bytes())?;
+    write_atlas_file_atomic(
+        // Path derived from the repo-local atlas dir by this module, never user input.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        Path::new(&manifest.manifest_json),
         serde_json::to_string_pretty(manifest).map_err(io::Error::other)?,
+    )?;
+    write_atlas_file_atomic(
+        dir.join(ATLAS_IDENTITIES_FULL_JSON),
+        serde_json::to_string_pretty(&manifest.atlases).map_err(io::Error::other)?,
     )?;
     Ok(())
 }
@@ -694,6 +732,94 @@ fn snapshot_missing(pack: &ContextPack) -> bool {
         || pack.risk.snapshot_health.as_deref() == Some("missing_snapshot")
 }
 
+fn atlas_corpus_size(pack: &ContextPack) -> usize {
+    pack.structural.files.len() + pack.structural.symbols.len() + pack.structural.imports.len()
+}
+
+fn atlas_status(pack: &ContextPack) -> &'static str {
+    if snapshot_missing(pack) {
+        ATLAS_STATUS_HOLLOW
+    } else if pack.risk.stale_snapshot {
+        ATLAS_STATUS_STALE
+    } else if atlas_corpus_size(pack) == 0 {
+        ATLAS_STATUS_HOLLOW
+    } else {
+        ATLAS_STATUS_READY
+    }
+}
+
+fn atlas_status_message(status: &str) -> String {
+    match status {
+        ATLAS_STATUS_HOLLOW => {
+            "This atlas is hollow: no snapshot (or empty corpus). Run `loct scan` before treating cards as repository truth. Cards are unread/unusable until a snapshot exists."
+                .to_string()
+        }
+        ATLAS_STATUS_STALE => {
+            "This atlas is stale relative to live git state. Refresh with `loct scan` or `loct context --full` before relying on cards."
+                .to_string()
+        }
+        _ => {
+            "This atlas contains the repo understanding an agent would otherwise rediscover manually. Start with manifest.md, then read the recommended cards; broad repo-level answers are incomplete until core, structural, and runtime are read."
+                .to_string()
+        }
+    }
+}
+
+fn bound_atlas_identities(atlases: &[ContextAtlasReference]) -> (&[ContextAtlasReference], usize) {
+    if atlases.len() <= ATLAS_IDENTITY_LIST_LIMIT {
+        (atlases, 0)
+    } else {
+        (
+            &atlases[..ATLAS_IDENTITY_LIST_LIMIT],
+            atlases.len() - ATLAS_IDENTITY_LIST_LIMIT,
+        )
+    }
+}
+
+/// Exclusive lock for the shared atlas root (catalog + flat-card mirror).
+struct AtlasMirrorLock {
+    file: File,
+}
+
+impl Drop for AtlasMirrorLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
+
+fn acquire_atlas_mirror_lock(atlas_root: &Path) -> io::Result<AtlasMirrorLock> {
+    fs::create_dir_all(atlas_root)?;
+    let lock_path = atlas_root.join(".mirror.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(AtlasMirrorLock { file })
+}
+
+/// Same tmp+persist/rename shape as `snapshot::write_atomic`: readers never
+/// observe a partially written card under the destination path.
+fn write_atlas_file_atomic(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    let path = path.as_ref();
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atlas write path has no parent",
+        )
+    })?;
+    fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".loctree-atlas-")
+        .tempfile_in(dir)?;
+    tmp.write_all(contents.as_ref())?;
+    tmp.flush()?;
+    tmp.persist(path).map_err(|err| err.error)?;
+    Ok(())
+}
+
 fn render_manifest(manifest: &ContextAtlasManifest) -> String {
     let mut out = String::new();
     out.push_str("# Loctree Context Atlas\n\n");
@@ -710,7 +836,8 @@ fn render_manifest(manifest: &ContextAtlasManifest) -> String {
     out.push_str("The flat cards in this directory are a compatibility view of the active identity. Scope-keyed atlases below remain independently addressable.\n\n");
     out.push_str("| Identity | Kind | Selectors | Task | Snapshot | Manifest |\n");
     out.push_str("|---|---|---|---|---|---|\n");
-    for atlas in &manifest.atlases {
+    let (shown, omitted) = bound_atlas_identities(&manifest.atlases);
+    for atlas in shown {
         let selectors = if atlas.identity.selectors.is_empty() {
             "—".to_string()
         } else {
@@ -725,6 +852,11 @@ fn render_manifest(manifest: &ContextAtlasManifest) -> String {
             task.replace('`', "'"),
             atlas.snapshot,
             atlas.manifest
+        ));
+    }
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n… and {omitted} more (full list: `{ATLAS_IDENTITIES_FULL_JSON}`)\n"
         ));
     }
     out.push('\n');
@@ -755,6 +887,12 @@ fn render_manifest(manifest: &ContextAtlasManifest) -> String {
     }
 
     out.push_str("\n## Completeness\n\n");
+    out.push_str(&format!("Atlas status: `{}`\n", manifest.status));
+    if manifest.status == ATLAS_STATUS_HOLLOW {
+        out.push_str(
+            "Run `loct scan` — cards below are unread/unusable until a snapshot exists.\n",
+        );
+    }
     out.push_str("Current reading state: `0/");
     out.push_str(&manifest.cards.len().to_string());
     out.push_str("` context cards read.\n");
@@ -780,16 +918,20 @@ fn render_manifest(manifest: &ContextAtlasManifest) -> String {
 }
 
 fn card_line_label(card: &ContextAtlasCard) -> String {
-    if !card.truncated {
-        return format!("{} lines", card.lines);
-    }
-
-    match card.full_payload_lines {
-        Some(full_payload_lines) => format!(
-            "{} materialized lines / {} full-payload lines ⚠ partial",
-            card.lines, full_payload_lines
-        ),
-        None => format!("{} materialized lines ⚠ partial", card.lines),
+    let base = if !card.truncated {
+        format!("{} lines", card.lines)
+    } else {
+        match card.full_payload_lines {
+            Some(full_payload_lines) => format!(
+                "{} materialized lines / {} full-payload lines ⚠ partial",
+                card.lines, full_payload_lines
+            ),
+            None => format!("{} materialized lines ⚠ partial", card.lines),
+        }
+    };
+    match card.status.as_deref() {
+        Some(status) => format!("{base} · {status}"),
+        None => base,
     }
 }
 
@@ -911,7 +1053,8 @@ fn one_line_json<T: Serialize>(value: &T) -> String {
 /// `←` is neutralized so free-form memory text can never fake an edge-fact
 /// grammar line on a card whose receipt is empty.
 fn one_line_thesis(text: &str) -> String {
-    let flat = text
+    let flat = redact_secrets(text)
+        .text
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -2748,6 +2891,7 @@ mod tests {
                 full_payload_lines: Some(3602),
                 payload_hash: Some("deadbeef".to_string()),
                 fact_count: 42,
+                status: None,
             }],
             message: "msg".to_string(),
         };
@@ -2803,6 +2947,7 @@ mod tests {
                 full_payload_lines: Some(4869),
                 payload_hash: Some("deadbeef".to_string()),
                 fact_count: 42,
+                status: None,
             }],
             message: "msg".to_string(),
         };
@@ -3593,6 +3738,272 @@ mod tests {
         assert!(
             md.contains("✓[V] 2026-07-12 · operator_confirmed"),
             "stale layer still serves the last correct theses: {md}"
+        );
+    }
+
+    fn pack_with_corpus_file(root: &Path) -> ContextPack {
+        let mut pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some(root.display().to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: Some("scan-1".to_string()),
+        });
+        pack.structural.files.push(StructuralFile {
+            path: "src/lib.rs".to_string(),
+            role: StructuralRole::Target,
+            depth: 0,
+            language: "rs".to_string(),
+            loc: 12,
+            authority: AuthorityLabel::RepoVerified,
+        });
+        pack
+    }
+
+    #[test]
+    fn w4_02_atlas_status_reflects_snapshot() {
+        let tmp = TempDir::new().expect("temp dir");
+
+        let mut hollow = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some(tmp.path().display().to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: None,
+        });
+        hollow.risk.cache_scope = RiskCacheScope::MissingSnapshot;
+        hollow.risk.cache_scope_authority = AuthorityLabel::RepoVerified;
+        hollow.risk.snapshot_health = Some("missing_snapshot".to_string());
+        let hollow_dir = tmp.path().join("hollow-atlas");
+        let hollow_manifest = materialize_context_atlas(&hollow, tmp.path(), Some(&hollow_dir))
+            .expect("hollow atlas should still materialize");
+        assert_eq!(hollow_manifest.status, ATLAS_STATUS_HOLLOW);
+        assert_ne!(hollow_manifest.status, ATLAS_STATUS_READY);
+        assert!(
+            hollow_manifest.message.contains("loct scan"),
+            "hollow atlas must instruct `loct scan`: {}",
+            hollow_manifest.message
+        );
+        assert!(
+            !hollow_manifest.pointer_payload()["status"]
+                .as_str()
+                .unwrap_or("")
+                .eq(ATLAS_STATUS_READY),
+            "MCP pointer must not claim atlas_ready without a snapshot"
+        );
+        for card in &hollow_manifest.cards {
+            assert_eq!(
+                card.status.as_deref(),
+                Some(CARD_STATUS_UNREAD_UNUSABLE),
+                "{} must be unread/unusable when hollow",
+                card.path
+            );
+        }
+        let hollow_md =
+            fs::read_to_string(hollow_dir.join("manifest.md")).expect("hollow manifest md");
+        assert!(hollow_md.contains("unread/unusable"));
+        assert!(hollow_md.contains("`loct scan`") || hollow_md.contains("loct scan"));
+        assert!(!hollow_md.contains(&format!("Atlas status: `{ATLAS_STATUS_READY}`")));
+
+        let mut stale = pack_with_corpus_file(tmp.path());
+        stale.risk.stale_snapshot = true;
+        let stale_dir = tmp.path().join("stale-atlas");
+        let stale_manifest = materialize_context_atlas(&stale, tmp.path(), Some(&stale_dir))
+            .expect("stale atlas should materialize");
+        assert_eq!(stale_manifest.status, ATLAS_STATUS_STALE);
+        assert_ne!(stale_manifest.status, ATLAS_STATUS_READY);
+
+        let ready = pack_with_corpus_file(tmp.path());
+        let ready_dir = tmp.path().join("ready-atlas");
+        let ready_manifest = materialize_context_atlas(&ready, tmp.path(), Some(&ready_dir))
+            .expect("ready atlas should materialize");
+        assert_eq!(ready_manifest.status, ATLAS_STATUS_READY);
+        for card in &ready_manifest.cards {
+            assert_eq!(card.status, None, "{} should be readable", card.path);
+        }
+    }
+
+    #[test]
+    fn w4_02_manifest_identity_list_bounded() {
+        let atlases: Vec<ContextAtlasReference> = (0..25)
+            .map(|idx| ContextAtlasReference {
+                identity: ContextAtlasIdentity {
+                    atlas_id: format!("scope-{idx:02}"),
+                    kind: "scope".to_string(),
+                    scope_fingerprint: Some(format!("fp-{idx:02}")),
+                    selectors: vec![format!("path:src/{idx:02}")],
+                    task: Some(format!("task {idx:02}")),
+                },
+                snapshot: "main@abc1234".to_string(),
+                generated_at: "2026-09-19T00:00:00Z".to_string(),
+                atlas_dir: format!("/tmp/atlas/{idx:02}"),
+                manifest: format!("/tmp/atlas/{idx:02}/manifest.md"),
+                manifest_json: format!("/tmp/atlas/{idx:02}/manifest.json"),
+            })
+            .collect();
+        let manifest = ContextAtlasManifest {
+            protocol: CONTEXT_ATLAS_PROTOCOL.to_string(),
+            status: ATLAS_STATUS_READY.to_string(),
+            project: "proj".to_string(),
+            snapshot: "main@abc1234".to_string(),
+            generated_at: "2026-09-19T00:00:00Z".to_string(),
+            atlas_dir: "/tmp/proj/.loctree/context-atlas".to_string(),
+            manifest: "/tmp/proj/.loctree/context-atlas/manifest.md".to_string(),
+            manifest_json: "/tmp/proj/.loctree/context-atlas/manifest.json".to_string(),
+            recommended_start: "/tmp/proj/.loctree/context-atlas/00-core-map.md".to_string(),
+            identity: ContextAtlasIdentity {
+                atlas_id: "scope-00".to_string(),
+                kind: "scope".to_string(),
+                ..ContextAtlasIdentity::default()
+            },
+            atlases,
+            domain_owners: atlas_domain_owners(),
+            cards: Vec::new(),
+            message: "msg".to_string(),
+        };
+
+        let md = render_manifest(&manifest);
+        assert!(md.contains("`scope-00`"));
+        assert!(md.contains("`scope-19`"));
+        assert!(
+            !md.contains("`scope-20`"),
+            "markdown table must cap at {ATLAS_IDENTITY_LIST_LIMIT} identities: {md}"
+        );
+        assert!(
+            md.contains("… and 5 more"),
+            "markdown must name omitted identities: {md}"
+        );
+        assert!(md.contains(ATLAS_IDENTITIES_FULL_JSON));
+
+        let payload = manifest.pointer_payload();
+        assert_eq!(
+            payload["atlases"].as_array().map(Vec::len),
+            Some(ATLAS_IDENTITY_LIST_LIMIT)
+        );
+        assert_eq!(payload["atlases_omitted"], json!(5));
+        assert_eq!(
+            payload["atlases_full_path"],
+            json!(ATLAS_IDENTITIES_FULL_JSON)
+        );
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut persisted = manifest;
+        persisted.manifest = tmp.path().join("manifest.md").display().to_string();
+        persisted.manifest_json = tmp.path().join("manifest.json").display().to_string();
+        write_manifest_files(&persisted).expect("persist bounded catalog");
+        let full: Vec<ContextAtlasReference> = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join(ATLAS_IDENTITIES_FULL_JSON))
+                .expect("manifest.full.json"),
+        )
+        .expect("full identity list parses");
+        assert_eq!(full.len(), 25, "full list lives in .full.json");
+        let on_disk: ContextAtlasManifest = serde_json::from_str(
+            &fs::read_to_string(tmp.path().join("manifest.json")).expect("manifest.json"),
+        )
+        .expect("catalog parses");
+        assert_eq!(
+            on_disk.atlases.len(),
+            25,
+            "on-disk catalog keeps the full identity list for reload"
+        );
+    }
+
+    #[test]
+    fn w4_02_mirror_writes_are_atomic() {
+        let tmp = TempDir::new().expect("temp dir");
+        let dest = tmp.path().join("card.md");
+        write_atlas_file_atomic(&dest, b"# hello\ncomplete\n").expect("atomic write");
+        assert_eq!(
+            fs::read_to_string(&dest).expect("read dest"),
+            "# hello\ncomplete\n"
+        );
+        let leftover_tmps: Vec<_> = fs::read_dir(tmp.path())
+            .expect("list dest dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".loctree-atlas-")
+            })
+            .collect();
+        assert!(
+            leftover_tmps.is_empty(),
+            "tmp+rename must not leave staging files: {leftover_tmps:?}"
+        );
+
+        let root = tmp.path().join("shared-project");
+        fs::create_dir_all(&root).expect("project root");
+        std::thread::scope(|scope| {
+            let root_a = root.clone();
+            scope.spawn(move || {
+                let mut pack = pack_with_corpus_file(&root_a);
+                pack.scope = Some(ScopeReport {
+                    selectors: vec!["path:src/a".to_string()],
+                    matched_files: 1,
+                    empty: false,
+                    fingerprint: "scope-a".to_string(),
+                    named_resolved_from: None,
+                    resolved_selectors: Vec::new(),
+                    selector_match_counts: Vec::new(),
+                });
+                pack.action.next_safe_commands = vec!["FIRST_THREAD_MARKER".to_string()];
+                materialize_context_atlas(&pack, &root_a, None).expect("thread a");
+            });
+            let root_b = root.clone();
+            scope.spawn(move || {
+                let mut pack = pack_with_corpus_file(&root_b);
+                pack.scope = Some(ScopeReport {
+                    selectors: vec!["path:src/b".to_string()],
+                    matched_files: 1,
+                    empty: false,
+                    fingerprint: "scope-b".to_string(),
+                    named_resolved_from: None,
+                    resolved_selectors: Vec::new(),
+                    selector_match_counts: Vec::new(),
+                });
+                pack.action.next_safe_commands = vec!["SECOND_THREAD_MARKER".to_string()];
+                materialize_context_atlas(&pack, &root_b, None).expect("thread b");
+            });
+        });
+
+        let atlas_root = atlas_dir_for_project(&root);
+        for name in [
+            "00-core-map.md",
+            "01-structural-map.md",
+            "02-runtime-map.md",
+            "03-intent-map.md",
+            "04-verification-gates.md",
+            "05-risk-register.md",
+            "manifest.md",
+        ] {
+            let text = fs::read_to_string(atlas_root.join(name))
+                .unwrap_or_else(|err| panic!("{name} must be a complete file: {err}"));
+            assert!(
+                text.starts_with("# "),
+                "{name} must not be a torn write: {}",
+                text.chars().take(80).collect::<String>()
+            );
+        }
+        let catalog_raw =
+            fs::read_to_string(atlas_root.join("manifest.json")).expect("root catalog json");
+        let catalog: ContextAtlasManifest =
+            serde_json::from_str(&catalog_raw).expect("root catalog must be complete JSON");
+        assert!(
+            catalog.atlases.len() >= 2,
+            "both scoped identities should land in the catalog: {:?}",
+            catalog
+                .atlases
+                .iter()
+                .map(|atlas| atlas.identity.atlas_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let core = fs::read_to_string(atlas_root.join("00-core-map.md")).expect("flat core");
+        assert!(
+            core.contains("FIRST_THREAD_MARKER") || core.contains("SECOND_THREAD_MARKER"),
+            "flat compatibility view must be one complete identity, not a mix of fragments: {core}"
+        );
+        assert!(
+            !(core.contains("FIRST_THREAD_MARKER") && core.contains("SECOND_THREAD_MARKER")),
+            "flat core card must not mix both writers: {core}"
         );
     }
 }

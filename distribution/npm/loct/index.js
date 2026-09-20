@@ -145,8 +145,10 @@ function getBinaryPath(name = RUNTIME_BINARY) {
 }
 
 /**
- * Run the Loctree runtime (`loctree`), inheriting stdio. Both the `loctree` and
- * `loct` bin entries call this — `loct` is just a short alias for the same binary.
+ * Run the Loctree runtime (`loctree`), inheriting stdio. Only the `loctree`
+ * bin entry calls this — `loct` routes to its own banner-free binary via
+ * `runBinary('loct', ...)`, so the deprecation nag never fires on the
+ * preferred command name.
  * Exits with the binary's status code on failure.
  */
 function runRuntime(args = []) {

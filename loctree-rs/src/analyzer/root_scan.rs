@@ -400,6 +400,11 @@ fn scan_single_root(
             "xml",
             "svg",
             "txt",
+            "kdl",
+            "snap",
+            "sha256",
+            "template",
+            "sql",
         ] {
             set.insert(lang_ext.to_string());
         }
@@ -728,9 +733,7 @@ fn scan_single_root(
                                 .and_then(|r| r.resolve(&imp.source, options.extensions.as_ref()))
                         }
                     }
-                    "rs" if imp.is_mod_declaration => {
-                        resolve_rust_import(&imp.source, &file, root_path, root_path)
-                    }
+                    "rs" => resolve_rust_import(&imp.source, &file, root_path, root_path),
                     _ => None,
                 });
                 if let Some(target) = resolved {

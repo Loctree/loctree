@@ -73,8 +73,15 @@ pub struct CrowdMember {
     pub file: String,
     /// Why this file is in the crowd
     pub match_reason: MatchReason,
-    /// Number of files that import this one
+    /// Number of files that import this one, following re-export chains:
+    /// direct importers plus upstream consumers of any barrel/glob that
+    /// re-exports this file. For textual direct importers only, see
+    /// `importer_count_direct`.
     pub importer_count: usize,
+    /// Direct importers only: files with a textual import or re-export edge
+    /// pointing at this file, without following re-export chains.
+    #[serde(default)]
+    pub importer_count_direct: usize,
     /// Similarity scores with other crowd members (file_path, similarity_score)
     pub similarity_scores: Vec<(String, f32)>,
     /// Whether this is a test file

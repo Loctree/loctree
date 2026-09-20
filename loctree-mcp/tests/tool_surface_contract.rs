@@ -556,12 +556,18 @@ struct StdioServer {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
+    _cache_dir: Option<tempfile::TempDir>,
 }
 
 impl StdioServer {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_loctree-mcp"))
-            .args(["--log-level", "error"])
+        let temp = tempfile::tempdir().ok();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_loctree-mcp"));
+        cmd.args(["--log-level", "error"]);
+        if let Some(ref t) = temp {
+            cmd.env("LOCT_CACHE_DIR", t.path().join("cache"));
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -573,6 +579,7 @@ impl StdioServer {
             child,
             stdin,
             stdout,
+            _cache_dir: temp,
         }
     }
 
@@ -647,19 +654,25 @@ struct HttpServer {
     child: Child,
     addr: SocketAddr,
     session_id: String,
+    _cache_dir: Option<tempfile::TempDir>,
 }
 
 impl HttpServer {
     fn start() -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_loctree-mcp"))
-            .args([
-                "--transport",
-                "http",
-                "--bind",
-                "127.0.0.1:0",
-                "--log-level",
-                "error",
-            ])
+        let temp = tempfile::tempdir().ok();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_loctree-mcp"));
+        cmd.args([
+            "--transport",
+            "http",
+            "--bind",
+            "127.0.0.1:0",
+            "--log-level",
+            "error",
+        ]);
+        if let Some(ref t) = temp {
+            cmd.env("LOCT_CACHE_DIR", t.path().join("cache"));
+        }
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -670,6 +683,7 @@ impl HttpServer {
             child,
             addr,
             session_id: String::new(),
+            _cache_dir: temp,
         }
     }
 

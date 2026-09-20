@@ -23,7 +23,7 @@
 //! };
 //!
 //! let score = calculate_health_score(&metrics);
-//! assert!(score.health > 0);
+//! assert!(score.health.unwrap() > 0);
 //! assert!(score.details.certain.penalty > 0.0);
 //! ```
 
@@ -99,8 +99,12 @@ pub struct ProjectSize {
 /// Complete health score with breakdown
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthScore {
-    /// Overall health score 0-100 (higher is better)
-    pub health: u8,
+    /// Overall health score 0-100 (higher is better).
+    /// `null` when the input was empty — a vacuous 100 is forbidden.
+    pub health: Option<u8>,
+    /// Why `health` is null. Omitted when the score is real.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// Breakdown by severity level
     pub details: HealthDetails,
     /// Normalized density metric (total issues/LOC adjusted)
@@ -109,14 +113,34 @@ pub struct HealthScore {
     pub project_size: ProjectSize,
 }
 
-impl Default for HealthScore {
-    fn default() -> Self {
+impl HealthScore {
+    /// Stable reason string for the zero-input / empty-scan case.
+    pub const NO_FILES_ANALYZED_REASON: &'static str = "no files analyzed";
+
+    /// Unscorable result: no numeric pride, only a reason.
+    pub fn unknown(reason: impl Into<String>) -> Self {
         Self {
-            health: 100,
+            health: None,
+            reason: Some(reason.into()),
             details: HealthDetails::default(),
             normalized_density: 0.0,
             project_size: ProjectSize::default(),
         }
+    }
+
+    /// Text/JSON-aligned rendering: `"84/100"` or `"unknown (no files analyzed)"`.
+    pub fn format_score(&self) -> String {
+        match (&self.health, self.reason.as_deref()) {
+            (Some(score), _) => format!("{score}/100"),
+            (None, Some(reason)) => format!("unknown ({reason})"),
+            (None, None) => "unknown".to_string(),
+        }
+    }
+}
+
+impl Default for HealthScore {
+    fn default() -> Self {
+        Self::unknown(Self::NO_FILES_ANALYZED_REASON)
     }
 }
 
@@ -175,7 +199,22 @@ pub struct HealthMetrics {
 /// - SMELL (20% weight): twins_same_language, barrel_chaos, structural_cycles, etc.
 ///
 /// Log-normalization ensures fair comparison across project sizes.
+///
+/// Zero files is not a perfect score: it is unknown. An empty or
+/// never-scanned input used to return `health: 100` / HEALTHY because
+/// every penalty term is zero when there is nothing to count
+/// (G-VACUOUS-HEALTH).
 pub fn calculate_health_score(metrics: &HealthMetrics) -> HealthScore {
+    if metrics.files == 0 {
+        return HealthScore {
+            project_size: ProjectSize {
+                files: metrics.files,
+                loc: metrics.loc,
+            },
+            ..HealthScore::unknown(HealthScore::NO_FILES_ANALYZED_REASON)
+        };
+    }
+
     // === Aggregate counts per severity ===
     let certain_count =
         metrics.missing_handlers + metrics.unregistered_handlers + metrics.breaking_cycles;
@@ -208,7 +247,8 @@ pub fn calculate_health_score(metrics: &HealthMetrics) -> HealthScore {
 
     // === Build result ===
     HealthScore {
-        health,
+        health: Some(health),
+        reason: None,
         details: HealthDetails {
             certain: SeverityDimension {
                 count: certain_count,
@@ -296,7 +336,8 @@ mod tests {
             ..Default::default()
         };
         let score = calculate_health_score(&metrics);
-        assert_eq!(score.health, 100);
+        assert_eq!(score.health, Some(100));
+        assert!(score.reason.is_none());
         assert_eq!(score.details.certain.count, 0);
         assert_eq!(score.details.high.count, 0);
         assert_eq!(score.details.smell.count, 0);
@@ -313,8 +354,8 @@ mod tests {
 
         let score = calculate_health_score(&metrics);
         assert!(
-            score.health < 100,
-            "health={} should be < 100",
+            score.health.is_some_and(|h| h < 100),
+            "health={:?} should be < 100",
             score.health
         );
         assert!(
@@ -337,8 +378,8 @@ mod tests {
         let score = calculate_health_score(&metrics);
         // SMELL has max 20% weight, so impact is limited
         assert!(
-            score.health >= 80,
-            "health={} should be >= 80 for smell-only issues",
+            score.health.is_some_and(|h| h >= 80),
+            "health={:?} should be >= 80 for smell-only issues",
             score.health
         );
     }
@@ -355,7 +396,10 @@ mod tests {
         metrics.barrel_chaos_count = 100;
 
         let score = calculate_health_score(&metrics);
-        assert!(score.health <= 100, "health should never exceed 100");
+        assert!(
+            score.health.is_some_and(|h| h <= 100),
+            "health should never exceed 100"
+        );
     }
 
     #[test]
@@ -392,7 +436,7 @@ mod tests {
         // Large project should have higher health (less penalty per issue)
         assert!(
             large_score.health > small_score.health,
-            "large={} should be > small={}",
+            "large={:?} should be > small={:?}",
             large_score.health,
             small_score.health
         );
@@ -437,5 +481,27 @@ mod tests {
         assert!(json.contains("\"details\""));
         assert!(json.contains("\"certain\""));
         assert!(json.contains("\"normalized_density\""));
+        assert!(!json.contains("\"reason\""));
+    }
+
+    /// Delivery-verifier for W1-04: empty input is unknown/null, never 100.
+    #[test]
+    fn w1_04_health_zero_files_is_not_100() {
+        let score = calculate_health_score(&HealthMetrics::default());
+        assert!(
+            score.health.is_none(),
+            "zero files must not invent a score; got {:?}",
+            score.health
+        );
+        assert_ne!(score.health, Some(100));
+        assert_eq!(
+            score.reason.as_deref(),
+            Some(HealthScore::NO_FILES_ANALYZED_REASON)
+        );
+        assert_eq!(score.format_score(), "unknown (no files analyzed)");
+
+        let json = serde_json::to_value(&score).unwrap();
+        assert!(json["health"].is_null(), "JSON health must be null: {json}");
+        assert_eq!(json["reason"], "no files analyzed");
     }
 }

@@ -964,7 +964,7 @@ commit_agent="${VIBECRAFTED_AGENT:-codex}"
 commit_mode="${VIBECRAFTED_COMMIT_MODE:-interactive}"
 commit_runtime="${VIBECRAFTED_RUNTIME:-make-version}"
 commit_session_id="${VIBECRAFTED_SESSION_ID:-$(make_session_id)}"
-commit_date="${VIBECRAFTED_COMMIT_DATE:-$(date '+%Y-%m-%dT%H:%M:%S %Z')}"
+commit_time="${VIBECRAFTED_COMMIT_TIME:-${VIBECRAFTED_COMMIT_DATE:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}}"
 
 git -C "$ROOT_DIR" commit -m "[$commit_agent/$commit_mode] chore(release): bump versions
 
@@ -972,7 +972,7 @@ $commit_parts
 
 Authored-By: $commit_agent <agents@vetcoders.io>
 session_id: $commit_session_id
-date: $commit_date
+time: $commit_time
 runtime: $commit_runtime"
 
 log_success "Committed version bump"

@@ -1,6 +1,6 @@
 {
   "name": "@loctree/loctree-darwin-arm64",
-  "version": "0.14.4",
+  "version": "0.14.5-rc1",
   "description": "Loctree suite binaries (loct, loctree, loctree-mcp, loctree-lsp) for macOS Apple Silicon (ARM64). Technical delivery package for @loctree/loctree — do not install directly.",
   "keywords": [
     "loctree",

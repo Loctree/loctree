@@ -1,0 +1,65 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CodeQL's Rust extractor has no autobuild support (2.27+ refuses
+          # it outright) — analysis runs build-less.
+          - language: rust
+            build-mode: none
+          - language: java-kotlin
+            build-mode: manual
+          # Languages below were covered by org-level CodeQL default setup
+          # until it was disabled (advanced and default setups conflict:
+          # GitHub rejects advanced SARIF uploads while default is enabled).
+          # This matrix is the single source of CodeQL truth for the repo.
+          - language: javascript-typescript
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: actions
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Java for JetBrains plugin analysis
+        if: matrix.language == 'java-kotlin'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: .github/codeql/codeql-config.yml
+
+      - name: Build JetBrains plugin for CodeQL
+        if: matrix.language == 'java-kotlin'
+        working-directory: editors/jetbrains
+        run: ./gradlew --no-daemon classes testClasses
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4
+        with:
+          category: "/language:${{ matrix.language }}"
