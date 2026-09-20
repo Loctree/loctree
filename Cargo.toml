@@ -24,7 +24,7 @@ members = [
 # here is what moves the entire suite onto a new release number; `rust-version`
 # is the floor CI and the Dockerfile toolchain must both satisfy.
 [workspace.package]
-version = "0.14.5-rc1"
+version = "0.14.5"
 edition = "2024"
 rust-version = "1.93.0"
 license = "BUSL-1.1"
@@ -84,9 +84,9 @@ schemars = "1"
 # dedicated rename tracks land. Thin releases, npm, and Homebrew use the active
 # loct / loct-mcp / loct-lsp naming contract instead.
 # The local crates (for inter-crate dependencies)
-loctree = { path = "loctree-rs", version = "0.14.5-rc1" }
-loctree-ast = { path = "loctree-ast", version = "0.14.5-rc1" }
-report-leptos = { path = "reports", version = "0.14.5-rc1" }
+loctree = { path = "loctree-rs", version = "0.14.5" }
+loctree-ast = { path = "loctree-ast", version = "0.14.5" }
+report-leptos = { path = "reports", version = "0.14.5" }
 
 # Release profile - good defaults for all crates
 [profile.release]
