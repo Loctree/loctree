@@ -414,10 +414,196 @@ fn line_is_complete_statement(line: &str, language: &str) -> bool {
     }
 }
 
+/// Whether a Rust source line starts a named function declaration rather than
+/// mentioning the `fn(...)` function-pointer type.
+fn rust_named_function_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+        return false;
+    }
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    tokens
+        .iter()
+        .position(|token| *token == "fn")
+        .and_then(|index| tokens.get(index + 1))
+        .is_some_and(|name| !name.starts_with('('))
+}
+
+/// Find a real body-opening brace without borrowing one from syntax trivia or
+/// the declaration that follows a prototype. The scan is bounded by the same
+/// line cap as the returned body. Rust function bodies begin only after their
+/// parameter list closes; this also keeps const-generic braces inside the
+/// signature from becoming the body boundary.
+fn find_body_open_brace(
+    lines: &[&str],
+    start_idx: usize,
+    line_cap: usize,
+    language: &str,
+) -> Option<(usize, usize)> {
+    let rust = language == "rs";
+    let rust_function = rust && rust_named_function_start(lines[start_idx]);
+    let mut paren_depth = 0_i32;
+    let mut bracket_depth = 0_i32;
+    let mut angle_depth = 0_i32;
+    let mut signature_brace_depth = 0_i32;
+    let mut saw_parameter_list = false;
+    let mut parameters_closed = !rust_function;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let mut block_comment_depth = 0_u32;
+    let mut raw_string_hashes: Option<usize> = None;
+    let end = start_idx.saturating_add(line_cap).min(lines.len());
+
+    for (line_idx, line) in lines.iter().enumerate().take(end).skip(start_idx) {
+        if rust
+            && line_idx > start_idx
+            && paren_depth == 0
+            && bracket_depth == 0
+            && angle_depth == 0
+            && signature_brace_depth == 0
+            && in_string.is_none()
+            && raw_string_hashes.is_none()
+            && block_comment_depth == 0
+            && rust_named_function_start(line)
+        {
+            return None;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut idx = 0;
+        while idx < chars.len() {
+            let ch = chars[idx];
+            if let Some(hashes) = raw_string_hashes {
+                if ch == '"' && (0..hashes).all(|offset| chars.get(idx + 1 + offset) == Some(&'#'))
+                {
+                    raw_string_hashes = None;
+                    idx += hashes + 1;
+                    continue;
+                }
+                idx += 1;
+                continue;
+            }
+            if block_comment_depth > 0 {
+                if ch == '/' && chars.get(idx + 1) == Some(&'*') {
+                    block_comment_depth += 1;
+                    idx += 2;
+                    continue;
+                }
+                if ch == '*' && chars.get(idx + 1) == Some(&'/') {
+                    block_comment_depth -= 1;
+                    idx += 2;
+                    continue;
+                }
+                idx += 1;
+                continue;
+            }
+            if let Some(quote) = in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                idx += 1;
+                continue;
+            }
+            if ch == '/' && chars.get(idx + 1) == Some(&'/') {
+                break;
+            }
+            if ch == '/' && chars.get(idx + 1) == Some(&'*') {
+                block_comment_depth = 1;
+                idx += 2;
+                continue;
+            }
+            if rust && ch == 'r' {
+                let boundary = idx == 0
+                    || chars
+                        .get(idx - 1)
+                        .is_none_or(|before| !before.is_alphanumeric() && *before != '_');
+                if boundary {
+                    let hashes = chars[idx + 1..]
+                        .iter()
+                        .take_while(|next| **next == '#')
+                        .count();
+                    if chars.get(idx + 1 + hashes) == Some(&'"') {
+                        raw_string_hashes = Some(hashes);
+                        idx += hashes + 2;
+                        continue;
+                    }
+                }
+            }
+            if signature_brace_depth > 0 {
+                match ch {
+                    '{' => signature_brace_depth += 1,
+                    '}' => signature_brace_depth -= 1,
+                    _ => {}
+                }
+                idx += 1;
+                continue;
+            }
+            match ch {
+                '"' | '`' => in_string = Some(ch),
+                '\'' => {
+                    if rust {
+                        let opens_char_literal =
+                            chars.get(idx + 1) == Some(&'\\') || chars.get(idx + 2) == Some(&'\'');
+                        if opens_char_literal {
+                            in_string = Some('\'');
+                        }
+                    } else {
+                        in_string = Some('\'');
+                    }
+                }
+                '(' => {
+                    paren_depth += 1;
+                    saw_parameter_list = true;
+                }
+                ')' => {
+                    paren_depth = (paren_depth - 1).max(0);
+                    if saw_parameter_list && paren_depth == 0 {
+                        parameters_closed = true;
+                    }
+                }
+                '[' => bracket_depth += 1,
+                ']' => bracket_depth = (bracket_depth - 1).max(0),
+                '<' if rust
+                    && chars.get(idx + 1) != Some(&'<')
+                    && chars.get(idx.wrapping_sub(1)) != Some(&'<') =>
+                {
+                    angle_depth += 1;
+                }
+                '>' if rust && chars.get(idx.wrapping_sub(1)) != Some(&'-') && angle_depth > 0 => {
+                    angle_depth -= 1;
+                }
+                ';' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => return None,
+                '}' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => return None,
+                '{' => {
+                    if paren_depth == 0
+                        && bracket_depth == 0
+                        && angle_depth == 0
+                        && parameters_closed
+                    {
+                        return Some((line_idx, idx));
+                    }
+                    signature_brace_depth = 1;
+                }
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+    None
+}
+
 /// Resolve the 0-based end index of the body at `start_idx`, together with the
 /// extent strategy that proved it. `EXTENT_WINDOW` means no strategy could
 /// prove a closing boundary — callers must report that as truncated.
-fn resolve_extent(lines: &[&str], start_idx: usize, language: &str) -> (usize, &'static str) {
+fn resolve_extent(
+    lines: &[&str],
+    start_idx: usize,
+    line_cap: usize,
+    language: &str,
+) -> (usize, &'static str) {
     // Python `def`/`class` first: an indentation block is the real extent, and
     // it must win over the assignment heuristic (a default arg like
     // `def f(x=(1, 2)):` would otherwise be mistaken for a collection const).
@@ -446,17 +632,9 @@ fn resolve_extent(lines: &[&str], start_idx: usize, language: &str) -> (usize, &
         return (start_idx, EXTENT_LINE);
     }
 
-    // Look for the opening brace within a small lookahead from the definition.
-    let mut brace_open_idx: Option<usize> = None;
-    let lookahead_end = (start_idx + 10).min(lines.len());
-    'outer: for (offset, line) in lines[start_idx..lookahead_end].iter().enumerate() {
-        if line.contains('{') {
-            brace_open_idx = Some(start_idx + offset);
-            break 'outer;
-        }
-    }
-
-    if let Some(open_idx) = brace_open_idx {
+    if let Some((open_idx, open_char_idx)) =
+        find_body_open_brace(lines, start_idx, line_cap, language)
+    {
         // Brace-balanced scan from the opening brace line.
         let rust_quotes = language == "rs";
         let mut depth: i32 = 0;
@@ -466,7 +644,7 @@ fn resolve_extent(lines: &[&str], start_idx: usize, language: &str) -> (usize, &
         'scan: for (i, line) in lines.iter().enumerate().skip(open_idx) {
             let chars: Vec<char> = line.chars().collect();
             let mut escaped = false;
-            let mut idx = 0;
+            let mut idx = if i == open_idx { open_char_idx } else { 0 };
             while idx < chars.len() {
                 let ch = chars[idx];
                 if let Some(q) = in_string {
@@ -560,7 +738,7 @@ fn extract_body(
     line_cap: usize,
     language: &str,
 ) -> ExtractedBody {
-    let (end_idx, extent) = resolve_extent(lines, start_idx, language);
+    let (end_idx, extent) = resolve_extent(lines, start_idx, line_cap, language);
     let closed = extent != EXTENT_WINDOW;
 
     let total_lines = end_idx - start_idx + 1;
@@ -999,6 +1177,97 @@ mod tests {
         let b = extract_body(&lines, 0, 200, "rs");
         assert_eq!(b.end_line, 4);
         assert!(!b.source.contains("fn next"));
+    }
+
+    #[test]
+    fn test_extract_rust_function_body_after_long_project_serial_signature() {
+        let src = r#"fn project_serial(
+    serial: &AcousticSerial,
+    word_evidence_receipts: Vec<String>,
+    layer_decision_receipts: Vec<String>,
+    seal_receipt: Option<String>,
+    manual_edit_receipt: Option<String>,
+    presentation_receipt: Option<&IncrementalShapingReceipt>,
+    word_finality: Vec<
+        codescribe_core::pipeline::acoustic_ledger::word_adjudication::WordFinality,
+    >,
+) -> ProjectedAcousticReceipt
+where
+    ProjectedAcousticReceipt: Send,
+{
+    ProjectedAcousticReceipt::from(serial)
+}
+
+fn publish_revision() {
+    unreachable!();
+}"#;
+        let lines: Vec<&str> = src.lines().collect();
+        let body = extract_body(&lines, 0, 1_000, "rs");
+        assert_eq!(body.extent, EXTENT_BRACE);
+        assert!(!body.truncated);
+        assert!(body.total_lines > 10, "the regression needs a long header");
+        assert!(body.source.ends_with('}'));
+        assert!(!body.source.contains("publish_revision"));
+    }
+
+    #[test]
+    fn test_extract_rust_long_header_shields_syntax_trivia_braces() {
+        let src = r###"fn shielded<const N: usize>(
+    normal: Marker<"{ not a body }">,
+    raw: Marker<r#"{ still not a body }"#>,
+    character: Marker<'{'>,
+    value: [u8; { N }],
+)
+// { fn borrowed_from_comment() {}
+/* outer { /* nested { } */ } */
+where
+    Bound<{ N }>: Trait,
+{
+    consume(normal, raw, character, value);
+}
+
+fn sibling() {}
+"###;
+        let lines: Vec<&str> = src.lines().collect();
+        let body = extract_body(&lines, 0, 200, "rs");
+        assert_eq!(body.extent, EXTENT_BRACE);
+        assert!(!body.truncated);
+        assert!(body.source.contains("consume(normal"));
+        assert!(!body.source.contains("fn sibling"));
+    }
+
+    #[test]
+    fn test_extract_rust_prototype_and_malformed_header_never_borrow_next_function() {
+        for src in [
+            "fn declared(\n    first: usize,\n    second: usize,\n);\nfn next() {\n    body();\n}",
+            "fn malformed(\n    first: usize,\n)\nfn next() {\n    body();\n}",
+        ] {
+            let lines: Vec<&str> = src.lines().collect();
+            let body = extract_body(&lines, 0, 200, "rs");
+            assert_eq!(body.extent, EXTENT_WINDOW);
+            assert!(body.truncated, "an unproved header must stay incomplete");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_const_generic_operators_do_not_hide_real_body() {
+        let src = "fn shifted<const N: usize>(\n    value: Marker<{ (N << 1) > 0 }>,\n) -> usize\nwhere\n    Marker<{ N >= 1 }>: Trait,\n{\n    N\n}\nfn next() {}";
+        let lines: Vec<&str> = src.lines().collect();
+        let body = extract_body(&lines, 0, 200, "rs");
+        assert_eq!(body.extent, EXTENT_BRACE);
+        assert!(!body.truncated);
+        assert!(body.source.ends_with('}'));
+        assert!(!body.source.contains("fn next"));
+    }
+
+    #[test]
+    fn test_extract_rust_body_opener_beyond_line_cap_stays_incomplete() {
+        let src = "fn capped(\n    first: usize,\n    second: usize,\n    third: usize,\n) {\n    body();\n}";
+        let lines: Vec<&str> = src.lines().collect();
+        let body = extract_body(&lines, 0, 3, "rs");
+        assert_eq!(body.extent, EXTENT_WINDOW);
+        assert!(body.truncated);
+        assert_eq!(body.source.lines().count(), 3);
     }
 
     #[test]

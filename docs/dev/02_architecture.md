@@ -123,6 +123,14 @@ MCP server exposing the same snapshot-backed structural truth to AI agents.
 - `suppressions` - Source-side silencer inventory
 - `prism` - Conceptual-smear score for `vc-polarize` gating
 
+The shared `body` extractor searches for a body opener within the requested
+line cap, including Rust signatures longer than ten lines. The opener scan
+ignores comments and quoted strings and tracks signature delimiters and
+const-generic expressions. A prototype or following function declaration
+cannot supply a missing opener. An unproved boundary retains `extent=window`
+and `truncated=true`; increasing the cap does not turn a fallback window into
+a complete body. The existing body balancer and output cap remain authoritative.
+
 **Version**: 0.1.11
 **Type**: Library + binary
 **Dependencies**: rmcp, lancedb (embeddings via external providers)
