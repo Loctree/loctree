@@ -128,8 +128,9 @@ line cap, including Rust signatures longer than ten lines. The opener scan
 ignores comments and quoted strings and tracks signature delimiters and
 const-generic expressions. A prototype or following function declaration
 cannot supply a missing opener. An unproved boundary retains `extent=window`
-and `truncated=true`; increasing the cap does not turn a fallback window into
-a complete body. The existing body balancer and output cap remain authoritative.
+and `truncated=true`; a larger cap reports a complete body only when the opener
+and closing boundary are proved. The existing body balancer and output cap
+remain authoritative.
 
 **Version**: 0.1.11
 **Type**: Library + binary

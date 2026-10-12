@@ -532,6 +532,18 @@ fn find_body_open_brace(
                     }
                 }
             }
+            if ch == '"' || ch == '`' {
+                in_string = Some(ch);
+                idx += 1;
+                continue;
+            }
+            if ch == '\'' {
+                if !rust || chars.get(idx + 1) == Some(&'\\') || chars.get(idx + 2) == Some(&'\'') {
+                    in_string = Some('\'');
+                }
+                idx += 1;
+                continue;
+            }
             if signature_brace_depth > 0 {
                 match ch {
                     '{' => signature_brace_depth += 1,
@@ -542,18 +554,6 @@ fn find_body_open_brace(
                 continue;
             }
             match ch {
-                '"' | '`' => in_string = Some(ch),
-                '\'' => {
-                    if rust {
-                        let opens_char_literal =
-                            chars.get(idx + 1) == Some(&'\\') || chars.get(idx + 2) == Some(&'\'');
-                        if opens_char_literal {
-                            in_string = Some('\'');
-                        }
-                    } else {
-                        in_string = Some('\'');
-                    }
-                }
                 '(' => {
                     paren_depth += 1;
                     saw_parameter_list = true;
@@ -567,12 +567,19 @@ fn find_body_open_brace(
                 '[' => bracket_depth += 1,
                 ']' => bracket_depth = (bracket_depth - 1).max(0),
                 '<' if rust
+                    && paren_depth == 0
+                    && bracket_depth == 0
                     && chars.get(idx + 1) != Some(&'<')
                     && chars.get(idx.wrapping_sub(1)) != Some(&'<') =>
                 {
                     angle_depth += 1;
                 }
-                '>' if rust && chars.get(idx.wrapping_sub(1)) != Some(&'-') && angle_depth > 0 => {
+                '>' if rust
+                    && paren_depth == 0
+                    && bracket_depth == 0
+                    && chars.get(idx.wrapping_sub(1)) != Some(&'-')
+                    && angle_depth > 0 =>
+                {
                     angle_depth -= 1;
                 }
                 ';' if paren_depth == 0 && bracket_depth == 0 && angle_depth == 0 => return None,
@@ -1257,6 +1264,33 @@ fn sibling() {}
         assert_eq!(body.extent, EXTENT_BRACE);
         assert!(!body.truncated);
         assert!(body.source.ends_with('}'));
+        assert!(!body.source.contains("fn next"));
+    }
+
+    #[test]
+    fn test_extract_rust_array_length_comparisons_do_not_open_generic_angles() {
+        for src in [
+            "fn compared(_: [u8; (1 < 2) as usize]) {\n    body();\n}\nfn next() {}",
+            "fn compared() -> [u8; (1 < 2) as usize] {\n    [0; 1]\n}\nfn next() {}",
+        ] {
+            let lines: Vec<&str> = src.lines().collect();
+            let body = extract_body(&lines, 0, 200, "rs");
+            assert_eq!(body.extent, EXTENT_BRACE);
+            assert!(!body.truncated);
+            assert!(!body.source.contains("fn next"));
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_const_expression_shields_quoted_closing_braces() {
+        let src = r#"fn quoted() -> Marker<{ let _ = "}"; let _ = '}'; 1 }> {
+    Marker
+}
+fn next() {}"#;
+        let lines: Vec<&str> = src.lines().collect();
+        let body = extract_body(&lines, 0, 200, "rs");
+        assert_eq!(body.extent, EXTENT_BRACE);
+        assert!(!body.truncated);
         assert!(!body.source.contains("fn next"));
     }
 
