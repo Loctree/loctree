@@ -29,6 +29,7 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 2
 fi
 
+publisher_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 tag="v$VERSION"
@@ -121,7 +122,7 @@ stage_platform linux-x64-gnu "${archives[2]}"
 stage_platform win32-x64-msvc "${archives[3]}" .exe
 
 node distribution/npm/sync-version.mjs --check "$VERSION"
-node --test distribution/npm/publish-if-missing.test.mjs
+node --test "$publisher_dir/publish-if-missing.test.mjs"
 
 for platform_dir in "$stage"/platform-packages/*; do
   for binary in loct loctree loctree-mcp loctree-lsp; do
@@ -166,7 +167,7 @@ publish_package() {
   if [[ "$PUBLISH_CONFIRM" == "1" ]]; then
     provenance=false
     [[ "$AUTH_MODE" != "oidc" ]] || provenance=true
-    node distribution/npm/publish-if-missing.mjs \
+    node "$publisher_dir/publish-if-missing.mjs" \
       --package-dir "$package_dir" --version "$VERSION" --provenance "$provenance"
   else
     (cd "$package_dir" && npm pack --dry-run >/dev/null)

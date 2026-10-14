@@ -7,6 +7,7 @@ import {
   assertPackageVersion,
   classifyNpmView,
   publishArgs,
+  waitForRegistryVersion,
 } from "./publish-if-missing.mjs";
 
 test("CI publishes with provenance by default", () => {
@@ -80,4 +81,31 @@ test("OIDC release publication refuses local execution without falling back to a
   assert.equal(result.status, 2);
   assert.match(result.stderr, /requires the GitHub Actions trusted-publisher identity/);
   assert.doesNotMatch(result.stderr, /credential missing|whoami/);
+});
+
+
+test("publication waits for registry visibility before advancing to dependent wrappers", () => {
+  let queries = 0;
+  let sleeps = 0;
+  waitForRegistryVersion(() => ++queries < 3
+    ? { status: 1, stderr: "E404", stdout: "" }
+    : { status: 0, stdout: '\"0.15.0\"', stderr: "" }, "0.15.0", {
+    attempts: 3,
+    sleep: () => { sleeps += 1; },
+  });
+  assert.equal(queries, 3);
+  assert.equal(sleeps, 2);
+});
+
+test("registry visibility has a bounded deadline and does not retry authentication errors", () => {
+  assert.throws(() => waitForRegistryVersion(
+    () => ({ status: 1, stderr: "E404", stdout: "" }), "0.15.0",
+    { attempts: 2, sleep: () => {} },
+  ), /did not become visible after 2 checks/);
+  let sleeps = 0;
+  assert.throws(() => waitForRegistryVersion(
+    () => ({ status: 1, stderr: "E401", stdout: "" }), "0.15.0",
+    { attempts: 2, sleep: () => { sleeps += 1; } },
+  ), /failed without a registry 404/);
+  assert.equal(sleeps, 0);
 });

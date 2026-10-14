@@ -41,6 +41,16 @@ export function classifyNpmView(result, requestedVersion) {
   throw new Error(`npm view failed without a registry 404:\n${diagnostic.trim()}`);
 }
 
+export function waitForRegistryVersion(query, requestedVersion, options = {}) {
+  const attempts = options.attempts ?? 30;
+  const sleep = options.sleep ?? (() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10000));
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (classifyNpmView(query(), requestedVersion) === "already-published") return;
+    if (attempt < attempts) sleep();
+  }
+  throw new Error(`published version ${requestedVersion} did not become visible after ${attempts} checks`);
+}
+
 function parseArgs(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -89,7 +99,7 @@ export function main(argv = process.argv.slice(2)) {
   assertPackageVersion(packageJson.version, options.version);
 
   const spec = `${packageName}@${options.version}`;
-  const view = npm(["view", spec, "version", "--json"], packageDir, true);
+  const view = npm(["view", spec, "version", "--json", "--prefer-online"], packageDir, true);
   const state = classifyNpmView(view, options.version);
   if (state === "already-published") {
     console.log(`${spec} already published; preserving immutable npm version`);
@@ -105,6 +115,11 @@ export function main(argv = process.argv.slice(2)) {
   if (published.status !== 0) {
     throw new Error(`npm publish failed for ${spec} with exit ${published.status}`);
   }
+  waitForRegistryVersion(
+    () => npm(["view", spec, "version", "--json", "--prefer-online"], packageDir, true),
+    options.version,
+  );
+  console.log(`${spec} is visible in the public registry`);
   return 0;
 }
 
