@@ -6,6 +6,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-14
+
 ### Fixed
 
 - Preserve AICX CLI stdout/stderr until the existing invocation deadline; delayed

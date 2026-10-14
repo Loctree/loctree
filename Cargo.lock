@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "loctree"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "aicx",
  "anyhow",
@@ -2119,7 +2119,7 @@ dependencies = [
 
 [[package]]
 name = "loctree-ast"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "thiserror 2.0.21",
  "tree-sitter",
@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "loctree-lsp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2159,7 +2159,7 @@ dependencies = [
 
 [[package]]
 name = "loctree-mcp"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3269,7 +3269,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "report-leptos"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "leptos",
  "pretty_assertions",

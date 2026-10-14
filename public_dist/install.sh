@@ -5,7 +5,7 @@
 #   curl -fsSL https://loct.io/install.sh | bash
 #
 # Env overrides:
-#   LOCTREE_VERSION   release version (default: 0.14.2)
+#   LOCTREE_VERSION   exact stable release (default: current public release index)
 #   INSTALL_DIR       where binaries/wrappers are placed (default: ~/.local/bin)
 #   CARGO_HOME        cargo home for source fallback (default: ~/.cargo)
 #   LOCTREE_BASE_URL  release base URL (default: https://loct.io/releases)
@@ -45,9 +45,8 @@ fi
 set -euo pipefail
 umask 022
 
-# Keep this default in lockstep with [workspace.package] version in Cargo.toml.
-# `scripts/sync-version.sh` updates it and `make version-assert` enforces it.
-VERSION="${LOCTREE_VERSION:-0.14.5-rc1}"
+# The source tree can be ahead of published artifacts; resolve public stable.
+VERSION="${LOCTREE_VERSION:-}"
 INSTALL_DIR="${INSTALL_DIR:-"$HOME/.local/bin"}"
 CARGO_HOME="${CARGO_HOME:-"$HOME/.cargo"}"
 CARGO_BIN="$CARGO_HOME/bin"
@@ -78,6 +77,22 @@ need_cmd() {
 
 # Prints the SHA-256 of a file using whichever of shasum/sha256sum exists,
 # and aborts the install when neither is available.
+resolve_version() {
+  if [ -z "$VERSION" ]; then
+    need_cmd curl
+    local index_json
+    if ! index_json="$(curl -fsSL "$BASE_URL/index.json")"; then
+      red "release index unavailable: $BASE_URL/index.json"
+      exit 1
+    fi
+    VERSION="$(printf '%s' "$index_json" | tr '\n' ' ' | sed -n 's/.*"current"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  fi
+  if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    red "invalid stable release version: $VERSION"
+    exit 1
+  fi
+}
+
 sha256_file() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 "$1" | awk '{print $1}'
@@ -443,6 +458,8 @@ if [ "${1:-}" = "--self-test-libc" ]; then
   printf 'detect_libc version compare tests passed\n'
   exit 0
 fi
+
+resolve_version
 
 printf '\n'
 blue "Loctree installer"
