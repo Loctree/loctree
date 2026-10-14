@@ -17,6 +17,7 @@ PY
 cat > "$scratch/bin/gpg" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "$*" == *--verify* && "${FAIL_SIGNATURE:-0}" == 1 ]]; then exit 1; fi
 if [[ "$*" == *--fingerprint* ]]; then
  printf 'pub:::::::::\nfpr:::::::::8868139E8A9A2291D067135FB979B60C7079E4D4:\nsub:::::::::\nfpr:::::::::1111111111111111111111111111111111111111:\n'
  if [[ "${EXTRA_PRIMARY:-0}" == 1 ]]; then
@@ -29,7 +30,9 @@ cat > "$scratch/bin/git" <<'STUB'
 set -euo pipefail
 if [[ "$1" == rev-parse ]]; then
  if [[ "$2" == HEAD && "${HEAD_MISMATCH:-0}" == 1 ]]; then printf '%040d\n' 2; else printf '%040d\n' 1; fi
-elif [[ "$1" != verify-tag ]]; then exit 2; fi
+elif [[ "$1" == verify-tag ]]; then
+ if [[ "${FAIL_TAG_SIGNATURE:-0}" == 1 ]]; then exit 1; fi
+else exit 2; fi
 STUB
 cat > "$scratch/bin/curl" <<'STUB'
 #!/usr/bin/env bash
@@ -57,11 +60,14 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$scratch/bin/sha256sum"
 chmod +x "$scratch/bin/"*
 export PATH="$scratch/bin:$PATH" RUNNER_TEMP="$scratch/tmp" GITHUB_ENV="$scratch/env" DOWNLOAD_LOG="$scratch/downloads" RELEASE_TAG=v0.15.0
 : > "$DOWNLOAD_LOG"
-EXTRA_PRIMARY=0 HEAD_MISMATCH=0 bash "$scratch/verify.sh"
+EXTRA_PRIMARY=0 HEAD_MISMATCH=0 /bin/bash "$scratch/verify.sh"
 [[ -s "$DOWNLOAD_LOG" ]]
 : > "$DOWNLOAD_LOG"
-if EXTRA_PRIMARY=1 HEAD_MISMATCH=0 bash "$scratch/verify.sh"; then echo 'untrusted extra primary key accepted' >&2; exit 1; fi
+if EXTRA_PRIMARY=1 HEAD_MISMATCH=0 /bin/bash "$scratch/verify.sh"; then echo 'untrusted extra primary key accepted' >&2; exit 1; fi
 [[ ! -s "$DOWNLOAD_LOG" ]]
-if EXTRA_PRIMARY=0 HEAD_MISMATCH=1 bash "$scratch/verify.sh"; then echo 'checkout differing from signed tag accepted' >&2; exit 1; fi
+if EXTRA_PRIMARY=0 HEAD_MISMATCH=1 /bin/bash "$scratch/verify.sh"; then echo 'checkout differing from signed tag accepted' >&2; exit 1; fi
 [[ ! -s "$DOWNLOAD_LOG" ]]
+if EXTRA_PRIMARY=0 HEAD_MISMATCH=0 FAIL_TAG_SIGNATURE=1 /bin/bash "$scratch/verify.sh"; then echo 'invalid tag signature accepted' >&2; exit 1; fi
+[[ ! -s "$DOWNLOAD_LOG" ]]
+if EXTRA_PRIMARY=0 HEAD_MISMATCH=0 FAIL_SIGNATURE=1 /bin/bash "$scratch/verify.sh"; then echo 'invalid asset signature accepted' >&2; exit 1; fi
 printf '%s\n' 'npm publisher identity contract: PASS'

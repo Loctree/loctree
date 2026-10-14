@@ -46,7 +46,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "expected a stable release tag" >&2
+            exit 2
+          fi
           VERSION="${RELEASE_TAG#v}"
           echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
           export GNUPGHOME
@@ -55,9 +58,15 @@ jobs:
           curl -fsSL https://loctree.com/loctree-signing.asc -o "$GNUPGHOME/signing.asc"
           gpg --batch --import "$GNUPGHOME/signing.asc"
           fingerprint="$(gpg --batch --with-colons --fingerprint | awk -F: '$1=="pub" {primary=1; next} primary && $1=="fpr" {print $10; primary=0}')"
-          [[ "$fingerprint" == 8868139E8A9A2291D067135FB979B60C7079E4D4 ]]
-          [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$RELEASE_TAG^{commit}")" ]]
-          git verify-tag "$RELEASE_TAG"
+          if [[ "$fingerprint" != 8868139E8A9A2291D067135FB979B60C7079E4D4 ]]; then
+            echo "release key bundle must contain exactly the pinned primary key" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "$RELEASE_TAG^{commit}")" ]]; then
+            echo "release checkout differs from the signed tag" >&2
+            exit 1
+          fi
+          git verify-tag "$RELEASE_TAG" || exit 1
           RELEASE_ASSET_DIR="$(mktemp -d "$RUNNER_TEMP/loctree-release-assets.XXXXXX")"
           echo "RELEASE_ASSET_DIR=$RELEASE_ASSET_DIR" >> "$GITHUB_ENV"
           for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
@@ -66,10 +75,10 @@ jobs:
           done
           gh release download "$RELEASE_TAG" --repo Loctree/loctree-release --dir "$RELEASE_ASSET_DIR" \
             --pattern SHA256SUMS --pattern SHA256SUMS.sig
-          gpg --batch --verify "$RELEASE_ASSET_DIR/SHA256SUMS.sig" "$RELEASE_ASSET_DIR/SHA256SUMS"
-          (cd "$RELEASE_ASSET_DIR" && sha256sum --ignore-missing -c SHA256SUMS)
+          gpg --batch --verify "$RELEASE_ASSET_DIR/SHA256SUMS.sig" "$RELEASE_ASSET_DIR/SHA256SUMS" || exit 1
+          (cd "$RELEASE_ASSET_DIR" && sha256sum --ignore-missing -c SHA256SUMS) || exit 1
           for archive in "$RELEASE_ASSET_DIR"/*.tar.gz; do
-            gpg --batch --verify "$archive.sig" "$archive"
+            gpg --batch --verify "$archive.sig" "$archive" || exit 1
           done
           rm -rf "$GNUPGHOME"
       - name: Publish all seven identities through trusted OIDC
