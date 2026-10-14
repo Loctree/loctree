@@ -58,24 +58,7 @@ if "$ROOT_DIR/scripts/wait-for-crates-io-version.sh" '../bad' 9.8.7 >/dev/null 2
 	exit 1
 fi
 
-workflow="$ROOT_DIR/.github/workflows/publish.yml"
-version_bump="$ROOT_DIR/scripts/version-bump.sh"
-
-grep -Fq 'path: release-src' "$workflow"
-grep -Fq 'ref: ${{ github.workflow_sha }}' "$workflow"
-grep -Fq 'path: release-control' "$workflow"
-grep -Fq '../release-control/scripts/wait-for-crates-io-version.sh' "$workflow"
-grep -Fq '"loctree-ast|loctree-ast|yes|"' "$version_bump"
-grep -Fq 'for crate in report-leptos loctree-ast loctree loctree-mcp; do' "$version_bump"
-
-publish_order="$TEST_ROOT/publish-order"
-awk '/- name: Publish (report-leptos|loctree-ast|loctree \(|loctree-mcp)/ { print }' "$workflow" >"$publish_order"
-cat >"$TEST_ROOT/expected-order" <<'EOF'
-      - name: Publish report-leptos (legacy crate)
-      - name: Publish loctree-ast
-      - name: Publish loctree (legacy crate)
-      - name: Publish loctree-mcp (legacy crate)
-EOF
-cmp "$TEST_ROOT/expected-order" "$publish_order"
+# Publisher ordering belongs to the canonical suite, not this source mirror.
+[[ ! -e "$ROOT_DIR/.github/workflows/publish.yml" ]]
 
 echo "crates.io index wait contract: PASS"
