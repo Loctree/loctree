@@ -142,7 +142,7 @@ fn swift_slice_reports_symbol_consumers_without_imports() {
         .stdout(predicate::str::contains("DocumentStore"));
 }
 
-/// Regression: loctree-fail.md 2026-07-25 (blinksh/blink). A nested
+/// Regression: loctree-feedback.md 2026-07-25 (blinksh/blink). A nested
 /// `enum Error` flattened into file exports used to give the defining file a
 /// module-sized implicit fan-in: every Swift file using the STDLIB `Error`
 /// became an "importer", and hub ranking mirrored module size. Implicit

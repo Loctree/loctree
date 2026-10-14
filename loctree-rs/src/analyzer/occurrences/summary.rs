@@ -332,6 +332,10 @@ pub(super) fn role_summary(occurrences: &[LiteralOccurrence]) -> Option<RoleSumm
     let mut summary = RoleSummary {
         definitions: 0,
         callsites: 0,
+        references: 0,
+        mutations: 0,
+        field_emissions: 0,
+        local_bindings: 0,
         imports: 0,
         non_code: 0,
         other: 0,
@@ -346,10 +350,22 @@ pub(super) fn role_summary(occurrences: &[LiteralOccurrence]) -> Option<RoleSumm
                     summary.definition_files.push(occ.file.clone());
                 }
             }
-            MatchRole::Reference
-            | MatchRole::Mutation
-            | MatchRole::FieldEmission
-            | MatchRole::LocalBinding => summary.callsites += 1,
+            MatchRole::Reference => {
+                summary.callsites += 1;
+                summary.references += 1;
+            }
+            MatchRole::Mutation => {
+                summary.callsites += 1;
+                summary.mutations += 1;
+            }
+            MatchRole::FieldEmission => {
+                summary.callsites += 1;
+                summary.field_emissions += 1;
+            }
+            MatchRole::LocalBinding => {
+                summary.callsites += 1;
+                summary.local_bindings += 1;
+            }
             MatchRole::Import => summary.imports += 1,
             MatchRole::Comment | MatchRole::StringLiteral | MatchRole::DataAttribute => {
                 summary.non_code += 1
@@ -380,4 +396,167 @@ pub(super) fn scope_classification_counts(
             count,
         })
         .collect()
+}
+
+/// C: one entity-first group for the default (non-`--literal`) summary.
+///
+/// Hits sharing a resolved definition roll into one header with their
+/// production call sites listed; test/doc/other hits collapse to counts so a
+/// hot symbol's summary does not drown in its own test suite. `--literal`
+/// output never calls this — it stays the flat per-hit list, byte-compatible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedEntity {
+    /// The resolved symbol's stable id, when the snapshot proved one. `None`
+    /// groups every unresolved hit together rather than fabricating an
+    /// identity for it — see `group_by_entity`'s key choice.
+    pub symbol_id: Option<String>,
+    /// Header label: the resolved definition's `name (file)`, or the bare
+    /// matched text suffixed `(unresolved)` when nothing resolved.
+    pub label: String,
+    /// Definition sites in this group, as `(file, line)`. A definition is
+    /// where the entity lives, not somebody calling it — counting it among
+    /// "production caller(s)" overstated fan-in by one everywhere (N05).
+    pub definitions: Vec<(String, usize)>,
+    /// Production-scope non-definition hits in this group, as
+    /// `(file, line, role)`, in the order they appear in the input
+    /// (already ranked by the caller).
+    pub production_callers: Vec<(String, usize, MatchRole)>,
+    /// Test-scope hit count, collapsed — not listed individually.
+    pub test_count: usize,
+    /// Docs-scope hit count, collapsed.
+    pub docs_count: usize,
+    /// Every remaining scope (Config/Generated/Unknown), collapsed.
+    pub other_count: usize,
+}
+
+/// Group a hit set entity-first: one header per resolved definition (or, for
+/// hits that resolved nothing, one shared `(unresolved)` group) instead of
+/// the flat file/line list `--literal` prints. Preserves the input order for
+/// group first-appearance and for each group's production callers, so
+/// grouping a already-ranked (`rank_occurrences`) hit set keeps that order.
+pub fn group_by_entity(occurrences: &[LiteralOccurrence]) -> Vec<GroupedEntity> {
+    let mut order: Vec<Option<String>> = Vec::new();
+    let mut groups: std::collections::HashMap<Option<String>, GroupedEntity> =
+        std::collections::HashMap::new();
+
+    for occ in occurrences {
+        let key = occ
+            .resolved_definition
+            .as_ref()
+            .map(|def| def.symbol_id.clone());
+        let group = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            let label = match &occ.resolved_definition {
+                Some(def) => format!("{} ({})", def.name, def.file),
+                None => format!("{} (unresolved)", occ.matched_text),
+            };
+            GroupedEntity {
+                symbol_id: key.clone(),
+                label,
+                definitions: Vec::new(),
+                production_callers: Vec::new(),
+                test_count: 0,
+                docs_count: 0,
+                other_count: 0,
+            }
+        });
+        match occ.scope_classification {
+            ScopeClassification::Production => {
+                if occ.match_role == MatchRole::Definition {
+                    group.definitions.push((occ.file.clone(), occ.line));
+                } else {
+                    group
+                        .production_callers
+                        .push((occ.file.clone(), occ.line, occ.match_role));
+                }
+            }
+            ScopeClassification::Test => group.test_count += 1,
+            ScopeClassification::Docs => group.docs_count += 1,
+            ScopeClassification::Config
+            | ScopeClassification::Generated
+            | ScopeClassification::Unknown => group.other_count += 1,
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| groups.remove(&key))
+        .collect()
+}
+
+#[cfg(test)]
+mod grouping_tests {
+    use super::super::{ScanOptions, scan_files_with_scope};
+    use super::*;
+
+    #[test]
+    fn group_by_entity_lists_production_callers_and_collapses_test_hits() {
+        let res = scan_files_with_scope(
+            [
+                (
+                    "src/lib.rs",
+                    "pub fn widget() {}\nfn use_it() { widget(); }\n",
+                ),
+                (
+                    "src/lib_test.rs",
+                    "fn t1() { widget(); }\nfn t2() { widget(); }\n",
+                ),
+                ("docs/GUIDE.md", "call widget() to render\n"),
+            ],
+            "widget",
+            ScanOptions::default(),
+            super::super::FileScope::default(),
+        );
+        let groups = group_by_entity(&res.occurrences);
+        assert_eq!(
+            groups.len(),
+            1,
+            "every hit here is the same bare-query group (no snapshot enrichment ran)"
+        );
+        let group = &groups[0];
+        assert!(
+            group
+                .production_callers
+                .iter()
+                .any(|(file, _, _)| file == "src/lib.rs"),
+            "production hits are listed individually: {:?}",
+            group.production_callers
+        );
+        assert_eq!(
+            group.test_count, 2,
+            "the two lib_test.rs hits collapse to a count, not two more rows"
+        );
+        assert_eq!(group.docs_count, 1, "the docs mention collapses too");
+    }
+
+    #[test]
+    fn group_by_entity_splits_distinct_resolved_definitions() {
+        let mut res = scan_files_with_scope(
+            [
+                ("src/a.rs", "pub fn widget() {}\n"),
+                ("src/b.rs", "pub fn widget() {}\n"),
+            ],
+            "widget",
+            ScanOptions::default(),
+            super::super::FileScope::default(),
+        );
+        let snapshot: crate::snapshot::Snapshot = serde_json::from_str(
+            r#"{
+                "metadata": {},
+                "files": [
+                    {"path": "src/a.rs", "language": "rust", "exports": [{"name": "widget", "kind": "function", "export_type": "named", "line": 1}]},
+                    {"path": "src/b.rs", "language": "rust", "exports": [{"name": "widget", "kind": "function", "export_type": "named", "line": 1}]}
+                ]
+            }"#,
+        )
+        .expect("minimal snapshot deserializes via serde defaults");
+        super::super::enrich_with_snapshot(&mut res, &snapshot);
+
+        let groups = group_by_entity(&res.occurrences);
+        assert_eq!(
+            groups.len(),
+            2,
+            "two distinct resolved definitions must NOT merge into one group"
+        );
+    }
 }

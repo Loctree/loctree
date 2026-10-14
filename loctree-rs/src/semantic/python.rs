@@ -329,6 +329,45 @@ static RE_OS_ENVIRON_INDEX_SQ: Lazy<Regex> = Lazy::new(|| {
         .expect("valid os.environ[] regex (single-quoted)")
 });
 
+// H5a: dynamic-key reads. `os.environ.get(env_key)`, `os.getenv(var)` and
+// `os.environ[key]` with an IDENTIFIER argument (not a quoted literal) read a
+// name that isn't known until runtime. The quoted-only patterns above
+// recorded nothing for these, so a file that only ever reads its env vars
+// through a dynamic key looked like it had zero read sites, and any declared
+// contract for that variable looked orphaned even though it demonstrably is
+// read somewhere. The identifier's own text can't tell us WHICH declared
+// variable it reads, so these bucket under a sentinel name (`DYNAMIC_ENV_KEY_NAME`)
+// instead of a real env var name — the point is a nonzero read-site count,
+// not a resolved name.
+//
+// The `[A-Za-z_][A-Za-z0-9_]*` class never matches a leading `"`/`'`, so
+// these can't double-count a call the quoted patterns above already matched.
+
+/// Match `os.getenv(some_identifier)` / `os.getenv(some_identifier, default)`.
+static RE_OS_GETENV_DYNAMIC: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"os\.getenv\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*(,[^)]*)?\)"#)
+        .expect("valid os.getenv dynamic-key regex")
+});
+
+/// Match `os.environ.get(some_identifier)` / `os.environ.get(some_identifier, default)`.
+static RE_OS_ENVIRON_GET_DYNAMIC: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"os\.environ\.get\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*(,[^)]*)?\)"#)
+        .expect("valid os.environ.get dynamic-key regex")
+});
+
+/// Match `os.environ[some_identifier]` (required: KeyError on miss, same as
+/// the literal-key subscript form).
+static RE_OS_ENVIRON_INDEX_DYNAMIC: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"os\.environ\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]"#)
+        .expect("valid os.environ[] dynamic-key regex")
+});
+
+/// Sentinel bucket name for a dynamic-key env read whose actual variable name
+/// can't be determined by static analysis. Never a real env var name (those
+/// are constrained to `[A-Z_][A-Z0-9_]*` by the literal-key patterns above),
+/// so it can't collide with a genuinely declared contract.
+const DYNAMIC_ENV_KEY_NAME: &str = "<dynamic>";
+
 /// Match `Field(env="FOO")` or `Field(..., env="FOO", ...)` for pydantic-settings.
 static RE_PYDANTIC_FIELD_ENV_DQ: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"Field\([^)]*?env\s*=\s*"([A-Z_][A-Z0-9_]*)"[^)]*\)"#)
@@ -404,6 +443,42 @@ fn parse_env_var_reads(stripped_content: &str, file_path: &str) -> Vec<EnvOccurr
                     required: true,
                 });
             }
+        }
+        // H5a: dynamic-key reads — os.getenv(ident) / os.environ.get(ident) /
+        // os.environ[ident]. The key name is unresolved, so these bucket
+        // under DYNAMIC_ENV_KEY_NAME (see its doc comment) rather than a real
+        // env var name; the point is a nonzero read-site count.
+        for caps in RE_OS_GETENV_DYNAMIC.captures_iter(line) {
+            let has_default = caps.get(2).is_some();
+            out.push(EnvOccurrenceCandidate {
+                name: DYNAMIC_ENV_KEY_NAME.to_string(),
+                file: file_path.to_string(),
+                line: line_no,
+                access_kind: "os.getenv_dynamic",
+                default: Some(caps[1].to_string()),
+                required: !has_default,
+            });
+        }
+        for caps in RE_OS_ENVIRON_GET_DYNAMIC.captures_iter(line) {
+            let has_default = caps.get(2).is_some();
+            out.push(EnvOccurrenceCandidate {
+                name: DYNAMIC_ENV_KEY_NAME.to_string(),
+                file: file_path.to_string(),
+                line: line_no,
+                access_kind: "os.environ.get_dynamic",
+                default: Some(caps[1].to_string()),
+                required: !has_default,
+            });
+        }
+        for caps in RE_OS_ENVIRON_INDEX_DYNAMIC.captures_iter(line) {
+            out.push(EnvOccurrenceCandidate {
+                name: DYNAMIC_ENV_KEY_NAME.to_string(),
+                file: file_path.to_string(),
+                line: line_no,
+                access_kind: "os.environ[]_dynamic",
+                default: Some(caps[1].to_string()),
+                required: true,
+            });
         }
         // pydantic Field(env="FOO", ...) — treat as required unless `default=`
         // is also present in the same expression (best-effort substring check).
@@ -1519,5 +1594,79 @@ def runtime():
             .find(|c| c.name == "REDIS_URL")
             .expect("REDIS_URL");
         assert_eq!(redis.occurrences[0].access_kind, "os.environ.get");
+    }
+
+    #[test]
+    fn h5a_dynamic_key_env_read_is_recorded_even_when_name_unresolved() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = r#"
+import os
+
+def load(env_key):
+    v = os.environ.get(env_key)
+    return v
+"#;
+        let path = write_tmp(tmp.path(), "config_dynamic.py", content);
+        let mut fa = FileAnalysis::new(path.clone());
+        fa.language = "py".to_string();
+
+        let registry = IdiomRegistry::load_defaults().expect("registry");
+        let mut facts = SemanticFacts::default();
+        PythonRuntimeSemantics
+            .analyze(&[fa], &registry, &mut facts)
+            .expect("analyze");
+
+        let total_read_sites: usize = facts
+            .env_contracts
+            .iter()
+            .map(|c| c.occurrences.len())
+            .sum();
+        assert!(
+            total_read_sites > 0,
+            "expected at least one recorded env read site for a dynamic-key \
+             os.environ.get(...) call, got 0 (contracts: {:?})",
+            facts.env_contracts
+        );
+    }
+
+    #[test]
+    fn h5a_dynamic_key_forms_cover_getenv_and_subscript() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let content = r#"
+import os
+
+def load(key, other_key):
+    a = os.getenv(key)
+    b = os.environ[other_key]
+    return a, b
+"#;
+        let path = write_tmp(tmp.path(), "config_dynamic2.py", content);
+        let mut fa = FileAnalysis::new(path.clone());
+        fa.language = "py".to_string();
+
+        let registry = IdiomRegistry::load_defaults().expect("registry");
+        let mut facts = SemanticFacts::default();
+        PythonRuntimeSemantics
+            .analyze(&[fa], &registry, &mut facts)
+            .expect("analyze");
+
+        let dynamic = facts
+            .env_contracts
+            .iter()
+            .find(|c| c.name == "<dynamic>")
+            .expect("expected a dynamic-key bucket");
+        let access_kinds: Vec<&str> = dynamic
+            .occurrences
+            .iter()
+            .map(|o| o.access_kind.as_str())
+            .collect();
+        assert!(
+            access_kinds.contains(&"os.getenv_dynamic"),
+            "expected an os.getenv_dynamic occurrence, got: {access_kinds:?}"
+        );
+        assert!(
+            access_kinds.contains(&"os.environ[]_dynamic"),
+            "expected an os.environ[]_dynamic occurrence, got: {access_kinds:?}"
+        );
     }
 }

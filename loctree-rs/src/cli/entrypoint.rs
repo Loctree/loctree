@@ -856,7 +856,7 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                 )
             })?;
 
-            let mut results = do_search(query, &analyses);
+            let mut results = do_search(query, &analyses, root_list.first().map(|p| p.as_path()));
             let total = result_count(&results, symbol_only, dead_only, semantic_only);
             if let Some(limit) = parsed.search_limit {
                 let mut remaining = limit;
@@ -969,7 +969,7 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
             let mut results: Vec<(String, SearchResults)> = Vec::new();
             let mut per_query_files: Vec<(String, HashSet<String>)> = Vec::new();
             for q in &parsed.search_queries {
-                let r = do_search(q, &analyses);
+                let r = do_search(q, &analyses, root_list.first().map(|p| p.as_path()));
                 per_query_files.push((
                     q.clone(),
                     file_set_for_search_results(&r, symbol_only, dead_only, semantic_only),
@@ -1046,7 +1046,11 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                     }
                     println!(
                         "{}",
-                        IndexedUniverse::from_analyses(&analyses).summary_line()
+                        IndexedUniverse::from_analyses(
+                            &analyses,
+                            root_list.first().map(|p| p.as_path())
+                        )
+                        .summary_line()
                     );
                     println!(
                         "accounting: total={total}, emitted={returned}, offset=0, truncated={}, has_more={}",
@@ -1065,7 +1069,10 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                     if let Some(page) = page {
                         out["page"] = page;
                     }
-                    out["universe"] = json!(IndexedUniverse::from_analyses(&analyses));
+                    out["universe"] = json!(IndexedUniverse::from_analyses(
+                        &analyses,
+                        root_list.first().map(|p| p.as_path())
+                    ));
                     attach_accounting(&mut out, total, returned, parsed.search_limit);
                     println!("{}", serde_json::to_string_pretty(&out).unwrap());
                 }
@@ -1078,7 +1085,7 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                             "queries": parsed.search_queries,
                             "cross_files": cross_files.iter().map(|(file, qs)| json!({"file": file, "matched_queries": qs})).collect::<Vec<_>>(),
                             "page": page,
-                            "universe": IndexedUniverse::from_analyses(&analyses),
+                            "universe": IndexedUniverse::from_analyses(&analyses, root_list.first().map(|p| p.as_path())),
                             "total": total,
                             "emitted": returned,
                             "offset": 0,
@@ -1111,7 +1118,7 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
             let mut per_term_files: Vec<(String, HashSet<String>)> = Vec::new();
 
             for term in &parsed.search_queries {
-                let r = do_search(term, &analyses);
+                let r = do_search(term, &analyses, root_list.first().map(|p| p.as_path()));
                 per_term_files.push((
                     term.clone(),
                     file_set_for_search_results(&r, symbol_only, dead_only, semantic_only),
@@ -1176,7 +1183,11 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                     }
                     println!(
                         "{}",
-                        IndexedUniverse::from_analyses(&analyses).summary_line()
+                        IndexedUniverse::from_analyses(
+                            &analyses,
+                            root_list.first().map(|p| p.as_path())
+                        )
+                        .summary_line()
                     );
                     println!(
                         "accounting: total={total}, emitted={returned}, offset=0, truncated={}, has_more={}",
@@ -1195,7 +1206,10 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                     if let Some(page) = page {
                         out["page"] = page;
                     }
-                    out["universe"] = json!(IndexedUniverse::from_analyses(&analyses));
+                    out["universe"] = json!(IndexedUniverse::from_analyses(
+                        &analyses,
+                        root_list.first().map(|p| p.as_path())
+                    ));
                     attach_accounting(&mut out, total, returned, parsed.search_limit);
                     println!("{}", serde_json::to_string_pretty(&out).unwrap());
                 }
@@ -1208,7 +1222,7 @@ fn run_search(root_list: &[PathBuf], parsed: &ParsedArgs) -> std::io::Result<()>
                             "terms": parsed.search_queries,
                             "intersection_files": intersect_files,
                             "page": page,
-                            "universe": IndexedUniverse::from_analyses(&analyses),
+                            "universe": IndexedUniverse::from_analyses(&analyses, root_list.first().map(|p| p.as_path())),
                             "total": total,
                             "emitted": returned,
                             "offset": 0,

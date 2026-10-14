@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn renders_long_paths_without_collapsing_layout() {
-        let long = "/Users/example/very/very/very/long/path/to/some/deeply/nested/source/project/with/a/lot/of/components".to_string();
+        let long = "/home/example/very/very/very/long/path/to/some/deeply/nested/source/project/with/a/lot/of/components".to_string();
         let section = ReportSection {
             root: long.clone(),
             files_analyzed: 1,

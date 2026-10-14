@@ -13,7 +13,7 @@ import {
 export interface ExportSym { name: string; kind: string }
 export interface BodyPreview { found: boolean; file: string; preview: string; truncated: boolean }
 export interface BlastRadius { count: number; direct: string[] }
-export interface PillHealth { score: number; status: string }
+export interface PillHealth { score: number | null; status: string }
 export interface PillFindings { dead: number; cycles: number; twins: number; hotspots: number }
 /** One finding scoped to the active file (filtered out of repo `top_risks`). */
 export interface FileRisk { kind: string; severity: string; message: string }
@@ -52,7 +52,7 @@ export interface ContextPillViewModel {
   health: PillHealth;
   /** Repo-level health score (`health.health_score`), 0–100. Demoted to a
    *  muted background line in the header — no longer a header badge. */
-  repoHealth: number;
+  repoHealth: number | null;
   /** Lines of code of the ACTIVE file. `slice.core[0].loc` for file scope;
    *  `null` for symbol/literal scope and out-of-workspace (no single file). */
   fileLoc: number | null;
@@ -295,8 +295,8 @@ function pillLspState(state: LspRuntimeState = DEFAULT_LSP_RUNTIME_STATE): PillL
 
 function emptyMetrics() {
   return {
-    health: { score: 0, status: 'unknown' },
-    repoHealth: 0,
+    health: { score: null, status: 'unknown' },
+    repoHealth: null,
     blastRadius: { count: 0, direct: [] },
     exports: [] as ExportSym[],
     deps: [] as string[],
@@ -416,8 +416,8 @@ export async function assembleViewModel(gw: PillGateway, scope: Scope): Promise<
   };
 
   const h = await safe<Partial<HealthResponse>>(gw.health(true), {});
-  const health: PillHealth = { score: h.health_score ?? 0, status: h.status ?? 'unknown' };
-  const repoHealth = h.health_score ?? 0;
+  const health: PillHealth = { score: h.health_score ?? null, status: h.status ?? 'unknown' };
+  const repoHealth = h.health_score ?? null;
   // Repo totals. `findings` is kept as the same object (agentContext reads it);
   // `repoFindings` is the webview-facing alias for the muted background line.
   const repoFindings: PillFindings = {

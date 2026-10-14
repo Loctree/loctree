@@ -98,6 +98,10 @@ fn find_literal_roundtrips_through_stdio_server() {
     assert_eq!(body["mode"], "literal");
     assert_eq!(body["query"], "needle_literal_marker");
     assert_eq!(body["literal_matches"]["total"], 1);
+    assert_eq!(
+        body["matches"], body["literal_matches"],
+        "matches must alias literal_matches exactly"
+    );
     assert_eq!(body["literal_matches"]["files_matched"], 1);
     assert_eq!(
         body["literal_matches"]["by_file"][0]["file"], "src/lib.rs",
@@ -130,6 +134,10 @@ fn find_regex_and_body_roundtrip_through_stdio_server() {
         .expect("regex result text");
     let regex_body: Value = serde_json::from_str(regex_text).expect("regex result JSON");
     assert_eq!(regex_body["mode"], "regex");
+    assert_eq!(
+        regex_body["matches"], regex_body["regex_matches"],
+        "matches must alias regex_matches exactly"
+    );
     assert_eq!(regex_body["regex_matches"]["total"], 1);
     assert!(
         regex_body["regex_matches"]["coverage_line"]

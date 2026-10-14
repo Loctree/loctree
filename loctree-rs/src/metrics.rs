@@ -20,7 +20,7 @@ pub struct IncomingImportMetric {
     /// Heuristic `implicit_symbol` edges carry weight 0 here — they are
     /// module-scope guesses, not imports, and counting them made Swift hub
     /// rankings mirror module size instead of blast radius
-    /// (loctree-fail.md 2026-07-25, blinksh/blink: hubs 77/75/74/74).
+    /// (loctree-feedback.md 2026-07-25, blinksh/blink: hubs 77/75/74/74).
     pub importers_direct: usize,
     /// Raw explicit import edge count (a file importing two symbols counts twice).
     pub import_edges: usize,
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(hubs[0].import_edges, 3);
     }
 
-    /// Regression for loctree-fail.md 2026-07-25 (blinksh/blink): Swift
+    /// Regression for loctree-feedback.md 2026-07-25 (blinksh/blink): Swift
     /// `implicit_symbol` edges must carry weight 0 in fan-in and hub ranking.
     /// A Swift file with module-sized implicit coupling must NOT outrank a
     /// file with real explicit importers.

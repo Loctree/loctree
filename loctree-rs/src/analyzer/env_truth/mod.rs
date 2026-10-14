@@ -87,7 +87,17 @@ pub fn compute_env_truth(config: &ComputeConfig, snapshot: Option<&Snapshot>) ->
         precedence::apply_override(&mut table, cfg, config.quiet);
     }
 
-    let candidates = discovery::discover_candidates(&config.roots, &config.restricted_paths);
+    // H5: supplement the independent, gitignore-blind WalkDir with the main
+    // scanner's own (properly gitignore-aware) file list when a snapshot is
+    // reachable, so discovery can't silently disagree with the rest of
+    // loctree about what's in scope. See `discovery::discover_candidates`.
+    let snapshot_file_paths: Option<Vec<String>> =
+        snapshot.map(|s| s.files.iter().map(|f| f.path.clone()).collect());
+    let candidates = discovery::discover_candidates(
+        &config.roots,
+        &config.restricted_paths,
+        snapshot_file_paths.as_deref(),
+    );
     let scan_root = config
         .roots
         .first()
@@ -315,6 +325,7 @@ pub fn compute_env_truth(config: &ComputeConfig, snapshot: Option<&Snapshot>) ->
             d.sources.is_empty()
                 && !d.reads.is_empty()
                 && !warnings::is_runtime_provided_env(&d.name)
+                && !warnings::is_single_letter_shell_shorthand(&d.name, &d.reads)
         })
         .map(|d| OrphanRead {
             name: d.name.clone(),
@@ -1131,6 +1142,7 @@ spec:
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         }
     }
 
@@ -1201,7 +1213,7 @@ jobs:
         );
     }
 
-    /// Regression for loctree-fail entry 22: Makefile variables like
+    /// Regression for loctree-feedback entry 22: Makefile variables like
     /// `CURRENT_VERSION := ...` are make-local symbols, not runtime env reads.
     /// Old cached snapshots may still contain the previous
     /// `required_for = Makefile variable assignment` contract, so env-truth

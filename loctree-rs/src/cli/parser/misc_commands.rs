@@ -938,10 +938,12 @@ EXAMPLES:
                 i += 1;
             }
 
-            if project.is_some() && (all || older_than.is_some() || max_size.is_some()) {
+            // `--project --all` is one checkout's full prune (snapshot bucket
+            // plus every context-atlas task run); the time/size criteria stay
+            // cache-wide only.
+            if project.is_some() && (older_than.is_some() || max_size.is_some()) {
                 return Err(
-                    "--project cannot be combined with --all, --older-than, or --max-size"
-                        .to_string(),
+                    "--project cannot be combined with --older-than or --max-size".to_string(),
                 );
             }
             if all && (older_than.is_some() || max_size.is_some()) {

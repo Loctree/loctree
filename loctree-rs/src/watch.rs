@@ -354,7 +354,7 @@ fn patch_snapshot(
     changed_paths: &HashSet<PathBuf>,
     parsed_args: &ParsedArgs,
 ) -> anyhow::Result<PatchStats> {
-    // loctree-fail hak 2026-05-23 #4 (L9 closure): the watch daemon used to
+    // loctree-feedback hak 2026-05-23 #4 (L9 closure): the watch daemon used to
     // cache `git_context` once during setup and stamp every incremental
     // patch with that frozen commit hash. Commits landing between the
     // 50-patch full-rescan boundaries left snapshots with fresh files but
@@ -1062,7 +1062,7 @@ mod tests {
         );
     }
 
-    /// Regression for loctree-fail hak 2026-05-23 #4 (L9 closure): when the
+    /// Regression for loctree-feedback hak 2026-05-23 #4 (L9 closure): when the
     /// cached `infra.git_context.commit` differs from the live git HEAD,
     /// `patch_snapshot` MUST refresh the cache and stamp the snapshot with
     /// the fresh commit. Before this fix, every incremental patch between

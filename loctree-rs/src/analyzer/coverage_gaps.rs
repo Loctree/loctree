@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 /// "production usage that lacks a test" drowns real coverage gaps in noise.
 ///
 /// Source hak: 2026-05-18 Screenscribe HAK 3 (`loct coverage` mixes external
-/// imports as "missing exports"). See `~/.vibecrafted/loctree/loctree-fail.md`.
+/// imports as "missing exports"). See `~/internal-artifacts/loctree/loctree-feedback.md`.
 fn import_is_local_repo_symbol(import: &ImportEntry) -> bool {
     match import.resolution {
         ImportResolutionKind::Local => true,
@@ -35,6 +35,19 @@ fn import_is_local_repo_symbol(import: &ImportEntry) -> bool {
         | ImportResolutionKind::Dynamic
         | ImportResolutionKind::Unknown => false,
     }
+}
+
+/// N1 (round-2): which export kinds have behavior a test could cover.
+///
+/// `export_without_test` gaps and the `coverage_percent` denominator only
+/// apply to functions/methods. Types (`struct`/`enum`/`trait`/`type`/
+/// `union`), constants (`decl`), re-exports (`reexport`) and FFI `extern`
+/// declarations carry no executable behavior of their own - flagging them
+/// as "untested" produced pure noise (e.g. extern `AXUIElementCopyAttributeValue`
+/// fired a medium gap). Integrator decision, round 2 cut V: those kinds are
+/// removed from this surface entirely (no new Info severity).
+pub(crate) fn is_testable_export_kind(kind: &str) -> bool {
+    matches!(kind, "function" | "method")
 }
 
 /// A gap in test coverage
@@ -50,6 +63,12 @@ pub struct CoverageGap {
     pub context: Option<String>,
     /// File paths involved
     pub files: Vec<String>,
+    /// N2 (round-2): number of production (non-test) files that import this
+    /// symbol. `Some(n)` on `TestedButUnused` gaps means the "not used in
+    /// production" claim was NOT made - the symbol is referenced, only the
+    /// literal emit/call bridge evidence is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub production_refs: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -99,10 +118,18 @@ pub fn find_coverage_gaps_fenced(
     let test_imports = build_test_import_index(&snapshot.files, &test_files);
 
     // Gap 1: Handlers without tests
-    gaps.extend(find_handler_gaps(&snapshot.command_bridges, &test_imports));
+    gaps.extend(find_handler_gaps(
+        &snapshot.command_bridges,
+        &test_imports,
+        include_artifacts,
+    ));
 
     // Gap 2: Events without tests
-    gaps.extend(find_event_gaps(&snapshot.event_bridges, &test_imports));
+    gaps.extend(find_event_gaps(
+        &snapshot.event_bridges,
+        &test_imports,
+        include_artifacts,
+    ));
 
     // Gap 3: Exports without tests (from files with production usage)
     gaps.extend(find_export_gaps(
@@ -116,6 +143,8 @@ pub fn find_coverage_gaps_fenced(
         &snapshot.command_bridges,
         &snapshot.event_bridges,
         &test_imports,
+        &snapshot.files,
+        &test_files,
     ));
 
     // Artifact fence: a gap whose evidence files are all artifacts is noise
@@ -222,10 +251,39 @@ fn build_test_import_index(
     index
 }
 
+/// H4(d): drop artifact-class (vendored/minified/generated/fixture)
+/// locations from a bridge's evidence list before it becomes gap evidence,
+/// UNLESS that would empty the list entirely — in which case the original
+/// (all-artifact) locations are kept so the caller's whole-gap
+/// `gap_artifact_class` fence can still cut the gap wholesale. This is what
+/// keeps a single product-code emit sharing a generic bridge name from
+/// dragging a vendored file (e.g. `jszip.min.js`) along as if it were also
+/// evidence: the two are fenced per-location, not as an all-or-nothing unit.
+fn filter_artifact_locations<T: Clone>(
+    locations: &[T],
+    path_of: impl Fn(&T) -> &str,
+    include_artifacts: bool,
+) -> Vec<T> {
+    if include_artifacts {
+        return locations.to_vec();
+    }
+    let product: Vec<T> = locations
+        .iter()
+        .filter(|loc| !artifact_class(path_of(loc), None).is_artifact())
+        .cloned()
+        .collect();
+    if product.is_empty() {
+        locations.to_vec()
+    } else {
+        product
+    }
+}
+
 /// Find handlers used in production but not tested
 fn find_handler_gaps(
     command_bridges: &[CommandBridge],
     test_imports: &HashMap<String, Vec<String>>,
+    include_artifacts: bool,
 ) -> Vec<CoverageGap> {
     let mut gaps = Vec::new();
 
@@ -247,8 +305,12 @@ fn find_handler_gaps(
                 .map(|(path, line)| format!("{}:{}", path, line))
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let frontend_files: Vec<String> = bridge
-                .frontend_calls
+            let frontend_calls = filter_artifact_locations(
+                &bridge.frontend_calls,
+                |(path, _)| path.as_str(),
+                include_artifacts,
+            );
+            let frontend_files: Vec<String> = frontend_calls
                 .iter()
                 .map(|(path, _)| path.clone())
                 .collect();
@@ -261,13 +323,14 @@ fn find_handler_gaps(
                 recommendation: format!(
                     "Add test coverage for handler '{}' - it's called from {} production location(s) but has no tests",
                     bridge.name,
-                    bridge.frontend_calls.len()
+                    frontend_calls.len()
                 ),
                 context: Some(format!(
                     "Called from: {}",
                     frontend_files.join(", ")
                 )),
                 files: frontend_files,
+                production_refs: None,
             });
         }
     }
@@ -279,6 +342,7 @@ fn find_handler_gaps(
 fn find_event_gaps(
     event_bridges: &[EventBridge],
     test_imports: &HashMap<String, Vec<String>>,
+    include_artifacts: bool,
 ) -> Vec<CoverageGap> {
     let mut gaps = Vec::new();
 
@@ -292,17 +356,27 @@ fn find_event_gaps(
         let is_tested = test_imports.contains_key(&bridge.name);
 
         if !is_tested {
-            let location = bridge
-                .emits
+            // H4(d): event bridges are merged by bare name upstream (snapshot
+            // construction), so a generic event name can combine a real
+            // product-code emit with an unrelated match inside a vendored/
+            // minified bundle under ONE bridge. The old all-or-nothing
+            // `gap_artifact_class` fence (applied after this function
+            // returns) only cuts a gap when *every* location is an
+            // artifact, so a single product location kept the vendored
+            // location riding along in `files`/context. Fence per-location
+            // here instead, before the gap is even built.
+            let emits = filter_artifact_locations(
+                &bridge.emits,
+                |(path, _, _)| path.as_str(),
+                include_artifacts,
+            );
+
+            let location = emits
                 .first()
                 .map(|(path, line, _)| format!("{}:{}", path, line))
                 .unwrap_or_else(|| "unknown".to_string());
 
-            let emit_files: Vec<String> = bridge
-                .emits
-                .iter()
-                .map(|(path, _, _)| path.clone())
-                .collect();
+            let emit_files: Vec<String> = emits.iter().map(|(path, _, _)| path.clone()).collect();
 
             gaps.push(CoverageGap {
                 kind: GapKind::EventWithoutTest,
@@ -312,7 +386,7 @@ fn find_event_gaps(
                 recommendation: format!(
                     "Add test coverage for event '{}' - emitted from {} location(s) but not tested",
                     bridge.name,
-                    bridge.emits.len()
+                    emits.len()
                 ),
                 context: Some(format!(
                     "Emitted from: {}",
@@ -324,6 +398,7 @@ fn find_event_gaps(
                         .join(", ")
                 )),
                 files: emit_files,
+                production_refs: None,
             });
         }
     }
@@ -339,6 +414,22 @@ fn find_export_gaps(
 ) -> Vec<CoverageGap> {
     let mut gaps = Vec::new();
 
+    // N1 (round-2): name -> is-a-testable-kind map, built from snapshot
+    // exports. Only functions/methods can have a "missing test" gap; types,
+    // consts, re-exports and FFI externs are excluded from this gap kind.
+    // A name exported as a function anywhere stays eligible even if another
+    // file exports a same-named type.
+    let mut testable_kinds: HashMap<String, bool> = HashMap::new();
+    for file in files {
+        for export in &file.exports {
+            let testable = is_testable_export_kind(&export.kind);
+            testable_kinds
+                .entry(export.name.clone())
+                .and_modify(|known| *known = *known || testable)
+                .or_insert(testable);
+        }
+    }
+
     // Build usage map: which exports are actually imported in production code?
     let mut production_usage: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -353,7 +444,7 @@ fn find_export_gaps(
             // as production-used-but-untested generates ~30 false coverage
             // gaps for `from typing import Annotated`, `from rich.progress
             // import BarColumn`, etc. — drowning real gaps in noise.
-            // See loctree-fail.md 2026-05-18 Screenscribe HAK 3.
+            // See loctree-feedback.md 2026-05-18 Screenscribe HAK 3.
             if !import_is_local_repo_symbol(import) {
                 continue;
             }
@@ -380,7 +471,14 @@ fn find_export_gaps(
 
         let is_tested = test_imports.contains_key(&symbol);
 
-        if !is_tested && usage_locations.len() >= 2 {
+        // N1 (round-2): symbols whose exports are all non-testable kinds
+        // (struct/enum/trait/type/union/decl/reexport/extern) never produce
+        // this gap. Symbols with NO export entry keep the historical
+        // behavior (eligible) - absence from the map proves nothing about
+        // the symbol's kind.
+        let kind_testable = testable_kinds.get(&symbol).copied().unwrap_or(true);
+
+        if !is_tested && kind_testable && usage_locations.len() >= 2 {
             // Only flag if used in multiple places (more important)
             gaps.push(CoverageGap {
                 kind: GapKind::ExportWithoutTest,
@@ -402,6 +500,7 @@ fn find_export_gaps(
                         .join(", ")
                 )),
                 files: usage_locations,
+                production_refs: None,
             });
         }
     }
@@ -410,10 +509,23 @@ fn find_export_gaps(
 }
 
 /// Find handlers/events that are tested but not used in production
+///
+/// N2 (round-2): absence of production usage must be proven against actual
+/// production references, not only against bridge-name membership. A symbol
+/// imported by non-test files IS referenced in production even when no
+/// literal `.emit()`/command bridge names it (e.g. an enum passed to a
+/// wrapper method that emits internally). Such symbols keep an honest gap
+/// ("no literal emit/bridge evidence") instead of the false "not emitted /
+/// not called in production" claim; the `production_refs` field records the
+/// reference count so downstream mirrors (quick wins) stay consistent.
+/// A symbol with zero production references keeps the original verdict
+/// (true positive preserved).
 fn find_tested_but_unused(
     command_bridges: &[CommandBridge],
     event_bridges: &[EventBridge],
     test_imports: &HashMap<String, Vec<String>>,
+    files: &[FileAnalysis],
+    test_file_paths: &HashSet<String>,
 ) -> Vec<CoverageGap> {
     let mut gaps = Vec::new();
 
@@ -433,6 +545,31 @@ fn find_tested_but_unused(
         }
     }
 
+    // N2: symbols imported by production (non-test) files - same collection
+    // technique as `find_export_gaps` (local-repo imports only).
+    let mut production_refs: HashMap<String, HashSet<String>> = HashMap::new();
+    for file in files {
+        if test_file_paths.contains(&file.path) {
+            continue;
+        }
+        for import in &file.imports {
+            if !import_is_local_repo_symbol(import) {
+                continue;
+            }
+            for symbol in &import.symbols {
+                let name = if symbol.is_default {
+                    "default".to_string()
+                } else {
+                    symbol.name.clone()
+                };
+                production_refs
+                    .entry(name)
+                    .or_default()
+                    .insert(file.path.clone());
+            }
+        }
+    }
+
     // Check test imports for handlers/events not in production
     for (symbol, test_files) in test_imports {
         // Check if it looks like a handler (common naming patterns)
@@ -444,37 +581,77 @@ fn find_tested_but_unused(
         let looks_like_event =
             symbol.contains("Event") || symbol.contains("event") || symbol.ends_with("_event");
 
+        let referenced_from = production_refs.get(symbol).map(|set| set.len());
+
         if looks_like_handler && !production_handlers.contains(symbol) {
+            let (recommendation, refs) = match referenced_from {
+                Some(n) if n > 0 => (
+                    format!(
+                        "Handler '{}' has tests and is referenced from {} production file(s), but no command-bridge call evidence - verify the call path is actually exercised",
+                        symbol, n
+                    ),
+                    Some(n),
+                ),
+                _ => (
+                    format!(
+                        "Handler '{}' has tests but is not called in production - consider removing if truly unused",
+                        symbol
+                    ),
+                    None,
+                ),
+            };
             gaps.push(CoverageGap {
                 kind: GapKind::TestedButUnused,
                 target: symbol.clone(),
                 location: test_files.first().cloned().unwrap_or_default(),
                 severity: Severity::Low,
-                recommendation: format!(
-                    "Handler '{}' has tests but is not called in production - consider removing if truly unused",
-                    symbol
-                ),
+                recommendation,
                 context: Some(format!(
                     "Tested in: {}",
-                    test_files.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                    test_files
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
                 files: test_files.clone(),
+                production_refs: refs,
             });
         } else if looks_like_event && !production_events.contains(symbol) {
+            let (recommendation, refs) = match referenced_from {
+                Some(n) if n > 0 => (
+                    format!(
+                        "Event '{}' has tests and is referenced from {} production file(s); no literal emit/bridge evidence - verify the emission path is actually covered",
+                        symbol, n
+                    ),
+                    Some(n),
+                ),
+                _ => (
+                    format!(
+                        "Event '{}' has tests but is not emitted in production - consider removing if truly unused",
+                        symbol
+                    ),
+                    None,
+                ),
+            };
             gaps.push(CoverageGap {
                 kind: GapKind::TestedButUnused,
                 target: symbol.clone(),
                 location: test_files.first().cloned().unwrap_or_default(),
                 severity: Severity::Low,
-                recommendation: format!(
-                    "Event '{}' has tests but is not emitted in production - consider removing if truly unused",
-                    symbol
-                ),
+                recommendation,
                 context: Some(format!(
                     "Tested in: {}",
-                    test_files.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                    test_files
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
                 files: test_files.clone(),
+                production_refs: refs,
             });
         }
     }
@@ -506,12 +683,23 @@ pub fn gaps_to_quick_wins(gaps: &[CoverageGap]) -> Vec<crate::analyzer::for_ai::
                     format!("Create unit tests for '{}' to ensure behavior is documented", gap.target),
                     "easy",
                 ),
-                GapKind::TestedButUnused => (
-                    "Remove unused test or restore production usage",
-                    format!("'{}' has tests but is not used in production - likely dead code", gap.target),
-                    format!("Either remove tests for '{}' or restore production usage if intentional", gap.target),
-                    "easy",
-                ),
+                GapKind::TestedButUnused => match gap.production_refs {
+                    // N2 (round-2): symbol IS referenced from production
+                    // files - the honest claim is "no literal emit/call
+                    // evidence", not "dead code".
+                    Some(n) => (
+                        "Verify tests cover the real production path",
+                        format!("'{}' has tests and is referenced from {} production file(s), but no literal emit/call evidence was found", gap.target, n),
+                        format!("Confirm the production call/emit path for '{}' is exercised by the tests", gap.target),
+                        "easy",
+                    ),
+                    None => (
+                        "Remove unused test or restore production usage",
+                        format!("'{}' has tests but is not used in production - likely dead code", gap.target),
+                        format!("Either remove tests for '{}' or restore production usage if intentional", gap.target),
+                        "easy",
+                    ),
+                },
             };
 
             let priority = match gap.severity {
@@ -545,7 +733,7 @@ pub fn gaps_to_quick_wins(gaps: &[CoverageGap]) -> Vec<crate::analyzer::for_ai::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ImportEntry, ImportKind, ImportSymbol};
+    use crate::types::{ExportSymbol, ImportEntry, ImportKind, ImportSymbol};
 
     fn local_import(source: &str, symbol: &str) -> ImportEntry {
         let mut imp = ImportEntry::new(source.to_string(), ImportKind::Static);
@@ -711,6 +899,53 @@ mod tests {
         assert!(fence_all.is_empty());
     }
 
+    /// H4(d) RED: when one bridge (merged upstream by bare event name)
+    /// combines a real product-code emit with an unrelated vendored/minified
+    /// match, the vendored location must not ride along as evidence in the
+    /// surviving product gap's `files` list.
+    #[test]
+    fn find_event_gaps_strips_vendor_evidence_from_mixed_bucket() {
+        use crate::snapshot::EventBridge;
+
+        let bridges = vec![EventBridge {
+            name: "update".to_string(),
+            emits: vec![
+                (
+                    "loctree-rs/src/analyzer/assets/jszip.min.js".to_string(),
+                    5,
+                    "emit_const".to_string(),
+                ),
+                ("src/app.ts".to_string(), 12, "emit_const".to_string()),
+            ],
+            listens: vec![],
+            is_fe_sync: false,
+            same_file_sync: false,
+        }];
+        let test_imports = HashMap::new();
+
+        let gaps = find_event_gaps(&bridges, &test_imports, false);
+        let gap = gaps
+            .iter()
+            .find(|g| g.target == "update")
+            .expect("gap for the mixed bucket must survive (it has real product evidence)");
+
+        assert!(
+            !gap.files.iter().any(|f| f.contains("min.js")),
+            "vendored evidence must not ride along in a product-code gap's file list, found: {:?}",
+            gap.files
+        );
+        assert!(
+            gap.files.iter().any(|f| f == "src/app.ts"),
+            "product-code evidence must still be present, found: {:?}",
+            gap.files
+        );
+
+        // include_artifacts=true restores full, unfenced evidence.
+        let gaps_all = find_event_gaps(&bridges, &test_imports, true);
+        let gap_all = gaps_all.iter().find(|g| g.target == "update").unwrap();
+        assert!(gap_all.files.iter().any(|f| f.contains("min.js")));
+    }
+
     /// Filter must not over-fire: locally-resolved exports (relative imports
     /// or absolute paths inside the repo) still trigger gaps when untested.
     #[test]
@@ -733,5 +968,152 @@ mod tests {
             "locally-resolved untested export must still trigger a gap (was: {:?})",
             gaps
         );
+    }
+
+    fn file_with_exports(path: &str, exports: Vec<(&str, &str)>) -> FileAnalysis {
+        let mut file = FileAnalysis::new(path.to_string());
+        file.kind = "code".to_string();
+        file.exports = exports
+            .into_iter()
+            .map(|(name, kind)| ExportSymbol::new(name.to_string(), kind, "named", Some(1)))
+            .collect();
+        file
+    }
+
+    /// N1 (round-2): struct/const/extern exports used by multiple production
+    /// files must NOT produce `export_without_test` gaps - only functions and
+    /// methods have testable behavior. Guard: a real untested function still
+    /// fires medium.
+    #[test]
+    fn find_export_gaps_skips_non_function_kinds() {
+        let def = file_with_exports(
+            "src/lib.rs",
+            vec![
+                ("AppConfig", "struct"),
+                ("MAX_RETRIES", "decl"),
+                ("ax_copy_value", "extern"),
+                ("real_untested", "function"),
+            ],
+        );
+        let imports = || {
+            vec![
+                local_import("crate::lib", "AppConfig"),
+                local_import("crate::lib", "MAX_RETRIES"),
+                local_import("crate::lib", "ax_copy_value"),
+                local_import("crate::lib", "real_untested"),
+            ]
+        };
+        let files = vec![
+            def,
+            file_with_imports("src/a.rs", imports()),
+            file_with_imports("src/b.rs", imports()),
+        ];
+        let gaps = find_export_gaps(&files, &HashMap::new(), &HashSet::new());
+
+        for type_like in ["AppConfig", "MAX_RETRIES", "ax_copy_value"] {
+            assert!(
+                !gaps.iter().any(|g| g.target == type_like),
+                "non-function export `{type_like}` must not fire export_without_test (was: {:?})",
+                gaps
+            );
+        }
+        let real = gaps
+            .iter()
+            .find(|g| g.target == "real_untested")
+            .expect("a real untested function used in >=2 production files must still fire");
+        assert_eq!(real.severity, Severity::Medium);
+    }
+
+    /// N1 (round-2): a symbol with no export entry at all (kind unknowable)
+    /// keeps the historical behavior and stays eligible.
+    #[test]
+    fn find_export_gaps_keeps_symbols_without_kind_evidence() {
+        let files = vec![
+            file_with_imports("src/a.rs", vec![local_import("./util", "mystery_fn")]),
+            file_with_imports("src/b.rs", vec![local_import("./util", "mystery_fn")]),
+        ];
+        let gaps = find_export_gaps(&files, &HashMap::new(), &HashSet::new());
+        assert!(
+            gaps.iter().any(|g| g.target == "mystery_fn"),
+            "unknown-kind symbol must stay eligible (was: {:?})",
+            gaps
+        );
+    }
+
+    /// N2 (round-2): an event-ish symbol imported by tests AND referenced
+    /// from production files must not be claimed "not emitted in
+    /// production" - only the missing literal emit evidence may be stated.
+    #[test]
+    fn tested_but_unused_event_referenced_in_production_gets_honest_verdict() {
+        let mut test_imports = HashMap::new();
+        test_imports.insert(
+            "EngineEvent".to_string(),
+            vec!["tests/events_test.rs".to_string()],
+        );
+        let files = vec![file_with_imports(
+            "src/app.rs",
+            vec![local_import("crate::events", "EngineEvent")],
+        )];
+        let test_files: HashSet<String> =
+            ["tests/events_test.rs".to_string()].into_iter().collect();
+
+        let gaps = find_tested_but_unused(&[], &[], &test_imports, &files, &test_files);
+        let gap = gaps
+            .iter()
+            .find(|g| g.target == "EngineEvent")
+            .expect("referenced-but-no-emit-evidence symbol still gets a (honest) gap");
+        assert_eq!(gap.production_refs, Some(1));
+        assert!(
+            !gap.recommendation.contains("not emitted in production"),
+            "must not claim absence from production when production refs exist: {}",
+            gap.recommendation
+        );
+        assert!(
+            gap.recommendation
+                .contains("no literal emit/bridge evidence"),
+            "honest wording expected: {}",
+            gap.recommendation
+        );
+
+        // Mirror: quick wins must not call it dead code either.
+        let wins = gaps_to_quick_wins(&gaps);
+        assert!(
+            !wins[0].why.contains("likely dead code"),
+            "quick-win mirror must stay honest: {}",
+            wins[0].why
+        );
+        assert!(wins[0].why.contains("referenced from 1 production file"));
+    }
+
+    /// N2 (round-2) true positive: an event imported ONLY by a test and
+    /// referenced nowhere in production keeps the "not emitted in
+    /// production" verdict.
+    #[test]
+    fn tested_but_unused_ghost_event_keeps_unused_verdict() {
+        let mut test_imports = HashMap::new();
+        test_imports.insert(
+            "GhostEvent".to_string(),
+            vec!["tests/events_test.rs".to_string()],
+        );
+        let files = vec![file_with_imports(
+            "src/app.rs",
+            vec![local_import("crate::events", "EngineEvent")],
+        )];
+        let test_files: HashSet<String> =
+            ["tests/events_test.rs".to_string()].into_iter().collect();
+
+        let gaps = find_tested_but_unused(&[], &[], &test_imports, &files, &test_files);
+        let gap = gaps
+            .iter()
+            .find(|g| g.target == "GhostEvent")
+            .expect("test-only event with no production refs must still fire");
+        assert_eq!(gap.production_refs, None);
+        assert!(
+            gap.recommendation.contains("not emitted in production"),
+            "true positive keeps the unused verdict: {}",
+            gap.recommendation
+        );
+        let wins = gaps_to_quick_wins(&gaps);
+        assert!(wins[0].why.contains("likely dead code"));
     }
 }

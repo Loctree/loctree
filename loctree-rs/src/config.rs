@@ -207,10 +207,12 @@ invalid_command_names = ["npm"]
     }
 
     #[test]
+    #[serial_test::serial(loctree_parser_env)]
     fn parser_strategy_defaults_to_oxc() {
-        // Avoid env-var leakage when other tests set LOCTREE_PARSER.
-        // SAFETY: integration tests that toggle this env serialize via
-        // `serial_test`; this unit test runs single-threaded by default.
+        // Avoid env-var leakage when other tests set LOCTREE_PARSER. The
+        // serial group is what makes the test_env helper's unsafe sound:
+        // unit tests run on parallel threads, so every LOCTREE_PARSER
+        // mutation in this process must share the group.
         {
             crate::test_env::remove_var("LOCTREE_PARSER");
         }
@@ -219,6 +221,7 @@ invalid_command_names = ["npm"]
     }
 
     #[test]
+    #[serial_test::serial(loctree_parser_env)]
     fn parser_strategy_respects_config_field() {
         {
             crate::test_env::remove_var("LOCTREE_PARSER");
@@ -241,6 +244,7 @@ parser = "ts"
     }
 
     #[test]
+    #[serial_test::serial(loctree_parser_env)]
     fn parser_strategy_falls_back_on_unknown_value() {
         {
             crate::test_env::remove_var("LOCTREE_PARSER");

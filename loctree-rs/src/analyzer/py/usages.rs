@@ -21,6 +21,7 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
     let len = bytes.len();
 
     let mut i = 0;
+    let mut paren_depth = 0usize;
     while i < len {
         // Look for `:` or `->` followed by type annotation
         if bytes[i] == b':' || (i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'>') {
@@ -33,10 +34,11 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
                 while lookahead < len && (bytes[lookahead] == b' ' || bytes[lookahead] == b'\t') {
                     lookahead += 1;
                 }
-                if lookahead >= len
-                    || bytes[lookahead] == b'\n'
-                    || bytes[lookahead] == b'\r'
-                    || bytes[lookahead] == b'#'
+                if paren_depth == 0
+                    && (lookahead >= len
+                        || bytes[lookahead] == b'\n'
+                        || bytes[lookahead] == b'\r'
+                        || bytes[lookahead] == b'#')
                 {
                     i = lookahead;
                     continue;
@@ -44,8 +46,21 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
             }
 
             // Skip whitespace
-            while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
+            loop {
+                while i < len
+                    && (bytes[i] == b' '
+                        || bytes[i] == b'\t'
+                        || (paren_depth > 0 && bytes[i].is_ascii_whitespace()))
+                {
+                    i += 1;
+                }
+                if paren_depth > 0 && i < len && bytes[i] == b'#' {
+                    while i < len && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                } else {
+                    break;
+                }
             }
 
             // Now extract identifiers from the type annotation
@@ -108,6 +123,7 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
                 }
                 // Check for opening paren
                 if i < len && bytes[i] == b'(' {
+                    paren_depth += 1;
                     i += 1;
                     // Skip whitespace
                     while i < len && bytes[i].is_ascii_whitespace() {
@@ -130,6 +146,40 @@ pub(super) fn extract_type_hint_usages(content: &str, local_uses: &mut Vec<Strin
                 }
             }
         } else {
+            match bytes[i] {
+                b'(' => paren_depth += 1,
+                b')' => paren_depth = paren_depth.saturating_sub(1),
+                b'#' => {
+                    while i < len && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    let width = if bytes.get(i..i + 3) == Some(&[quote, quote, quote]) {
+                        3
+                    } else {
+                        1
+                    };
+                    i += width;
+                    while i < len {
+                        if bytes[i] == b'\\' {
+                            i = (i + 2).min(len);
+                        } else if bytes
+                            .get(i..i + width)
+                            .is_some_and(|s| s.iter().all(|b| *b == quote))
+                        {
+                            i += width;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
+            }
             i += 1;
         }
     }
@@ -389,6 +439,29 @@ pub(super) fn extract_bare_class_references(content: &str, local_uses: &mut Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_parameter_annotation_preserves_type_usage() {
+        for content in [
+            "def f(x:\n    MyType):\n    BodyOnly\n",
+            "def f(x:\r\n    MyType):\r\n    BodyOnly\r\n",
+            "def f(x: # parameter type\n    MyType):\n    BodyOnly\n",
+        ] {
+            let mut uses = Vec::new();
+            extract_type_hint_usages(content, &mut uses);
+            assert!(uses.contains(&"MyType".into()), "{content:?}: {uses:?}");
+            assert!(
+                !uses.contains(&"BodyOnly".into()),
+                "suite body is not an annotation"
+            );
+        }
+        let mut uses = Vec::new();
+        extract_type_hint_usages("text = '('\nif ready:\n    BodyOnly\n", &mut uses);
+        assert!(
+            !uses.contains(&"BodyOnly".into()),
+            "string delimiters are not syntax"
+        );
+    }
 
     #[test]
     fn type_hint_skips_builtins() {

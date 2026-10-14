@@ -54,8 +54,8 @@ use loctree::analyzer::crowd::detect_crowd_with_edges;
 use loctree::analyzer::cycles::find_cycles;
 use loctree::analyzer::dead_parrots::{DeadFilterConfig, find_dead_exports};
 use loctree::analyzer::occurrences::{
-    FileScope, OccurrenceResults, ReportOptions, ScanOptions, scan_files_for_literal_query,
-    scan_files_with_regex_opts,
+    FileScope, OccurrenceResults, ReportOptions, ScanOptions, enrich_with_snapshot,
+    scan_files_for_literal_query, scan_files_with_regex_opts,
 };
 use loctree::analyzer::pipelines::build_pipeline_summary;
 use loctree::analyzer::root_scan::scan_results_from_snapshot;
@@ -804,6 +804,16 @@ fn scan_literal_occurrences(
             }
         }
     }
+    // MCP parity: the CLI handler (`handle_occurrences_command` /
+    // `handle_find_literal_command` in
+    // `loctree-rs/src/cli/dispatch/handlers/occurrences.rs`) always enriches
+    // its scan against the snapshot before returning, so `find` literal hits
+    // carry `resolved_definition` / `enclosing_symbol` / `enclosing_facts`
+    // just like the CLI does. Run last, against the FINAL (post
+    // `no_generated`-filter) occurrence list, so every rollup this computes
+    // (role_summary, hit_shape, file_context, namesakes) matches what MCP
+    // actually returns.
+    enrich_with_snapshot(&mut results, snapshot);
     results
 }
 
@@ -874,6 +884,14 @@ fn scan_regex_occurrences(
             }
         }
     }
+    // Intentionally NO enrich_with_snapshot here: `handle_occurrences_regex`
+    // in `loctree-rs/src/cli/dispatch/handlers/occurrences.rs` documents why
+    // — "a regex pattern is not a symbol name, so symbol resolution against
+    // it would be meaningless. Matches stay raw-text truth." MCP parity with
+    // the CLI means matching THAT invariant too, not just the literal path's
+    // enrichment; see the final report for this deliberate deviation from a
+    // literal reading of the MCP-parity finding, which named this function
+    // alongside the literal one.
     Ok(matches)
 }
 
@@ -972,7 +990,7 @@ fn context_deadline() -> std::time::Duration {
 /// Environment override for the markdown-body char budget applied to
 /// `context(format=markdown)`.
 ///
-/// loctree-fail tail (2026-06-22, recurring ~6×): the full ContextPack markdown
+/// loctree-feedback tail (2026-06-22, recurring ~6×): the full ContextPack markdown
 /// hit 149,891 chars and was rejected by the MCP runtime token cap, forcing
 /// every agent off the recommended session-start surface onto a non-Loctree
 /// fallback exactly when structural orientation matters most. The default
@@ -1484,6 +1502,14 @@ struct FollowParams {
         deserialize_with = "deserialize_usize_lenient::deserialize"
     )]
     limit: usize,
+    /// Twin class filter for the twins trail.
+    /// CSV of EXACT, SHAPE_SIMILAR, NAME_COLLISION, IDIOM.
+    /// Aliases: `structural` (EXACT + SHAPE_SIMILAR), `naming` (NAME_COLLISION + IDIOM).
+    #[serde(default)]
+    class: Option<String>,
+    /// Twin-family groups to skip after the class filter, before `limit`.
+    #[serde(default, deserialize_with = "deserialize_usize_lenient::deserialize")]
+    offset: usize,
 }
 
 /// LOC at which `tree` flags a file as large when the caller sets no threshold.
@@ -2194,7 +2220,7 @@ impl LoctreeServer {
 
         if matches!(params.format, ContextFormat::Markdown) {
             // The full pack markdown can hit ~150k chars and blow past the MCP
-            // token cap (loctree-fail tail, recurring). We NEVER truncate — that
+            // token cap (loctree-feedback tail, recurring). We NEVER truncate — that
             // strands agents on a head + "go read the cards" and breaks their
             // flow. Instead paginate on top-level `## ` sections under a char
             // budget; the whole pack still comes back in one response when it
@@ -2980,7 +3006,8 @@ impl LoctreeServer {
                     "query": params.name,
                     "project": project.display().to_string(),
                     "file_filter": params.file,
-                    "regex_matches": regex_matches,
+                    "regex_matches": &regex_matches,
+                    "matches": &regex_matches,
                     "regex_trust": {
                         "matched_as_regex": true,
                         "absence_trustworthy": true,
@@ -3042,7 +3069,8 @@ impl LoctreeServer {
                     "query": literal_matches.query,
                     "project": project.display().to_string(),
                     "file_filter": params.file,
-                    "literal_matches": literal_matches,
+                    "literal_matches": &literal_matches,
+                    "matches": &literal_matches,
                     "fuzzy_suggestions": fuzzy_suggestions,
                     "literal_trust": {
                         "multi_literal": multi_literal,
@@ -3085,7 +3113,11 @@ impl LoctreeServer {
         };
 
         // Use the same search infrastructure as CLI
-        let search_results = run_search(&query, &snapshot.files);
+        let search_results = run_search(
+            &query,
+            &snapshot.files,
+            snapshot.metadata.roots.first().map(std::path::Path::new),
+        );
 
         // Convert symbol matches to JSON format (with limit)
         let symbol_matches: Vec<_> = search_results
@@ -3618,7 +3650,7 @@ impl LoctreeServer {
             None => {
                 let suggestions = suggest_directories(&snapshot, &params.directory, 3);
                 // A correct path can still yield no files if .loctignore parks it
-                // outside the snapshot (loctree-fail.md: vista docs/). Surface that
+                // outside the snapshot (loctree-feedback.md: vista docs/). Surface that
                 // precise cause instead of the blanket "Check the path."
                 let ignore_hint =
                     loctree::fs_utils::loctignore_exclusion_hint(&project, &params.directory);
@@ -3859,17 +3891,54 @@ impl LoctreeServer {
             );
         }
 
-        // Twins trail
+        // Twins trail. Class filter and offset match CLI `loct twins` /
+        // `follow twins`: structural classes page before naming classes,
+        // the class filter runs before the window, and exact twins then
+        // route twins share one limit.
         if scope == "twins" || scope == "all" {
-            let twins = detect_exact_twins(&snapshot.files, false);
+            let class_filter = match params.class.as_deref() {
+                Some(spec) if !spec.trim().is_empty() => {
+                    match loctree::analyzer::twins::parse_twin_class_filter(spec) {
+                        Ok(classes) => classes,
+                        Err(err) => {
+                            return tool_json_response(
+                                "follow",
+                                Some(&project),
+                                serde_json::json!({
+                                    "scope": scope,
+                                    "error": err,
+                                }),
+                            );
+                        }
+                    }
+                }
+                _ => Vec::new(),
+            };
+            let mut twins = detect_exact_twins(&snapshot.files, false);
+            loctree::analyzer::twins::order_twins_for_page(&mut twins);
+            loctree::analyzer::twins::retain_twin_classes(&mut twins, &class_filter);
 
+            let mut route_twins = detect_route_twins(&snapshot.files);
+            if !class_filter.is_empty() {
+                route_twins.clear();
+            }
+            let exact_total = twins.len();
+            let route_total = route_twins.len();
+            let family_total = exact_total + route_total;
+            let windows = loctree::analyzer::twins::page_family_windows(
+                &[exact_total, route_total],
+                params.offset,
+                Some(limit),
+            );
             let signals: Vec<_> = twins
                 .iter()
-                .take(limit)
+                .skip(windows[0].0)
+                .take(windows[0].1)
                 .map(|twin| {
                     let files: Vec<_> = twin.locations.iter().map(|l| &l.file_path).collect();
                     serde_json::json!({
                         "symbol": twin.name,
+                        "class": twin.class,
                         "files": files,
                         "locations": twin.locations.iter().map(|l| serde_json::json!({
                             "file": l.file_path,
@@ -3884,16 +3953,16 @@ impl LoctreeServer {
                 })
                 .collect();
 
-            // loctree-fail hak 2026-05-18 #6 + 2026-05-23 #13 (L9 closure):
+            // loctree-feedback hak 2026-05-18 #6 + 2026-05-23 #13 (L9 closure):
             // CLI `loct twins` returns both exact_twins AND route_twins
             // (since marbles-L8). MCP `follow(scope='twins')` was only
             // returning exact_twins, leaving agents blind to runtime
             // route-level collisions (e.g. duplicate `POST /api/stt`)
             // that the operator sees from the CLI. Restore parity.
-            let route_twins = detect_route_twins(&snapshot.files);
             let route_signals: Vec<_> = route_twins
                 .iter()
-                .take(limit)
+                .skip(windows[1].0)
+                .take(windows[1].1)
                 .map(|rt| {
                     serde_json::json!({
                         "framework": rt.framework,
@@ -3908,15 +3977,18 @@ impl LoctreeServer {
                     })
                 })
                 .collect();
+            let returned = signals.len() + route_signals.len();
 
             trails.insert(
                 "twins".to_string(),
                 serde_json::json!({
-                    "total": twins.len(),
+                    "total": exact_total,
                     "shown": signals.len(),
+                    "offset": params.offset,
+                    "has_more": loctree::analyzer::twins::page_has_more(family_total, params.offset, returned),
                     "signals": signals,
                     "route_twins": {
-                        "total": route_twins.len(),
+                        "total": route_total,
                         "shown": route_signals.len(),
                         "signals": route_signals,
                     }
@@ -4252,7 +4324,7 @@ impl LoctreeServer {
 /// Build-time identity stamp (populated by `build.rs`). Surfaced in the MCP
 /// `initialize` handshake so an agent can detect that the running binary lags
 /// its repo's source HEAD straight from `serverInfo.version` / `instructions`,
-/// without reverse-engineering the tool schema. See `loctree-fail.md`
+/// without reverse-engineering the tool schema. See `loctree-feedback.md`
 /// ("live binary predates the committed fix").
 const BUILD_VERSION: &str = env!("LOCTREE_MCP_BUILD_VERSION");
 /// Short commit the binary was built from, or `unknown` outside a checkout.
@@ -4408,26 +4480,29 @@ async fn run_idle_watchdog(idle_duration: Duration) {
     }
 }
 
-async fn wait_for_shutdown_signal() {
+// Install Unix handlers synchronously, before a transport can announce readiness.
+// An async function installs them only when select! polls that branch; a parent
+// reacting to the listener announcement could otherwise send SIGTERM first.
+fn wait_for_shutdown_signal() -> Result<impl std::future::Future<Output = ()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("failed to install SIGTERM handler: {e}");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
+        let mut sigterm = signal(SignalKind::terminate())
+            .context("failed to install SIGTERM handler before server startup")?;
+        let mut sigint = signal(SignalKind::interrupt())
+            .context("failed to install SIGINT handler before server startup")?;
+        Ok(async move {
+            tokio::select! {
+                _ = sigint.recv() => {},
+                _ = sigterm.recv() => {},
             }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
-        }
+        })
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        Ok(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
     }
 }
 
@@ -4615,7 +4690,7 @@ async fn run_server() -> Result<()> {
         info!("Idle watchdog configured: {:.2?}", idle_dur);
     }
 
-    let shutdown_signal = wait_for_shutdown_signal();
+    let shutdown_signal = wait_for_shutdown_signal()?;
     let auth_settings = AuthSettings::from_args(&args);
 
     tokio::select! {
@@ -5459,6 +5534,8 @@ pub fn public_entry() {
                 scope: "cycles".to_string(),
                 handler: None,
                 limit: 10,
+                class: None,
+                offset: 0,
             }))
             .await;
         let value: Value = serde_json::from_str(&output).expect("follow output JSON");
@@ -5841,9 +5918,36 @@ pub fn public_entry() {
                 obj.insert("universe".to_string(), universe.clone());
             }
         }
+        // Recipes round (E1, MCP parity): the MCP surface now runs the same
+        // `enrich_with_snapshot` pass the CLI applies, so snapshot-joined
+        // fields exist on top of the raw scanner rows. Assert the enrichment
+        // is present, then strip those keys and byte-compare the scanner core.
+        let mut actual = value["literal_matches"].clone();
+        assert!(
+            actual.get("file_context").is_some(),
+            "MCP literal mode must carry snapshot enrichment (file_context): {output}"
+        );
+        assert!(
+            actual["occurrences"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|o| o.get("enclosing_symbol").is_some())),
+            "MCP literal mode must carry per-occurrence enrichment: {output}"
+        );
+        if let Some(obj) = actual.as_object_mut() {
+            obj.remove("file_context");
+        }
+        if let Some(rows) = actual["occurrences"].as_array_mut() {
+            for row in rows {
+                if let Some(o) = row.as_object_mut() {
+                    o.remove("enclosing_facts");
+                    o.remove("enclosing_symbol");
+                    o.remove("resolved_definition");
+                }
+            }
+        }
         assert_eq!(
-            value["literal_matches"], expected_json,
-            "MCP literal_matches must be byte-for-byte identical to the shared scanner output"
+            actual, expected_json,
+            "MCP literal_matches (minus enrichment) must be byte-for-byte identical to the shared scanner output"
         );
     }
 
@@ -6123,6 +6227,8 @@ pub fn public_entry() {
                 scope: "twins".to_string(),
                 handler: None,
                 limit: 10,
+                class: None,
+                offset: 0,
             }))
             .await;
 
@@ -6140,7 +6246,7 @@ pub fn public_entry() {
         assert_eq!(marker["action"], "consolidate into single module");
     }
 
-    /// Regression for loctree-fail hak 2026-05-23 #13 (L9 closure): MCP
+    /// Regression for loctree-feedback hak 2026-05-23 #13 (L9 closure): MCP
     /// `follow(scope='twins')` must include route-level twins (FastAPI /
     /// Flask / Tauri duplicate `(method, path)` registrations) to match
     /// CLI `loct twins` since marbles-L8. Before this fix MCP returned
@@ -6187,6 +6293,8 @@ def transcribe_voice():
                 scope: "twins".to_string(),
                 handler: None,
                 limit: 10,
+                class: None,
+                offset: 0,
             }))
             .await;
 
@@ -6990,7 +7098,7 @@ pub fn page() {
         // surface-area decision; rename or update the assertion deliberately.
         //
         // `suppressions` joined on 2026-05-17 to close the silencer-surface
-        // gap recorded in `~/.vibecrafted/loctree/loctree-fail.md` (existing
+        // gap recorded in `~/internal-artifacts/loctree/loctree-feedback.md` (existing
         // logic under `analyzer/search.rs::search_suppressions` was invisible
         // agent-side; this tool exposes it). Free-tier scope is locked to
         // literal detection. Semantic enrichment is paid-tier Wave 7+.
@@ -7039,7 +7147,7 @@ pub fn page() {
     /// stay literal-only in its public description. If a future change
     /// adds semantic enrichment without an explicit feature-flag boundary,
     /// this test fails loudly. This protects the free-tier promise (see
-    /// `~/.vibecrafted/loctree/loctree-fail.md` 2026-05-17 addendum +
+    /// `~/internal-artifacts/loctree/loctree-feedback.md` 2026-05-17 addendum +
     /// `loctree::analyzer::suppression_inventory` module docs).
     #[test]
     fn suppressions_mcp_tool_description_advertises_literal_only_free_tier() {

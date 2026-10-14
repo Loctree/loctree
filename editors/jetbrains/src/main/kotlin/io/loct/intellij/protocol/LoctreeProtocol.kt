@@ -45,7 +45,7 @@ data class RiskItem(
 
 /** Mirror of `loctree-lsp/src/health.rs::HealthResponse`. */
 data class HealthResponse(
-    @SerializedName("health_score") val healthScore: Int = 0,
+    @SerializedName("health_score") val healthScore: Int? = null,
     @SerializedName("status") val status: String = "",
     @SerializedName("cycles") val cycles: Int = 0,
     @SerializedName("dead_exports") val deadExports: Int = 0,
@@ -55,7 +55,9 @@ data class HealthResponse(
     @SerializedName("snapshot_age_seconds") val snapshotAgeSeconds: Long = 0,
     @SerializedName("top_risks") val topRisks: List<RiskItem> = emptyList(),
     @SerializedName("recommended_actions") val recommendedActions: List<String> = emptyList(),
-)
+) {
+    val healthScoreLabel: String get() = healthScore?.let { "$it/100" } ?: "unknown"
+}
 
 /** Common shape for file-scoped custom requests (find/impact/slice/follow). */
 data class FileQueryParams(

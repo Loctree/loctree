@@ -94,8 +94,8 @@ These are examples of the contract, not universal performance promises.
   do not advertise a globally bounded discovery response unless the receipt proves it.
 
 If Loctree is stale, wrong, noisy, unsupported, or forces a fallback, record a
-reproducible note in the repository's `.loctree/loctree-fail.md` (contributors) or
-append to `~/.vibecrafted/loctree/loctree-fail.md` (external/operator workflow).
+reproducible note in the repository's `.loctree/loctree-feedback.md` (contributors) or
+append to `~/internal-artifacts/loctree/loctree-feedback.md` (external/operator workflow).
 
 Finish orientation with: snapshot/HEAD, scope and coverage, decisive evidence,
 remaining uncertainty, and the next safe command.

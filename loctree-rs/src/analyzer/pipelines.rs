@@ -559,6 +559,7 @@ mod tests {
             awaited,
             payload: None,
             is_dynamic: false,
+            receiver: None,
         }
     }
 
@@ -600,6 +601,7 @@ mod tests {
             generic_type: None,
             payload: None,
             plugin_name: None,
+            unconfirmed_import: false,
         });
 
         // BE file emitting ghost event and handling command
@@ -613,6 +615,7 @@ mod tests {
             generic_type: None,
             payload: None,
             plugin_name: None,
+            unconfirmed_import: false,
         });
 
         // Racy file: invoke before listener and not awaited
@@ -624,6 +627,7 @@ mod tests {
             generic_type: None,
             payload: None,
             plugin_name: None,
+            unconfirmed_import: false,
         });
         racy.event_listens
             .push(mk_event("sample://racy", 10, "listen_literal", false));
@@ -748,6 +752,7 @@ mod tests {
             awaited: false,
             payload: None,
             is_dynamic: false,
+            receiver: None,
         });
 
         let analyses = vec![be];
@@ -788,6 +793,7 @@ mod tests {
             awaited: false,
             payload: None,
             is_dynamic: true,
+            receiver: None,
         });
 
         let mut fe = FileAnalysis::new("src/frontend.ts".into());
@@ -799,6 +805,7 @@ mod tests {
             awaited: false,
             payload: None,
             is_dynamic: true,
+            receiver: None,
         });
 
         let analyses = vec![be, fe];
@@ -864,6 +871,7 @@ mod tests {
             awaited: false,
             payload: None,
             is_dynamic: false,
+            receiver: None,
         });
 
         let analyses = vec![be];

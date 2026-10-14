@@ -59,6 +59,8 @@ fn aggregate_limit_is_global_and_payloads_stay_bounded() {
         r#"
 import { emit, listen } from '@tauri-apps/api/event';
 export function duplicate() { return 1; }
+export function duplicate_two() { return 11; }
+export function duplicate_three() { return 12; }
 export function alpha() { return 2; }
 emit('event-one', {}); listen('event-one', () => {});
 emit('event-two', {}); listen('event-two', () => {});
@@ -70,6 +72,8 @@ emit('event-three', {}); listen('event-three', () => {});
         src.join("b.ts"),
         r#"
 export function duplicate() { return 3; }
+export function duplicate_two() { return 13; }
+export function duplicate_three() { return 14; }
 export function beta() { return 4; }
 export function gamma() { return 5; }
 "#,
@@ -81,18 +85,40 @@ export function gamma() { return 5; }
         cache.path(),
         &["twins", "--limit", "2", "--json", "."],
     );
+    // Round-2 N3 contract: `--limit` spends on the twin families (exact,
+    // then route). Dead parrots sit outside that budget under their own
+    // DEAD_PARROTS_PAGE_CAP, and each barrel list is capped at the limit.
+    let twin_family_returned =
+        array_len(&twins, "/exact_twins") + array_len(&twins, "/route_twins");
+    assert!(
+        twin_family_returned <= 2,
+        "twin families exceeded --limit: {twins}"
+    );
+    assert!(
+        array_len(&twins, "/dead_parrots") <= 10,
+        "dead parrots exceeded their fixed page cap: {twins}"
+    );
+    for barrel_list in [
+        "/barrel_chaos/missing_barrels",
+        "/barrel_chaos/deep_chains",
+        "/barrel_chaos/inconsistent_paths",
+    ] {
+        assert!(
+            array_len(&twins, barrel_list) <= 2,
+            "{barrel_list} exceeded --limit: {twins}"
+        );
+    }
     let twins_returned = array_len(&twins, "/dead_parrots")
         + array_len(&twins, "/exact_twins")
         + array_len(&twins, "/route_twins")
         + array_len(&twins, "/barrel_chaos/missing_barrels")
         + array_len(&twins, "/barrel_chaos/deep_chains")
         + array_len(&twins, "/barrel_chaos/inconsistent_paths");
-    assert!(twins_returned <= 2, "twins exceeded global limit: {twins}");
     assert_eq!(twins["page"]["semantics"], "global");
     assert_eq!(twins["page"]["returned"], twins_returned);
     assert!(
-        twins["page"]["total"].as_u64().unwrap_or(0) > 2,
-        "fixture must exercise truncation: {twins}"
+        twins["page"]["total"].as_u64().unwrap_or(0) as usize > twins_returned,
+        "fixture must exercise twin-family truncation: {twins}"
     );
     assert_eq!(twins["page"]["has_more"], true);
     assert!(

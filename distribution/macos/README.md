@@ -30,3 +30,20 @@ make smoke-release-macos-arm64 SMOKE_BIN_DIR=/path/to/staged/bin
 Apple references:
 
 - Signing Mac Software with Developer ID
+
+## Maintainer notarization profile
+
+Local notarization uses a stored `notarytool` keychain profile. Export the
+Apple ID, team ID and app-specific password from your secret store first (never
+commit them), then store the profile once per machine:
+
+```bash
+xcrun notarytool store-credentials "${NOTARY_PROFILE:-vc-notary}" \
+  --apple-id "$NOTARY_APPLE_ID" \
+  --team-id "$NOTARY_TEAM_ID" \
+  --password "$NOTARY_PASSWORD"
+```
+
+CI does not use this profile: `distribution/macos/sign-and-notarize.sh` signs
+in with the App Store Connect API key (`APPLE_API_KEY_BASE64`,
+`APPLE_API_KEY_ID`, `APPLE_API_ISSUER_ID`).

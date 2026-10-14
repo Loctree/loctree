@@ -15,6 +15,9 @@ use crate::snapshot::{
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
 
 use super::super::DispatchResult;
+use super::context::atlas::{
+    CONTEXT_ATLAS_RUNS_DIR, TASK_ATLAS_KEEP_LAST, atlas_dir_for_project, prune_project_task_atlases,
+};
 use super::resource_limits::{
     CACHE_ENUM_TIME_CEILING, DirSizeSample, EnumerationBudget, MAX_LIST_ROWS,
     MAX_SNAPSHOT_METADATA_PARSE_BYTES, MAX_WALK_ENTRIES_PER_BUCKET, SnapshotMetadataRead,
@@ -423,7 +426,8 @@ fn handle_clean(
     // an unknown/empty selector cannot report "Nothing to clean" (exit 0) or
     // fall through to cwd.
     if let Some(proj) = project {
-        return handle_clean_project(proj, &projects_dir, force);
+        // `--project` is one checkout. Do not scan other `.loctree` trees.
+        return handle_clean_project(proj, &projects_dir, all, force);
     }
 
     if !projects_dir.exists() {
@@ -592,7 +596,12 @@ fn format_unknown_project_refusal(requested: &Path, known_buckets: &[String]) ->
     msg
 }
 
-fn handle_clean_project(proj: &Path, projects_dir: &Path, force: bool) -> DispatchResult {
+fn handle_clean_project(
+    proj: &Path,
+    projects_dir: &Path,
+    all: bool,
+    force: bool,
+) -> DispatchResult {
     if is_blank_project_selector(proj) {
         eprintln!(
             "Refusing empty --project. Pass an explicit project directory; an empty string is not cwd."
@@ -607,7 +616,10 @@ fn handle_clean_project(proj: &Path, projects_dir: &Path, force: bool) -> Dispat
         proj.to_path_buf()
     };
     let cache_dir = project_cache_dir(&proj_path);
-    if !cache_dir.exists() {
+    let cache_exists = cache_dir.exists();
+    let atlas_runs = atlas_dir_for_project(&proj_path).join(CONTEXT_ATLAS_RUNS_DIR);
+    let atlas_runs_exist = atlas_runs.is_dir();
+    if !cache_exists && !atlas_runs_exist {
         eprintln!(
             "{}",
             format_unknown_project_refusal(&proj_path, &known_cache_bucket_ids(projects_dir))
@@ -616,36 +628,79 @@ fn handle_clean_project(proj: &Path, projects_dir: &Path, force: bool) -> Dispat
     }
     // Hold the same exclusive lock Snapshot::save/load use so a concurrent
     // writer cannot mutate the bucket between measurement and deletion.
-    let _cache_lock = match try_acquire_snapshot_cache_lock(&proj_path) {
-        Ok(lock) => lock,
-        Err(err) => {
-            eprintln!(
-                "Cannot safely clean cache for {}: {}. No cache entries were removed.",
-                proj_path.display(),
-                err
-            );
-            return DispatchResult::Exit(2);
+    let _cache_lock = if cache_exists {
+        match try_acquire_snapshot_cache_lock(&proj_path) {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                eprintln!(
+                    "Cannot safely clean cache for {}: {}. No cache entries were removed.",
+                    proj_path.display(),
+                    err
+                );
+                return DispatchResult::Exit(2);
+            }
         }
+    } else {
+        None
     };
-    let size = dir_size(&cache_dir);
+    let task_keep = if all { 0 } else { TASK_ATLAS_KEEP_LAST };
     if !force {
-        eprintln!(
-            "Will remove cache for {} ({}).",
-            proj_path.display(),
-            format_size_sample(size)
-        );
+        if cache_exists {
+            let size = dir_size(&cache_dir);
+            eprintln!(
+                "Will remove cache for {} ({}).",
+                proj_path.display(),
+                format_size_sample(size)
+            );
+        }
+        if atlas_runs_exist {
+            if all {
+                eprintln!(
+                    "Will remove every context-atlas task run under {} (project and scope atlases stay).",
+                    atlas_runs.display()
+                );
+            } else {
+                eprintln!(
+                    "Will keep the newest {task_keep} context-atlas task runs under {} (project and scope atlases stay).",
+                    atlas_runs.display()
+                );
+            }
+        }
         eprintln!("Use --force to skip this confirmation.");
         return DispatchResult::Exit(1);
     }
-    if let Err(err) = fs::remove_dir_all(&cache_dir) {
-        eprintln!("Failed to remove {}: {}", cache_dir.display(), err);
-        return DispatchResult::Exit(1);
+    if cache_exists {
+        let size = dir_size(&cache_dir);
+        if let Err(err) = fs::remove_dir_all(&cache_dir) {
+            eprintln!("Failed to remove {}: {}", cache_dir.display(), err);
+            return DispatchResult::Exit(1);
+        }
+        println!(
+            "Removed cache for {} ({})",
+            proj_path.display(),
+            format_size_sample(size)
+        );
     }
-    println!(
-        "Removed cache for {} ({})",
-        proj_path.display(),
-        format_size_sample(size)
-    );
+    if atlas_runs_exist {
+        if let Err(err) = prune_project_task_atlases(&proj_path, task_keep) {
+            eprintln!(
+                "Failed to prune context-atlas task runs for {}: {err}.",
+                proj_path.display()
+            );
+            return DispatchResult::Exit(1);
+        }
+        if all {
+            println!(
+                "Removed context-atlas task runs for {} (project and scope atlases kept).",
+                proj_path.display()
+            );
+        } else {
+            println!(
+                "Pruned context-atlas task runs for {} to the newest {task_keep}.",
+                proj_path.display()
+            );
+        }
+    }
     DispatchResult::Exit(0)
 }
 
@@ -1119,7 +1174,7 @@ fn parse_duration_days(s: &str) -> Option<u64> {
 /// is stripped; case is folded.
 ///
 /// Source hak: 2026-05-23 div0 system-cleanup (~16.6 GB cache without
-/// retention policy; operator could not free disk). See loctree-fail.md.
+/// retention policy; operator could not free disk). See loctree-feedback.md.
 fn parse_size_budget(s: &str) -> Option<u64> {
     let trimmed: String = s.chars().filter(|c| !c.is_whitespace()).collect();
     if trimmed.is_empty() {
@@ -1850,6 +1905,177 @@ mod tests {
         assert!(
             bucket.exists(),
             "preview without --force must not delete the addressed bucket"
+        );
+    }
+
+    /// `--project` trims that checkout's `task-*` atlas runs (or removes them
+    /// all with `--all`) and leaves `project` / `scope-*` plus the flat mirror.
+    /// A global clean does not walk `.loctree` trees.
+    #[test]
+    #[serial_test::serial]
+    fn cache_clean_project_trims_task_atlases_and_spares_other_checkouts() {
+        let (_cache_dir, _guard) = crate::snapshot::test_env::isolated_cache();
+
+        fn seed(project: &std::path::Path) {
+            let atlas = atlas_dir_for_project(project);
+            fs::create_dir_all(&atlas).expect("atlas root");
+            let runs = atlas.join(CONTEXT_ATLAS_RUNS_DIR);
+            fs::write(atlas.join("00-core-map.md"), b"FLAT_MIRROR_KEEP").expect("flat card");
+            let rows = [
+                ("project", "project", "2026-06-01T00:00:00.000000Z"),
+                ("scope-kept", "scope", "2026-06-02T00:00:00.000000Z"),
+                (
+                    "legacy-kept",
+                    "legacy_unknown_scope",
+                    "2026-06-03T00:00:00.000000Z",
+                ),
+                ("task-0001", "task", "2026-07-01T00:00:01.000000Z"),
+                ("task-0002", "task", "2026-07-01T00:00:02.000000Z"),
+                ("task-0003", "task", "2026-07-01T00:00:03.000000Z"),
+                ("task-0004", "task", "2026-07-01T00:00:04.000000Z"),
+                ("task-0005", "task", "2026-07-01T00:00:05.000000Z"),
+            ];
+            let mut refs = Vec::new();
+            for (id, kind, generated_at) in rows {
+                let dir = runs.join(id);
+                fs::create_dir_all(&dir).expect("run dir");
+                fs::write(dir.join("marker.txt"), id.as_bytes()).expect("marker");
+                refs.push(serde_json::json!({
+                    "identity": { "atlas_id": id, "kind": kind },
+                    "snapshot": "test@abc",
+                    "generated_at": generated_at,
+                    "atlas_dir": dir.display().to_string(),
+                    "manifest": dir.join("manifest.md").display().to_string(),
+                    "manifest_json": dir.join("manifest.json").display().to_string(),
+                }));
+            }
+            let manifest_json = atlas.join("manifest.json");
+            let manifest_md = atlas.join("manifest.md");
+            let body = serde_json::json!({
+                "protocol": "loctree.context_atlas.v1",
+                "status": "atlas_ready",
+                "project": project.display().to_string(),
+                "snapshot": "test@abc",
+                "generated_at": "2026-07-01T00:00:05.000000Z",
+                "atlas_dir": atlas.display().to_string(),
+                "manifest": manifest_md.display().to_string(),
+                "manifest_json": manifest_json.display().to_string(),
+                "recommended_start": atlas.join("00-core-map.md").display().to_string(),
+                "identity": { "atlas_id": "project", "kind": "project" },
+                "atlases": refs,
+                "cards": [],
+                "message": "test",
+            });
+            fs::write(
+                &manifest_json,
+                serde_json::to_string_pretty(&body).expect("manifest json"),
+            )
+            .expect("write manifest");
+        }
+
+        fn task_names(project: &std::path::Path) -> Vec<String> {
+            let runs = atlas_dir_for_project(project).join(CONTEXT_ATLAS_RUNS_DIR);
+            let mut names: Vec<String> = fs::read_dir(&runs)
+                .expect("runs")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| name.starts_with("task-"))
+                .collect();
+            names.sort();
+            names
+        }
+
+        let project = TempDir::new().expect("project");
+        let other = TempDir::new().expect("other checkout");
+        seed(project.path());
+        seed(other.path());
+        let bucket = project_cache_dir(project.path());
+        fs::create_dir_all(&bucket).expect("bucket");
+        fs::write(bucket.join("payload"), b"cache").expect("payload");
+
+        assert_exit(handle_clean(true, None, None, None, true), 0);
+        assert!(!bucket.exists(), "global --all removes snapshot buckets");
+        assert_eq!(
+            task_names(project.path()),
+            vec![
+                "task-0001".to_string(),
+                "task-0002".to_string(),
+                "task-0003".to_string(),
+                "task-0004".to_string(),
+                "task-0005".to_string(),
+            ],
+            "global --all must not scan repo-local context-atlas runs"
+        );
+        assert_eq!(task_names(other.path()).len(), 5);
+
+        fs::create_dir_all(&bucket).expect("recreate bucket");
+        fs::write(bucket.join("payload"), b"cache").expect("payload");
+        assert_exit(
+            handle_clean(false, Some(project.path()), None, None, true),
+            0,
+        );
+        assert!(
+            !bucket.exists(),
+            "project clean still removes the snapshot bucket"
+        );
+        assert_eq!(
+            task_names(project.path()),
+            vec![
+                "task-0003".to_string(),
+                "task-0004".to_string(),
+                "task-0005".to_string(),
+            ]
+        );
+        let runs = atlas_dir_for_project(project.path()).join(CONTEXT_ATLAS_RUNS_DIR);
+        assert!(runs.join("project").is_dir());
+        assert!(runs.join("scope-kept").is_dir());
+        assert!(runs.join("legacy-kept").is_dir());
+        assert_eq!(
+            fs::read_to_string(atlas_dir_for_project(project.path()).join("00-core-map.md"))
+                .expect("flat card"),
+            "FLAT_MIRROR_KEEP"
+        );
+        let catalog: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(atlas_dir_for_project(project.path()).join("manifest.json"))
+                .expect("catalog"),
+        )
+        .expect("catalog json");
+        for atlas in catalog["atlases"].as_array().expect("atlases") {
+            let id = atlas["identity"]["atlas_id"].as_str().expect("atlas id");
+            assert!(
+                runs.join(id).is_dir(),
+                "catalog must not name removed run {id}"
+            );
+        }
+        assert_eq!(
+            task_names(other.path()).len(),
+            5,
+            "other checkout stays intact"
+        );
+
+        let wiped = TempDir::new().expect("all-flag project");
+        seed(wiped.path());
+        let wiped_bucket = project_cache_dir(wiped.path());
+        fs::create_dir_all(&wiped_bucket).expect("wiped bucket");
+        fs::write(wiped_bucket.join("payload"), b"cache").expect("payload");
+        assert_exit(handle_clean(true, Some(wiped.path()), None, None, true), 0);
+        assert!(
+            task_names(wiped.path()).is_empty(),
+            "--all removes every task run"
+        );
+        let wiped_runs = atlas_dir_for_project(wiped.path()).join(CONTEXT_ATLAS_RUNS_DIR);
+        assert!(wiped_runs.join("project").is_dir());
+        assert!(wiped_runs.join("scope-kept").is_dir());
+        assert!(wiped_runs.join("legacy-kept").is_dir());
+        assert_eq!(
+            fs::read_to_string(atlas_dir_for_project(wiped.path()).join("00-core-map.md"))
+                .expect("flat card"),
+            "FLAT_MIRROR_KEEP"
         );
     }
 }

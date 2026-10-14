@@ -4,7 +4,7 @@ Leptos SSR renderer for generating static HTML reports from code analysis data.
 
 [![Crates.io](https://img.shields.io/crates/v/report-leptos.svg)](https://crates.io/crates/report-leptos)
 [![Documentation](https://docs.rs/report-leptos/badge.svg)](https://docs.rs/report-leptos)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
 
 ## Overview
 
@@ -237,7 +237,8 @@ Contributions welcome! Please read [CONTRIBUTING.md](../CONTRIBUTING.md) first.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+Business Source License 1.1 (BUSL-1.1), converting to Apache License 2.0 on
+2030-04-13 — see [LICENSE](LICENSE) for the parameters.
 
 ---
 

@@ -15,6 +15,13 @@ import org.junit.Test
 class AgentBriefTest {
 
     @Test
+    fun healthBriefDoesNotInventAScoreForAnEmptySnapshot() {
+        val brief = AgentBrief.fromHealth(HealthResponse(healthScore = null, status = "unknown"))
+        assertTrue(brief.contains("**unknown**"))
+        assertTrue(!brief.contains("null/100") && !brief.contains("0/100"))
+    }
+
+    @Test
     fun projectedBriefIncludesPathsForSwiftAndTs() {
         val page = JsonParser.parseString(
             """

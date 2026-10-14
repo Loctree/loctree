@@ -23,7 +23,7 @@ use super::for_ai::{
     find_hub_files,
 };
 use super::graph::{MAX_GRAPH_EDGES, MAX_GRAPH_NODES, build_graph_data};
-use super::health_inputs::structural_defects;
+use super::health_inputs::{canonical_exact_twins, structural_defects};
 use super::health_score::calculate_health_score;
 use super::html::render_html_report;
 use super::insights::collect_ai_insights;
@@ -33,7 +33,7 @@ use super::report::{
 };
 use super::root_scan::{RootContext, normalize_module_id};
 use super::scan::resolve_event_constants_across_files;
-use super::twins::{detect_exact_twins, find_dead_parrots};
+use super::twins::find_dead_parrots;
 use super::{DupSeverity, RankedDup};
 
 fn build_tree(analyses: &[FileAnalysis], root_path: &std::path::Path) -> Vec<TreeNode> {
@@ -224,6 +224,13 @@ fn build_cycle_edges(
 
     let mut edges = Vec::new();
     for analysis in analyses {
+        // #[cfg(test)]-only files (fixture loaders, a test module's own
+        // `include_str!` self-reference, …) are not production coupling —
+        // including their edges here manufactures cycles that only exist
+        // inside a test binary and never in the shipped module graph (F5).
+        if analysis.is_test {
+            continue;
+        }
         for imp in &analysis.imports {
             if let Some(target) = &imp.resolved_path {
                 let kind = if imp.is_mod_declaration {
@@ -916,6 +923,7 @@ pub fn process_root_context(
             .collect(),
         semantic_facts: None,
         symbol_graph: None,
+        scan_diagnostics: None,
     };
 
     // Run twins analysis (dead parrots, exact twins, barrel chaos)
@@ -924,8 +932,15 @@ pub fn process_root_context(
         // Note: include_tests=false for production reports
         let twins_result = find_dead_parrots(&analyses, true, false);
 
-        // Detect exact twins (same symbol exported from multiple files)
-        let exact_twins = detect_exact_twins(&analyses, false);
+        // Detect exact twins (same symbol exported from multiple files).
+        // F6: converged onto `canonical_exact_twins` (the same computation
+        // `findings.rs`/`health_inputs.rs` use) instead of a bare
+        // `detect_exact_twins` call. This root-scoped `structural_snapshot`
+        // has no semantic facts yet at this stage of the pipeline (built
+        // with `semantic_facts: None` a few lines above), so passing `None`
+        // here is not a behavior change — it degrades to exactly the same
+        // raw result this call already produced.
+        let exact_twins = canonical_exact_twins(&analyses, None, false);
 
         // Analyze barrel chaos (missing barrels, deep chains, inconsistent paths)
         let barrel_analysis = analyze_barrel_chaos(&structural_snapshot);
@@ -1517,6 +1532,7 @@ Top duplicate exports (showing {} actionable, {} cross-lang silenced):",
                 barrels: Vec::new(),
                 semantic_facts: None,
                 symbol_graph: None,
+                scan_diagnostics: None,
             };
 
             find_coverage_gaps(&snapshot)
@@ -1713,9 +1729,44 @@ pub fn write_report(
 
 #[cfg(test)]
 mod tests {
+    use super::build_cycle_edges;
     use super::build_tree;
-    use crate::types::FileAnalysis;
+    use crate::types::{FileAnalysis, ImportEntry, ImportKind};
     use std::path::Path;
+
+    /// F5 — a cycle formed only by `#[cfg(test)]`-only files (a fixture
+    /// loader, a test module's own `include_str!` self-reference, …) must
+    /// not surface any cycle-detection edges. `build_cycle_edges`'s fallback
+    /// path (used when graph collection is off) had no `is_test` filter, so
+    /// two test-only files that import each other counted as a real cycle.
+    #[test]
+    fn build_cycle_edges_ignores_test_only_files() {
+        let mut import_to_b = ImportEntry::new("./b".to_string(), ImportKind::Static);
+        import_to_b.resolved_path = Some("tests/fixtures/b.rs".to_string());
+        let test_a = FileAnalysis {
+            path: "tests/fixtures/a.rs".to_string(),
+            is_test: true,
+            imports: vec![import_to_b],
+            ..Default::default()
+        };
+
+        let mut import_to_a = ImportEntry::new("./a".to_string(), ImportKind::Static);
+        import_to_a.resolved_path = Some("tests/fixtures/a.rs".to_string());
+        let test_b = FileAnalysis {
+            path: "tests/fixtures/b.rs".to_string(),
+            is_test: true,
+            imports: vec![import_to_a],
+            ..Default::default()
+        };
+
+        let edges = build_cycle_edges(&[], &[test_a, test_b]);
+
+        assert!(
+            edges.is_empty(),
+            "a cycle formed only by #[cfg(test)]-only files must not surface \
+             any cycle-detection edges"
+        );
+    }
 
     #[test]
     fn build_tree_aggregates_loc_and_hierarchy() {

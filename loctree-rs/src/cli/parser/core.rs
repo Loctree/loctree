@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn test_version_after_subcommand_is_literal_query_not_version() {
-        // Regression for 2026-06-20 loctree-fail: `loct find --literal --version`
+        // Regression for 2026-06-20 loctree-feedback: `loct find --literal --version`
         // printed loct's OWN version instead of searching for the literal string
         // "--version". `--version` is global only BEFORE a subcommand.
         let args = vec!["find".into(), "--literal".into(), "--version".into()];
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_double_dash_terminator_carries_flaglike_literal() {
-        // The POSIX `--` workaround documented in loctree-fail must actually work
+        // The POSIX `--` workaround documented in loctree-feedback must actually work
         // end-to-end through the global parser: `loct find --literal -- --version`.
         let args = vec![
             "find".into(),

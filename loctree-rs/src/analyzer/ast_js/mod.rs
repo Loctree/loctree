@@ -178,6 +178,42 @@ pub(crate) fn analyze_js_file_ast(
 
     visitor.visit_program(&ret.program);
 
+    // N06 (audit): import evidence pass. A file importing any @tauri-apps
+    // API (or the legacy `tauri` module) confirms its wrapper-shaped command
+    // calls; without that import, a `*Command*`-named wrapper stays an
+    // unconfirmed smell, and member-call events on receivers that are not a
+    // Tauri surface (e.g. `server.listen("http")`) are not events at all.
+    let has_tauri_import = visitor.analysis.imports.iter().any(|imp| {
+        imp.source_raw.contains("@tauri-apps/")
+            || imp.source_raw == "tauri"
+            || imp.source_raw.starts_with("tauri/")
+    });
+    if has_tauri_import {
+        for call in &mut visitor.analysis.command_calls {
+            call.unconfirmed_import = false;
+        }
+    } else {
+        const TAURI_EVENT_RECEIVERS: &[&str] = &[
+            "appWindow",
+            "window",
+            "webview",
+            "webviewWindow",
+            "app",
+            "event",
+        ];
+        let keep = |event: &crate::types::EventRef| match event.receiver.as_deref() {
+            Some(receiver) => TAURI_EVENT_RECEIVERS.contains(&receiver),
+            None => true,
+        };
+        // Only LISTENS are gated by receiver: `server.listen("http")` is the
+        // audit's counterexample and has no other guard. Member-call EMITS
+        // stay detected — vendored/minified noise like `e.emit("...")` is
+        // the artifact fence's job to demote WITH accounting ("excluded:
+        // vendored(...)"), and a silent detection-time drop would erase that
+        // accounting (see e2e_cli::events_fences_minified_vendor_bridges).
+        visitor.analysis.event_listens.retain(keep);
+    }
+
     if is_svelte_file || is_svelte_rune_module {
         add_svelte_rune_exports(&mut visitor.analysis, content_to_parse);
     }
@@ -431,6 +467,27 @@ impl<'a> Visit<'a> for JsVisitor<'a> {
                     self.push_string_literal(cooked, tpl.span);
                 } else if tpl.expressions.is_empty() && tpl.quasis.len() == 1 {
                     self.push_string_literal(&tpl.quasis[0].value.raw, tpl.span);
+                } else if !tpl.expressions.is_empty() {
+                    // H3(b): a template literal WITH interpolations (e.g.
+                    // `/api/manual-analyze/${markerId}`) used to vanish entirely
+                    // from string_literals because only the empty-expressions
+                    // branch above ever recorded anything. Record a
+                    // pattern-form literal instead — each `${...}` collapsed to
+                    // `*` — so route-shaped dynamic literals stay visible to
+                    // downstream consumers (e.g. route/endpoint detection).
+                    // NOTE: `StringLiteral` (types.rs) has no `is_dynamic` flag
+                    // and types.rs is outside this executor's edit surface, so
+                    // the pattern form is recorded via the plain `value` field;
+                    // flagged for the integrator in case a dedicated marker is
+                    // wanted later.
+                    let mut pattern = String::new();
+                    for (i, quasi) in tpl.quasis.iter().enumerate() {
+                        pattern.push_str(&quasi.value.raw);
+                        if i < tpl.expressions.len() {
+                            pattern.push('*');
+                        }
+                    }
+                    self.push_string_literal(&pattern, tpl.span);
                 }
             }
             Expression::NewExpression(new_expr) => {
@@ -1221,6 +1278,38 @@ export default class HeroSection {}
         assert_eq!(
             stem_anchor, 1,
             "Synthetic stem-named export should be pushed exactly once"
+        );
+    }
+
+    /// H3(b) RED: a template literal WITH interpolations must still surface
+    /// as a (pattern-form) string literal instead of vanishing entirely.
+    #[test]
+    fn test_dynamic_template_literal_recorded_as_pattern() {
+        let content = r#"
+            const url = `/api/manual-analyze/${markerId}`;
+        "#;
+
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/api.ts"),
+            Path::new("src"),
+            None,
+            None,
+            "api.ts".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+
+        assert!(
+            analysis
+                .string_literals
+                .iter()
+                .any(|lit| lit.value == "/api/manual-analyze/*"),
+            "dynamic template literal should be recorded in pattern form, found: {:?}",
+            analysis
+                .string_literals
+                .iter()
+                .map(|l| &l.value)
+                .collect::<Vec<_>>()
         );
     }
 

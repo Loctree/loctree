@@ -36,7 +36,7 @@ impl RuntimeSemanticAnalyzer for MakeSemantics {
             let phony = parse_phony_directives(&content);
 
             self.classify_exports(file, &phony, registry, out);
-            self.emit_recipe_shell_markers(file, &content, out);
+            self.emit_recipe_shell_markers(file, &content, files, out);
         }
 
         Ok(())
@@ -63,7 +63,7 @@ impl MakeSemantics {
             let phony = parse_phony_directives(&content);
 
             self.classify_exports(file, &phony, registry, out);
-            self.emit_recipe_shell_markers(file, &content, out);
+            self.emit_recipe_shell_markers(file, &content, files, out);
         }
 
         Ok(())
@@ -163,16 +163,71 @@ impl MakeSemantics {
         &self,
         file: &FileAnalysis,
         content: &str,
+        files: &[FileAnalysis],
         out: &mut SemanticFacts,
     ) {
         for (_target, line_no, called_symbol) in extract_recipe_shell_calls(content) {
+            let handler_file = resolve_called_symbol_handler_file(&called_symbol, file, files);
             out.dispatch_edges.push(DispatchEdge {
                 from_file: file.path.clone(),
                 from_line: line_no as u32,
                 dispatch_kind: DispatchKind::RecipeShellCall,
                 handler_symbol: called_symbol,
-                handler_file: None,
+                handler_file,
             });
+        }
+    }
+}
+
+/// H8: resolve a recipe's shell-called symbol against the repo tree so
+/// `handler_file` stops being hardcoded `None`. `called_symbol` is already
+/// basename-only by the time it reaches here (`first_command_symbol` strips
+/// any directory prefix via `rsplit('/')`), so resolution works by matching
+/// that basename against the known corpus file list (`files` - the same
+/// slice `analyze`/`analyze_with_root` already received; never touches the
+/// filesystem, since `called_symbol` is untrusted text extracted from a
+/// recipe body, not a sensor-provided path):
+///
+/// 1. Exact, UNIQUE basename match anywhere in the corpus wins outright.
+/// 2. On an ambiguous basename (two+ files share it), narrow to matches
+///    that live under a conventional script directory (`scripts/`,
+///    `tools/`, `bin/`) or under the calling Makefile's own directory; only
+///    resolve if that narrows it to exactly one. An unresolved ambiguity
+///    stays `None` — a wrong guess is worse than no answer.
+fn resolve_called_symbol_handler_file(
+    called_symbol: &str,
+    makefile: &FileAnalysis,
+    files: &[FileAnalysis],
+) -> Option<String> {
+    if called_symbol.is_empty() {
+        return None;
+    }
+
+    let basename_matches: Vec<&str> = files
+        .iter()
+        .filter(|f| Path::new(&f.path).file_name().and_then(|n| n.to_str()) == Some(called_symbol))
+        .map(|f| f.path.as_str())
+        .collect();
+
+    match basename_matches.len() {
+        0 => None,
+        1 => Some(basename_matches[0].to_string()),
+        _ => {
+            let makefile_dir = Path::new(&makefile.path).parent();
+            let scoped: Vec<&str> = basename_matches
+                .iter()
+                .filter(|p| {
+                    ["scripts/", "tools/", "bin/"]
+                        .iter()
+                        .any(|dir| p.contains(dir))
+                        || makefile_dir.is_some_and(|d| Path::new(p).starts_with(d))
+                })
+                .copied()
+                .collect();
+            match scoped.len() {
+                1 => Some(scoped[0].to_string()),
+                _ => None,
+            }
         }
     }
 }
@@ -624,6 +679,85 @@ build:
         );
         assert!(symbols.contains("_internal_compile.sh"));
         assert!(symbols.contains("info"));
+    }
+
+    /// H8 RED: a recipe calling `tools/gen.py` (present elsewhere in the
+    /// scanned corpus) must resolve `handler_file` instead of the old
+    /// hardcoded `None` — `tools/gen.py` exists in the fixture as a plain
+    /// `FileAnalysis`, uniquely matching the basename-only `called_symbol`
+    /// (`first_command_symbol` already strips the directory prefix).
+    #[test]
+    fn recipe_shell_calls_resolve_handler_file_via_unique_basename() {
+        let content = r#"
+gen:
+	@tools/gen.py --flag
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let makefile_path = tmp.path().join("Makefile");
+        std::fs::write(&makefile_path, content).expect("write makefile");
+        let makefile_path_str = makefile_path.to_string_lossy().to_string();
+
+        let mut makefile = analyze_makefile(content, makefile_path_str);
+        makefile.language = LANG_STR.into();
+
+        let gen_py = FileAnalysis::new("tools/gen.py".to_string());
+
+        let registry = IdiomRegistry::load_defaults().expect("defaults");
+        let mut facts = SemanticFacts::default();
+        MakeSemantics
+            .analyze(&[makefile, gen_py], &registry, &mut facts)
+            .expect("analyze");
+
+        let edge = facts
+            .dispatch_edges
+            .iter()
+            .find(|e| e.handler_symbol == "gen.py")
+            .expect("gen.py dispatch edge present");
+        assert_eq!(
+            edge.handler_file.as_deref(),
+            Some("tools/gen.py"),
+            "handler_file must resolve to the unique basename match, got: {:?}",
+            edge.handler_file
+        );
+    }
+
+    /// Guard: an ambiguous basename (two files sharing a name, neither
+    /// scoped to a conventional script dir or the Makefile's own directory)
+    /// must NOT guess — `handler_file` stays `None` rather than pointing at
+    /// the wrong file.
+    #[test]
+    fn recipe_shell_calls_leave_handler_file_none_on_ambiguous_basename() {
+        let content = r#"
+gen:
+	@gen.py --flag
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let makefile_path = tmp.path().join("Makefile");
+        std::fs::write(&makefile_path, content).expect("write makefile");
+        let makefile_path_str = makefile_path.to_string_lossy().to_string();
+
+        let mut makefile = analyze_makefile(content, makefile_path_str);
+        makefile.language = LANG_STR.into();
+
+        let gen_py_a = FileAnalysis::new("services/a/gen.py".to_string());
+        let gen_py_b = FileAnalysis::new("services/b/gen.py".to_string());
+
+        let registry = IdiomRegistry::load_defaults().expect("defaults");
+        let mut facts = SemanticFacts::default();
+        MakeSemantics
+            .analyze(&[makefile, gen_py_a, gen_py_b], &registry, &mut facts)
+            .expect("analyze");
+
+        let edge = facts
+            .dispatch_edges
+            .iter()
+            .find(|e| e.handler_symbol == "gen.py")
+            .expect("gen.py dispatch edge present");
+        assert_eq!(
+            edge.handler_file, None,
+            "ambiguous basename must not be guessed at, got: {:?}",
+            edge.handler_file
+        );
     }
 
     #[test]

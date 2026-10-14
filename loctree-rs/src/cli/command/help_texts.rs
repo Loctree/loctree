@@ -399,7 +399,7 @@ OPTIONS:
     --group-by-file      In literal mode, include a per-file rollup
     --count-only, --slim In literal mode, return counters without occurrences
     --compact            In literal mode, terse path:line human output
-    --include-untracked  Scan git-untracked sources in-memory (no full rescan)
+    --include-untracked  Literal/regex only: scan git-untracked sources in-memory
     --offset <N>         In literal mode, zero-based page offset
     --root <PATH>        Project root to scan (default: current directory)
     --project <PATH>     Alias for --root (parity with context --project)

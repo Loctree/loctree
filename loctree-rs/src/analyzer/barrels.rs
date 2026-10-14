@@ -260,45 +260,149 @@ fn trace_reexport_chain(
     chain
 }
 
+/// True for names that look like a real identifier — guards against parser
+/// artifacts (`*`, `}`, empty strings from a namespace/brace import that
+/// failed to parse cleanly) surfacing as an "inconsistent import" symbol.
+fn is_identifier_like(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+        }
+        _ => false,
+    }
+}
+
 /// Detect symbols imported via inconsistent paths
 ///
-/// Groups imports by symbol name, finds symbols imported from multiple paths,
-/// marks most-used path as canonical.
+/// Groups imports by (symbol name, resolved definition identity) — NOT by
+/// bare name alone. A bare-name grouping merges unrelated symbols that only
+/// happen to share a name (`std::process::Command` and `crate::cli::Command`
+/// both surface as "Command"); keying by the resolved definition path (when
+/// the import graph resolved one, else the raw source string itself, which
+/// is then its own identity) keeps them apart while still collapsing
+/// textually different paths that resolve to the SAME definition — the
+/// actual "inconsistent path" signal. Canonical selection then prefers the
+/// definition site (a source whose resolved target is not a re-exporting
+/// barrel) over raw import-count majority, so a widely-imported barrel
+/// re-export never outranks the file that actually defines the symbol.
 fn detect_inconsistent_paths(snapshot: &Snapshot) -> Vec<InconsistentImport> {
-    // Map: symbol -> map of (source_path -> import_count)
-    let mut symbol_sources: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    // Group key: (symbol name, definition identity). Inner map: raw source
+    // string -> import count.
+    let mut symbol_sources: HashMap<(String, String), HashMap<String, usize>> = HashMap::new();
+    // Per group, the resolved target file for each raw source (when known)
+    // — used only to prefer a non-barrel canonical over raw majority.
+    let mut source_targets: HashMap<(String, String), HashMap<String, Option<String>>> =
+        HashMap::new();
+
+    // N11 (audit): the definition identity must be the symbol's ORIGIN, not
+    // the direct import target. Keying on `resolved_path` alone split the
+    // barrel spelling and the definition spelling of the SAME symbol into
+    // two one-source groups, hiding exactly the inconsistency this pass
+    // exists to report. Follow named (and star) reexports from a barrel to
+    // the file that actually defines the symbol before grouping.
+    let mut reexport_origin: HashMap<(String, String), String> = HashMap::new();
+    for file in &snapshot.files {
+        for reexport in &file.reexports {
+            let Some(resolved) = &reexport.resolved else {
+                continue;
+            };
+            match &reexport.kind {
+                crate::types::ReexportKind::Named(pairs) => {
+                    for (_original, exported) in pairs {
+                        reexport_origin
+                            .insert((file.path.clone(), exported.clone()), resolved.clone());
+                    }
+                }
+                crate::types::ReexportKind::Star => {
+                    reexport_origin.insert((file.path.clone(), "*".to_string()), resolved.clone());
+                }
+            }
+        }
+    }
+    let follow_origin = |start: &str, name: &str| -> String {
+        let mut current = start.to_string();
+        for _ in 0..16 {
+            let next = reexport_origin
+                .get(&(current.clone(), name.to_string()))
+                .or_else(|| reexport_origin.get(&(current.clone(), "*".to_string())));
+            match next {
+                Some(next) if *next != current => current = next.clone(),
+                _ => break,
+            }
+        }
+        current
+    };
 
     for file in &snapshot.files {
         for import in &file.imports {
             for symbol in &import.symbols {
                 let symbol_name = symbol.alias.as_ref().unwrap_or(&symbol.name);
+                if !is_identifier_like(symbol_name) {
+                    continue;
+                }
+
+                let definition_key = import
+                    .resolved_path
+                    .as_deref()
+                    .map(|path| follow_origin(path, &symbol.name))
+                    .unwrap_or_else(|| import.source.clone());
+                let group_key = (symbol_name.clone(), definition_key);
 
                 symbol_sources
-                    .entry(symbol_name.clone())
+                    .entry(group_key.clone())
                     .or_default()
                     .entry(import.source.clone())
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
+                source_targets
+                    .entry(group_key)
+                    .or_default()
+                    .entry(import.source.clone())
+                    .or_insert_with(|| import.resolved_path.clone());
             }
         }
     }
 
     let mut inconsistent = Vec::new();
 
-    for (symbol, sources) in symbol_sources {
-        // Skip if symbol only imported from one path
+    for ((symbol, definition_key), sources) in symbol_sources {
+        // Skip if symbol only imported from one distinct raw path within
+        // this definition group.
         if sources.len() <= 1 {
             continue;
         }
 
-        // Find canonical (most-used) path
-        let mut sources_vec: Vec<_> = sources.into_iter().collect();
-        sources_vec.sort_by_key(|b| std::cmp::Reverse(b.1));
+        let targets = source_targets
+            .get(&(symbol.clone(), definition_key))
+            .cloned()
+            .unwrap_or_default();
 
-        if let Some((canonical, _canonical_count)) = sources_vec.first() {
+        // Canonical = the definition site (resolved target is not a
+        // re-exporting index.* barrel), not whichever raw path happens to
+        // be imported most. Ties (or no resolvable target at all) fall
+        // back to raw import-count majority, then alphabetical order for
+        // determinism.
+        let mut sources_vec: Vec<_> = sources.into_iter().collect();
+        sources_vec.sort_by(|(a_path, a_count), (b_path, b_count)| {
+            let a_is_barrel = targets
+                .get(a_path)
+                .and_then(|t| t.as_deref())
+                .is_some_and(is_barrel_file);
+            let b_is_barrel = targets
+                .get(b_path)
+                .and_then(|t| t.as_deref())
+                .is_some_and(is_barrel_file);
+            a_is_barrel
+                .cmp(&b_is_barrel)
+                .then_with(|| b_count.cmp(a_count))
+                .then_with(|| a_path.cmp(b_path))
+        });
+
+        if let Some((canonical, _canonical_count)) = sources_vec.first().cloned() {
             let alternative_paths: Vec<_> = sources_vec
                 .iter()
-                .skip(1)
+                .filter(|(path, _)| path != &canonical)
                 .map(|(path, count)| (path.clone(), *count))
                 .collect();
 
@@ -306,7 +410,7 @@ fn detect_inconsistent_paths(snapshot: &Snapshot) -> Vec<InconsistentImport> {
             if alternative_paths.iter().any(|(_, count)| *count > 1) {
                 inconsistent.push(InconsistentImport {
                     symbol: symbol.clone(),
-                    canonical_path: canonical.clone(),
+                    canonical_path: canonical,
                     alternative_paths,
                 });
             }
@@ -543,6 +647,7 @@ mod tests {
                 barrels: Vec::new(),
                 semantic_facts: None,
                 symbol_graph: None,
+                scan_diagnostics: None,
             }
         }
 
@@ -594,6 +699,7 @@ mod tests {
             barrels: Vec::new(),
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         };
 
         let analysis = analyze_barrel_chaos(&rust_snapshot);
@@ -633,6 +739,7 @@ mod tests {
             barrels: Vec::new(),
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         }
     }
 
@@ -858,6 +965,163 @@ mod tests {
         assert!(
             formatted.contains("frontend/"),
             "formatted advice must name the TS dir:\n{formatted}"
+        );
+    }
+
+    /// F4 RED: a bare-name grouping merges `std::process::Command` (external,
+    /// unresolvable) with `crate::cli::Command` (resolves internally to
+    /// `src/cli/mod.rs`, imported via two different textual paths). They
+    /// must never collapse into one InconsistentImport group by name alone.
+    #[test]
+    fn w4_inconsistent_paths_never_merges_different_definitions_by_bare_name() {
+        use crate::types::{ImportEntry, ImportKind, ImportSymbol};
+
+        fn command_import(source: &str, resolved: Option<&str>) -> ImportEntry {
+            let mut import = ImportEntry::new(source.to_string(), ImportKind::Static);
+            import.resolved_path = resolved.map(|r| r.to_string());
+            import.symbols.push(ImportSymbol {
+                name: "Command".to_string(),
+                alias: None,
+                is_default: false,
+            });
+            import
+        }
+
+        let mut std_importer = file("src/spawn.rs");
+        std_importer
+            .imports
+            .push(command_import("std::process::Command", None));
+        std_importer
+            .imports
+            .push(command_import("std::process::Command", None));
+
+        let mut cli_importer_a = file("src/one.rs");
+        cli_importer_a.imports.push(command_import(
+            "crate::cli::Command",
+            Some("src/cli/mod.rs"),
+        ));
+        cli_importer_a.imports.push(command_import(
+            "crate::cli::Command",
+            Some("src/cli/mod.rs"),
+        ));
+
+        let mut cli_importer_b = file("src/two.rs");
+        cli_importer_b.imports.push(command_import(
+            "crate::cli::commands::Command",
+            Some("src/cli/mod.rs"),
+        ));
+        cli_importer_b.imports.push(command_import(
+            "crate::cli::commands::Command",
+            Some("src/cli/mod.rs"),
+        ));
+
+        let snapshot = snapshot_with(
+            vec![std_importer, cli_importer_a, cli_importer_b],
+            Vec::new(),
+        );
+
+        let inconsistent = detect_inconsistent_paths(&snapshot);
+
+        assert_eq!(
+            inconsistent.len(),
+            1,
+            "the std-lib Command (one raw source, filtered) and the \
+             crate::cli Command (two raw sources, one real group) must \
+             produce exactly one InconsistentImport: {inconsistent:?}"
+        );
+        assert!(
+            inconsistent[0].canonical_path != "std::process::Command"
+                && inconsistent[0]
+                    .alternative_paths
+                    .iter()
+                    .all(|(path, _)| path != "std::process::Command"),
+            "std::process::Command must never appear in the crate::cli \
+             group at all (canonical or alternative): {inconsistent:?}"
+        );
+    }
+
+    /// F4 RED: parser artifacts (`*`, `}`) from a namespace/brace import that
+    /// failed to parse cleanly must never surface as an inconsistent-path
+    /// symbol.
+    #[test]
+    fn w4_inconsistent_paths_filters_non_identifier_parser_artifacts() {
+        use crate::types::{ImportEntry, ImportKind, ImportSymbol};
+
+        fn bad_import(source: &str, symbol_name: &str) -> ImportEntry {
+            let mut import = ImportEntry::new(source.to_string(), ImportKind::Static);
+            import.symbols.push(ImportSymbol {
+                name: symbol_name.to_string(),
+                alias: None,
+                is_default: false,
+            });
+            import
+        }
+
+        let mut a = file("src/a.ts");
+        a.imports.push(bad_import("./one", "}"));
+        a.imports.push(bad_import("./two", "}"));
+        let mut b = file("src/b.ts");
+        b.imports.push(bad_import("./one", "*"));
+        b.imports.push(bad_import("./two", "*"));
+
+        let snapshot = snapshot_with(vec![a, b], Vec::new());
+        let inconsistent = detect_inconsistent_paths(&snapshot);
+
+        assert!(
+            inconsistent
+                .iter()
+                .all(|i| i.symbol != "}" && i.symbol != "*"),
+            "parser artifacts must never appear as an inconsistent-path \
+             symbol: {inconsistent:?}"
+        );
+    }
+    /// N11 (audit): the SAME symbol imported via its barrel and via its
+    /// defining file is ONE group with the definition as canonical — even
+    /// when the barrel spelling has more imports. Direct-target grouping
+    /// split them into two invisible one-source groups.
+    #[test]
+    fn n11_barrel_and_direct_spellings_group_and_definition_wins() {
+        use crate::types::{ImportEntry, ImportKind, ImportSymbol, ReexportEntry, ReexportKind};
+
+        fn widget_import(source: &str, resolved: &str) -> ImportEntry {
+            let mut import = ImportEntry::new(source.to_string(), ImportKind::Static);
+            import.resolved_path = Some(resolved.to_string());
+            import.symbols.push(ImportSymbol {
+                name: "Widget".to_string(),
+                alias: None,
+                is_default: false,
+            });
+            import
+        }
+
+        let mut barrel = file("src/index.ts");
+        barrel.reexports.push(ReexportEntry {
+            source: "./thing".to_string(),
+            kind: ReexportKind::Named(vec![("Widget".to_string(), "Widget".to_string())]),
+            resolved: Some("src/thing.ts".to_string()),
+        });
+
+        // Barrel spelling is the MAJORITY (3 imports); direct has 2.
+        let mut a = file("src/a.ts");
+        a.imports.push(widget_import("./index", "src/index.ts"));
+        a.imports.push(widget_import("./index", "src/index.ts"));
+        let mut b = file("src/b.ts");
+        b.imports.push(widget_import("./index", "src/index.ts"));
+        let mut c = file("src/c.ts");
+        c.imports.push(widget_import("./thing", "src/thing.ts"));
+        c.imports.push(widget_import("./thing", "src/thing.ts"));
+
+        let snapshot = snapshot_with(vec![barrel, a, b, c], Vec::new());
+        let inconsistent = detect_inconsistent_paths(&snapshot);
+
+        assert_eq!(
+            inconsistent.len(),
+            1,
+            "barrel and direct spellings of the same Widget are one inconsistency: {inconsistent:?}"
+        );
+        assert_eq!(
+            inconsistent[0].canonical_path, "./thing",
+            "the definition spelling wins over the barrel majority: {inconsistent:?}"
         );
     }
 }

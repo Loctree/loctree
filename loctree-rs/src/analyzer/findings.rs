@@ -26,7 +26,7 @@ use crate::analyzer::react_lint::{ReactLintIssue, ReactLintSummary, analyze_reac
 use crate::analyzer::report::RankedDup;
 use crate::analyzer::root_scan::ScanResults;
 use crate::analyzer::ts_lint::{TsLintIssue, TsLintSummary, lint_ts_file};
-use crate::analyzer::twins::{detect_exact_twins, filter_idiom_twins, omit_from_duplicate_groups};
+use crate::analyzer::twins::omit_from_duplicate_groups;
 use crate::semantic::{Classifier as SemClassifier, SemanticFacts};
 use crate::snapshot::{EntrypointDriftSummary, Snapshot};
 use crate::types::FileAnalysis;
@@ -250,7 +250,7 @@ pub struct QuickWin {
     /// `delete_candidate: <path>` and reads as a verdict on the whole file —
     /// a reader who then checks whether the *file* is used finds it very much
     /// alive and dismisses a true finding. Carrying the symbol keeps the
-    /// proposal at the size it was actually made at. (loctree-fail 2026-08-12)
+    /// proposal at the size it was actually made at. (loctree-feedback 2026-08-12)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
     /// 1-based line of `symbol`, when known.
@@ -338,7 +338,7 @@ impl Findings {
             .into_iter()
             .map(|nodes| ClassifiedCycle::new(nodes, &all_edges))
             .collect();
-        let cycles = classify_cycles(&classified_strict, &lazy_cycles);
+        let cycles = classify_cycles(&classified_strict, &lazy_cycles, &all_edges);
 
         // Duplicates from scan contexts
         let mut duplicates = collect_duplicates(scan_results);
@@ -439,15 +439,19 @@ impl Findings {
         // Detect exact twins for health score consistency with for_ai.rs
         // (and as the shape-evidence source for duplicate classification —
         // computed BEFORE quick wins so "consolidate" is gated on class EXACT).
-        let analyses_vec: Vec<_> = analyses.iter().cloned().cloned().collect();
-        let exact_twins_raw = detect_exact_twins(&analyses_vec, false);
-
-        // Layer 3 — drop convention twins (e.g. two `usage` printers in two
-        // scripts) before they pollute consolidation suggestions.
-        let exact_twins = match snapshot.semantic_facts.as_ref() {
-            Some(facts) => filter_idiom_twins(exact_twins_raw, facts),
-            None => exact_twins_raw,
-        };
+        //
+        // F6: this used to run `detect_exact_twins` over `analyses_vec`
+        // (derived from `scan_results.global_analyses`), while
+        // `health_inputs::structural_defects` — the canonical score — reads
+        // `snapshot.files` directly. Two different input slices for the same
+        // sensor is exactly the kind of drift `canonical_exact_twins` exists
+        // to close: every surface now reads the same file set through the
+        // same gate.
+        let exact_twins = crate::analyzer::health_inputs::canonical_exact_twins(
+            &snapshot.files,
+            snapshot.semantic_facts.as_ref(),
+            false,
+        );
 
         // Annotate duplicate groups with the twin shape-evidence class
         // (EXACT / SHAPE_SIMILAR / NAME_COLLISION / IDIOM). Symbols without a
@@ -586,25 +590,33 @@ fn is_make_file_path(path: &str) -> bool {
         || lower.ends_with(".make")
 }
 
-/// Classify cycles into breaking/structural/diamond/lazy
-fn classify_cycles(strict: &[ClassifiedCycle], lazy: &[Vec<String>]) -> Vec<CycleEntry> {
-    use crate::analyzer::cycles::CycleClassification;
+/// Classify cycles into breaking/structural/diamond/lazy.
+///
+/// F5/F6 one-truth fix: this used to derive `cycle_type` straight from
+/// `cycle.classification` (`HardBidirectional => "breaking"`), while
+/// `cycles::determine_compilability` computed a SEPARATE `compilability`
+/// verdict that never actually reached `Breaking` — so `loct cycles`
+/// (grouped by compilability) always said 0 breaking while `findings.json`
+/// (this function) said N. Reading `cycle.compilability` here means both
+/// surfaces now report the exact same field.
+fn classify_cycles(
+    strict: &[ClassifiedCycle],
+    lazy: &[Vec<String>],
+    edges: &[(String, String, String)],
+) -> Vec<CycleEntry> {
+    use crate::analyzer::cycles::CycleCompilability;
 
     let mut entries = Vec::new();
 
     for cycle in strict {
-        let cycle_type = match cycle.classification {
-            CycleClassification::HardBidirectional => "breaking",
-            CycleClassification::ModuleSelfReference => "structural",
-            CycleClassification::TraitBased => "structural",
-            CycleClassification::CfgGated => "structural",
-            CycleClassification::FanPattern => "diamond",
-            CycleClassification::WildcardImport => "structural",
-            CycleClassification::Unknown => "structural",
+        let cycle_type = match cycle.compilability {
+            CycleCompilability::Breaking => "breaking",
+            CycleCompilability::Structural => "structural",
+            CycleCompilability::DiamondDependency => "diamond",
         };
 
         let suggestion = if cycle_type == "breaking" {
-            suggest_cycle_break(&cycle.nodes)
+            suggest_cycle_break(&cycle.nodes, edges)
         } else {
             None
         };
@@ -628,15 +640,44 @@ fn classify_cycles(strict: &[ClassifiedCycle], lazy: &[Vec<String>]) -> Vec<Cycl
     entries
 }
 
-/// Suggest where to break a cycle
-fn suggest_cycle_break(nodes: &[String]) -> Option<String> {
-    if nodes.len() < 2 {
+/// Suggest where to break a cycle.
+///
+/// Prefers a non-type-dependency edge: cutting a `type_import`/recursive-type
+/// edge is rarely the actionable fix (the type relationship usually has to
+/// stay), so when edge-kind data is available this walks the ring starting
+/// from the previous fixed midpoint and returns the first edge that isn't a
+/// type edge, wrapping around. With no matching edge data (or none of the
+/// cycle's edges are known), it falls back to the original middle-edge pick.
+fn suggest_cycle_break(nodes: &[String], edges: &[(String, String, String)]) -> Option<String> {
+    let n = nodes.len();
+    if n < 2 {
         return None;
     }
-    // Suggest breaking at the middle edge
-    let mid = nodes.len() / 2;
+
+    let kind_of = |from: &str, to: &str| -> Option<&str> {
+        edges
+            .iter()
+            .find(|(f, t, _)| f == from && t == to)
+            .map(|(_, _, k)| k.as_str())
+    };
+    let is_type_edge =
+        |kind: &str| kind == "type_import" || kind == "type" || kind.contains("type");
+
+    let mid = n / 2;
+    for offset in 0..n {
+        let i = (mid + offset) % n;
+        let from = &nodes[i];
+        let to = &nodes[(i + 1) % n];
+        let edge_is_type = kind_of(from, to).map(is_type_edge).unwrap_or(false);
+        if !edge_is_type {
+            return Some(format!("Break at: {} -> {}", from, to));
+        }
+    }
+
+    // Every edge on the ring is a type-dependency edge — nothing safe to
+    // single out, keep the original middle-edge suggestion.
     let from = &nodes[mid];
-    let to = &nodes[(mid + 1) % nodes.len()];
+    let to = &nodes[(mid + 1) % n];
     Some(format!("Break at: {} -> {}", from, to))
 }
 
@@ -1237,6 +1278,164 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyzer::report::{DupLocation, DupSeverity};
+    use crate::analyzer::root_scan::RootContext;
+
+    fn empty_scan_results(
+        edges: Vec<(String, String, String)>,
+        global_analyses: Vec<FileAnalysis>,
+        filtered_ranked: Vec<RankedDup>,
+    ) -> ScanResults {
+        ScanResults {
+            contexts: vec![RootContext {
+                graph_edges: edges,
+                filtered_ranked,
+                ..RootContext::default()
+            }],
+            global_fe_commands: HashMap::new(),
+            global_be_commands: HashMap::new(),
+            global_fe_payloads: HashMap::new(),
+            global_be_payloads: HashMap::new(),
+            global_analyses,
+            ts_resolver_config: None,
+            py_roots: Vec::new(),
+        }
+    }
+
+    /// F5/F6 — cross-surface parity. A genuinely mutual (hard-bidirectional,
+    /// non-mod/use, non-diamond) two-node cycle must be called "breaking" by
+    /// BOTH the `loct cycles` compilability surface and the `findings.json`
+    /// surface. Before this cut, `cycles::determine_compilability` never
+    /// reached `Breaking` for a hard-bidirectional cycle (it always fell
+    /// through to `Structural`), while `classify_cycles` here derived
+    /// "breaking" straight from the `HardBidirectional` classification — 0
+    /// vs N on the same repository. Both now read the same
+    /// `ClassifiedCycle::compilability` field.
+    #[test]
+    fn cycles_surface_and_findings_surface_agree_on_breaking_count() {
+        use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
+
+        let edges = vec![
+            ("a.ts".to_string(), "b.ts".to_string(), "import".to_string()),
+            ("b.ts".to_string(), "a.ts".to_string(), "import".to_string()),
+        ];
+
+        let (classified_strict, _lazy) = find_cycles_classified_with_lazy(&edges);
+        let cycles_surface_breaking = classified_strict
+            .iter()
+            .filter(|c| c.compilability == CycleCompilability::Breaking)
+            .count();
+        assert_eq!(
+            cycles_surface_breaking, 1,
+            "a genuine hard-bidirectional pair must classify as Breaking"
+        );
+
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.files.push(FileAnalysis::new("a.ts".to_string()));
+        snapshot.files.push(FileAnalysis::new("b.ts".to_string()));
+
+        let scan_results = empty_scan_results(edges, Vec::new(), Vec::new());
+        let findings = Findings::produce(&scan_results, &snapshot, FindingsConfig::default(), None);
+
+        assert_eq!(
+            findings.summary.cycles.breaking, cycles_surface_breaking,
+            "findings.json must agree with `loct cycles` on how many cycles are breaking"
+        );
+    }
+
+    fn twin_export_file(path: &str, symbol: &str) -> FileAnalysis {
+        FileAnalysis {
+            path: path.to_string(),
+            exports: vec![crate::types::ExportSymbol {
+                name: symbol.to_string(),
+                kind: "function".to_string(),
+                export_type: "named".to_string(),
+                line: Some(1),
+                params: Vec::new(),
+                symbol_id: crate::types::SymbolIdV1::default(),
+            }],
+            // Identical signature usage on both locations gives the twin
+            // classifier real (matching) shape evidence — the classifier
+            // requires this to call a group EXACT/Duplicate rather than
+            // NAME_COLLISION/Namesake (which would omit it from
+            // `duplicate_groups` regardless of the F6 fix under test).
+            signature_uses: vec![crate::types::SignatureUse {
+                function: symbol.to_string(),
+                usage: crate::types::SignatureUseKind::Return,
+                type_name: "()".to_string(),
+                line: Some(1),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// F6 — `findings.rs` used to run `detect_exact_twins` over
+    /// `scan_results.global_analyses`, while `health_inputs::structural_defects`
+    /// (the canonical score) reads `snapshot.files` directly — two different
+    /// input slices for the same sensor. Reproduce the drift: `global_analyses`
+    /// carries only one of the two duplicate-export locations (simulating a
+    /// stale/partial scan-results slice); `snapshot.files`, as a real snapshot
+    /// always does, carries both. Before convergence, findings.rs's own twin
+    /// detection would miss the pair entirely and never annotate the ranked
+    /// duplicate with shape evidence.
+    #[test]
+    fn findings_twin_annotation_reads_the_same_file_set_as_health() {
+        let file_a = twin_export_file("src/a.rs", "shared_fn");
+        let file_b = twin_export_file("src/b.rs", "shared_fn");
+
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.files.push(file_a.clone());
+        snapshot.files.push(file_b);
+
+        let ranked = RankedDup {
+            name: "shared_fn".to_string(),
+            files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            locations: vec![
+                DupLocation {
+                    file: "src/a.rs".to_string(),
+                    line: Some(1),
+                },
+                DupLocation {
+                    file: "src/b.rs".to_string(),
+                    line: Some(1),
+                },
+            ],
+            score: 2,
+            prod_count: 2,
+            dev_count: 0,
+            canonical: "src/a.rs".to_string(),
+            canonical_line: Some(1),
+            refactors: Vec::new(),
+            severity: DupSeverity::SamePackage,
+            is_cross_lang: false,
+            packages: Vec::new(),
+            reason: String::new(),
+        };
+
+        // The drift: only `a.rs` made it into this surface's own analyses
+        // list; `snapshot.files` (read by `structural_defects`) has both.
+        let scan_results = empty_scan_results(Vec::new(), vec![file_a], vec![ranked]);
+
+        let health = structural_defects(&snapshot, &[], &["shared_fn".to_string()], 0);
+        let findings = Findings::produce(&scan_results, &snapshot, FindingsConfig::default(), None);
+
+        assert_eq!(
+            health.twins_same_language, 1,
+            "health reads the snapshot directly and must see the twin pair"
+        );
+
+        let dup = findings
+            .duplicates
+            .iter()
+            .find(|d| d.symbol == "shared_fn")
+            .expect("ranked duplicate must still surface");
+        assert!(
+            dup.class.is_some(),
+            "findings must read the same file set health does (snapshot.files), \
+             not scan_results.global_analyses, or the twin pair goes invisible \
+             and the duplicate never gets annotated with shape evidence"
+        );
+    }
 
     #[test]
     fn test_cycle_counts_default() {
@@ -1414,13 +1613,38 @@ mod tests {
     fn test_suggest_cycle_break() {
         let nodes = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
         let suggestion =
-            suggest_cycle_break(&nodes).expect("non-empty cycle should suggest a break");
+            suggest_cycle_break(&nodes, &[]).expect("non-empty cycle should suggest a break");
         assert!(suggestion.contains("Break at:"));
     }
 
     #[test]
     fn test_suggest_cycle_break_empty() {
         let nodes: Vec<String> = vec![];
-        assert!(suggest_cycle_break(&nodes).is_none());
+        assert!(suggest_cycle_break(&nodes, &[]).is_none());
+    }
+
+    /// F5 — cutting a type-only edge is rarely the actionable fix (the type
+    /// relationship usually has to stay); the suggestion should skip past it
+    /// to a real value-level edge when the edge data distinguishes them.
+    #[test]
+    fn test_suggest_cycle_break_prefers_non_type_edge() {
+        let nodes = vec!["a.ts".to_string(), "b.ts".to_string(), "c.ts".to_string()];
+        // a->b is a real value import (safe to cut); b->c and c->a are
+        // type-only, so the default middle-edge pick (b->c) must be skipped.
+        let edges = vec![
+            ("a.ts".to_string(), "b.ts".to_string(), "import".to_string()),
+            (
+                "b.ts".to_string(),
+                "c.ts".to_string(),
+                "type_import".to_string(),
+            ),
+            (
+                "c.ts".to_string(),
+                "a.ts".to_string(),
+                "type_import".to_string(),
+            ),
+        ];
+        let suggestion = suggest_cycle_break(&nodes, &edges).expect("should suggest a break");
+        assert_eq!(suggestion, "Break at: a.ts -> b.ts");
     }
 }

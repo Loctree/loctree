@@ -40,7 +40,11 @@ pub fn compute_warnings(
     //    names (OS user env, shell/CI builtins) are exempt — `$HOME` or
     //    `$GITHUB_ENV` exist without any declaration file, so flagging them
     //    is pure noise (W2-c).
-    if decl.sources.is_empty() && !decl.reads.is_empty() && !is_runtime_provided_env(&decl.name) {
+    if decl.sources.is_empty()
+        && !decl.reads.is_empty()
+        && !is_runtime_provided_env(&decl.name)
+        && !is_single_letter_shell_shorthand(&decl.name, &decl.reads)
+    {
         decl.precedence_warnings
             .push(EnvWarning::OrphanCodeReference {
                 read_sites: decl.reads.iter().map(|r| r.file.clone()).collect(),
@@ -157,6 +161,39 @@ const OS_STANDARD_ENV: &[&str] = &[
     "COLORTERM",
 ];
 
+/// H5: common shell terminal-color / ANSI escape constants
+/// (`RED='\033[0;31m'`, `NC='\033[0m'`). These are self-contained shell
+/// script presentation locals, declared and read in the SAME script for
+/// output formatting - not environment variables any repo-wide declaration
+/// sensor tracks. `source_reads` (generic `$VAR`/`${VAR}` scanning) can't
+/// tell them apart from a real env var read, so without this exemption
+/// every color-coded shell script prints a false `orphan-code-reference`
+/// for its own palette.
+///
+/// This is a name-based exemption, not a true same-file declare-and-read
+/// correlation (no sensor exists yet for plain shell script `VAR=value`
+/// assignments as declarations - that would be a real new sensor in
+/// `discovery.rs`/a new parser, out of scope here and flagged for the
+/// integrator). It only ever suppresses noise for this specific, narrow,
+/// well-known name set - it can't hide a real gap for any other name.
+const SHELL_ANSI_COLOR_NAMES: &[&str] = &[
+    "RED",
+    "GREEN",
+    "YELLOW",
+    "BLUE",
+    "MAGENTA",
+    "CYAN",
+    "WHITE",
+    "BLACK",
+    "NC",
+    "RESET",
+    "BOLD",
+    "DIM",
+    "UNDERLINE",
+    "BLINK",
+    "REVERSE",
+];
+
 /// Names provided by the runtime (OS, shell, CI runner) rather than by any
 /// repo declaration. Exempt from orphan-code-reference warnings.
 ///
@@ -166,9 +203,27 @@ const OS_STANDARD_ENV: &[&str] = &[
 /// `std::env::var("HOME")`) that legitimately stay contracts.
 pub(super) fn is_runtime_provided_env(name: &str) -> bool {
     OS_STANDARD_ENV.contains(&name)
+        || SHELL_ANSI_COLOR_NAMES.contains(&name)
         || name.starts_with("LC_")
         || name.starts_with("XDG_")
         || crate::semantic::shell::is_shell_runtime_var(name)
+}
+
+/// The one-character shell colour-shorthand idiom (G/N/R/Y in
+/// vc-workspace's scripts): exempt from orphan evidence only when every
+/// read site is a shell script. A single-letter env var read from Rust or
+/// Python is a real contract — the old blanket `len() == 1` exemption
+/// erased genuine evidence by name alone (audit N08).
+pub(super) fn is_single_letter_shell_shorthand(
+    name: &str,
+    reads: &[crate::analyzer::env_truth::types::EnvReadSite],
+) -> bool {
+    name.chars().count() == 1
+        && !reads.is_empty()
+        && reads.iter().all(|read| {
+            let file = read.file.to_lowercase();
+            file.ends_with(".sh") || file.ends_with(".bash") || file.ends_with(".zsh")
+        })
 }
 
 fn plain_value_hash(s: &EnvSource) -> Option<&str> {
@@ -352,6 +407,32 @@ mod tests {
         );
     }
 
+    /// H5 RED: a same-file shell ANSI color read (`RED`, `NC`, `BLUE`, ...)
+    /// must not register as an orphan-code-reference - it's a shell script's
+    /// own presentation constant, not a repo environment variable.
+    #[test]
+    fn ansi_color_reads_are_not_orphan_code_references() {
+        use crate::analyzer::env_truth::types::EnvReadSite;
+        for name in ["RED", "NC", "BLUE", "GREEN", "RESET", "G", "Y"] {
+            let mut decl = decl_from_sources(vec![]);
+            decl.name = name.into();
+            decl.reads = vec![EnvReadSite {
+                file: "scripts/deploy.sh".into(),
+                line: Some(3),
+                symbol: None,
+                required_for: vec![],
+            }];
+            compute_warnings(&mut decl, true, 7);
+            assert!(
+                !decl
+                    .precedence_warnings
+                    .iter()
+                    .any(|w| matches!(w, EnvWarning::OrphanCodeReference { .. })),
+                "shell ANSI color var `{name}` must not be an orphan code reference"
+            );
+        }
+    }
+
     #[test]
     fn orphan_declaration_only_when_env_contracts_present() {
         let mut decl = decl_from_sources(vec![mk_source(
@@ -379,5 +460,30 @@ mod tests {
                 .iter()
                 .any(|w| matches!(w, EnvWarning::OrphanDeclaration { .. }))
         );
+    }
+    /// N08 (audit): the one-letter exemption needs shell-read facts. `R`
+    /// read only from shell scripts is the colour shorthand; `R` read from
+    /// Rust is a real contract and must stay orphan evidence.
+    #[test]
+    fn single_letter_exemption_requires_shell_reads() {
+        let shell_reads = vec![crate::analyzer::env_truth::types::EnvReadSite {
+            file: "scripts/colors.sh".to_string(),
+            line: Some(3),
+            symbol: None,
+            required_for: vec![],
+        }];
+        assert!(is_single_letter_shell_shorthand("R", &shell_reads));
+
+        let rust_reads = vec![crate::analyzer::env_truth::types::EnvReadSite {
+            file: "src/main.rs".to_string(),
+            line: Some(10),
+            symbol: None,
+            required_for: vec![],
+        }];
+        assert!(
+            !is_single_letter_shell_shorthand("R", &rust_reads),
+            "a single-letter env read from Rust is a real contract, not a colour"
+        );
+        assert!(!is_single_letter_shell_shorthand("RED_LONG", &shell_reads));
     }
 }

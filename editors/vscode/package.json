@@ -2,7 +2,7 @@
   "name": "loctree",
   "displayName": "Loctree",
   "description": "One-shot full repository context for AI agents: literal occurrences, symbol bodies, context packs, and blast-radius navigation powered by loctree",
-  "version": "0.14.5",
+  "version": "0.15.0",
   "publisher": "libraxis",
   "license": "MIT",
   "repository": {
@@ -337,16 +337,19 @@
     "@types/vscode": "^1.75.0",
     "@typescript-eslint/eslint-plugin": "^8.60.1",
     "@typescript-eslint/parser": "^8.60.1",
-    "@vscode/vsce": "^3.9.2",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.1",
     "eslint": "^10.4.1",
     "globals": "^17.6.0",
-    "ovsx": "^1.0.0",
+    "ovsx": "^1.2.0",
     "typescript": "^5.3.3"
   },
   "overrides": {
     "uuid": "^14.0.0",
     "encoding-sniffer": "^1.0.2",
-    "brace-expansion": "^5.0.9"
+    "brace-expansion": "^5.0.9",
+    "ovsx": {
+      "@vscode/vsce": "^4.0.0"
+    }
   }
 }

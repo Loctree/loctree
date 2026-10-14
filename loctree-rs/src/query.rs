@@ -136,6 +136,48 @@ fn paths_match(edge_to: &str, target: &str) -> bool {
     false
 }
 
+/// `who-imports` edge match, disambiguated against the snapshot's real files.
+///
+/// `paths_match()`'s suffix branch treats any `edge.to` that ends with
+/// `/{target}` as the same file as `target` -- correct when `target` is a
+/// bare/partial name (`utils.ts`) that has exactly one real owner, but wrong
+/// when `target` is itself the exact path of a real, distinct file. A
+/// vendored copy at `lua-api-crates/mux/src/pane.rs` legitimately ends with
+/// `/mux/src/pane.rs`, but that suffix hit is a name collision with someone
+/// else's ancestors, not a relative/absolute spelling of the genuine
+/// `mux/src/pane.rs` (G10.1, loctree-feedback.md). Once `target` resolves to one
+/// concrete file in the snapshot, only an exact match to THAT file counts;
+/// the folder-to-index heuristic stays available regardless, since it names
+/// a resolution formality (folder import -> its index file), never a
+/// collision between two genuine files.
+fn edge_targets_query(snapshot: &Snapshot, edge_to: &str, target: &str) -> bool {
+    let edge_norm = normalize_path(edge_to);
+    let target_norm = normalize_path(target);
+
+    if edge_norm == target_norm {
+        return true;
+    }
+
+    // Folder match: target is index file, edge.to points to folder.
+    if let Some(folder) = strip_index_suffix(&target_norm)
+        && (edge_norm == folder || edge_norm.ends_with(&format!("/{}", folder)))
+    {
+        return true;
+    }
+
+    // The suffix heuristic is only trustworthy when `target` does not
+    // itself name a real, distinct file already present in the snapshot.
+    let target_is_real_file = snapshot
+        .files
+        .iter()
+        .any(|f| normalize_path(&f.path) == target_norm);
+    if target_is_real_file {
+        return false;
+    }
+
+    edge_norm.ends_with(&format!("/{}", target_norm))
+}
+
 /// Result of a query operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
@@ -329,6 +371,90 @@ fn implicit_reference_match(
     })
 }
 
+/// Outcome of checking a regular import edge against a symbol-scoped
+/// `who-imports` query. Three-way rather than a plain bool/Option: absence of
+/// a name match is only proof of exclusion when we actually HAVE import data
+/// to check it against — a snapshot with no mirrored `ImportEntry` for the
+/// edge (partial scan, or a fixture that only carries the graph edge) must
+/// not be treated the same as one that positively names a different symbol.
+enum SymbolImportEvidence {
+    /// A concrete `ImportEntry` names the symbol (or imports it via a glob,
+    /// which cannot prove absence of anything).
+    Named { line: Option<usize>, label: String },
+    /// The importer has `ImportEntry`s resolving to `target_file`, and NONE
+    /// of them name the symbol or use a glob — positive proof this importer
+    /// consumes a sibling export, not the queried one.
+    Excluded,
+    /// No `ImportEntry` resolving to `target_file` was found for this
+    /// importer (missing file, or no mirrored import data) — cannot prove
+    /// absence, so the caller keeps the edge counted the way file-mode
+    /// queries always have.
+    Unknown,
+}
+
+/// Verify a regular import edge against a symbol-scoped `who-imports` query.
+///
+/// A regular (non-reexport, non-implicit) edge only proves "importer
+/// resolves to this file" — reaching the file that defines the queried
+/// symbol otherwise credited EVERY importer of that file as a consumer of
+/// THAT symbol, even when its actual `use` statement named an unrelated
+/// sibling export from the same module (atuin: `who-imports
+/// effective_data_dir` returned 92 files while 2 actually used it —
+/// loctree-feedback.md G2). Mirrors `implicit_reference_match`'s symbol-precise
+/// discipline, checked against `ImportEntry.symbols` instead of usage sites.
+fn symbol_import_evidence(
+    snapshot: &Snapshot,
+    edge: &crate::snapshot::GraphEdge,
+    target_file: &str,
+    symbol: &str,
+) -> SymbolImportEvidence {
+    let Some(importer_analysis) = snapshot
+        .files
+        .iter()
+        .find(|f| paths_match(&f.path, &edge.from))
+    else {
+        return SymbolImportEvidence::Unknown;
+    };
+
+    // `Type::method` queries: a `use` statement only ever names the TYPE
+    // (`use foo::Recorder;`), never the method, so match against the
+    // qualifier when one is present rather than the full qualified string.
+    let (qualifier, _method) = parse_rust_method_query(symbol);
+    let import_name = qualifier.unwrap_or(symbol);
+
+    let mut saw_matching_entry = false;
+    for entry in &importer_analysis.imports {
+        let names_file = entry
+            .resolved_path
+            .as_deref()
+            .is_some_and(|p| paths_match(p, target_file))
+            || paths_match(&entry.source, target_file);
+        if !names_file {
+            continue;
+        }
+        saw_matching_entry = true;
+
+        let is_glob = entry.symbols.iter().any(|s| s.name == "*");
+        let names_symbol = entry
+            .symbols
+            .iter()
+            .any(|s| s.name == import_name || s.alias.as_deref() == Some(import_name));
+
+        if is_glob || names_symbol {
+            return SymbolImportEvidence::Named {
+                line: entry.line,
+                label: edge.label.clone(),
+            };
+        }
+    }
+
+    if saw_matching_entry {
+        SymbolImportEvidence::Excluded
+    } else {
+        SymbolImportEvidence::Unknown
+    }
+}
+
 pub fn query_who_imports(snapshot: &Snapshot, target: &str) -> QueryResult {
     use std::collections::HashSet;
 
@@ -390,7 +516,7 @@ pub fn query_who_imports(snapshot: &Snapshot, target: &str) -> QueryResult {
 
         // Find edges pointing to current target
         for edge in &snapshot.edges {
-            if paths_match(&edge.to, &current) {
+            if edge_targets_query(snapshot, &edge.to, &current) {
                 if edge.label == "reexport" {
                     // Follow re-export chain
                     if !visited.contains(&edge.from) {
@@ -402,19 +528,55 @@ pub fn query_who_imports(snapshot: &Snapshot, target: &str) -> QueryResult {
                     // importer actually references the symbol, and point at
                     // the real reference line. Blind reporting turned every
                     // file in a Swift module into an "importer"
-                    // (loctree-fail.md 2026-07-25, blinksh/blink).
+                    // (loctree-feedback.md 2026-07-25, blinksh/blink).
                     if let Some(m) =
                         implicit_reference_match(snapshot, &edge.from, &current, symbol_name)
                     {
                         results.push(m);
                     }
                 } else {
-                    // Regular import - this is an actual consumer
-                    results.push(QueryMatch {
-                        file: edge.from.clone(),
-                        line: None,
-                        context: Some(format!("imports via {}", edge.label)),
-                    });
+                    // Regular import - this proves "importer resolves to
+                    // this file". A symbol-scoped query additionally
+                    // requires the import to actually name the symbol
+                    // (loctree-feedback.md G2): reaching the file that defines
+                    // it is not proof every one of its importers consumes
+                    // THIS symbol rather than a sibling export. Glob imports,
+                    // and importers we have no mirrored ImportEntry data for,
+                    // stay counted (can't prove absence either way);
+                    // file-mode queries (symbol_name == None) are unaffected
+                    // — they ask about the FILE, not a symbol inside it.
+                    match symbol_name {
+                        Some(sym) => {
+                            match symbol_import_evidence(snapshot, edge, &current, sym) {
+                                SymbolImportEvidence::Named { line, label } => {
+                                    results.push(QueryMatch {
+                                        file: edge.from.clone(),
+                                        line,
+                                        context: Some(format!("imports {sym} via {label}")),
+                                    });
+                                }
+                                SymbolImportEvidence::Excluded => {
+                                    // Positive proof: this importer names a
+                                    // different, sibling symbol from the
+                                    // same file, not the queried one.
+                                }
+                                SymbolImportEvidence::Unknown => {
+                                    results.push(QueryMatch {
+                                        file: edge.from.clone(),
+                                        line: None,
+                                        context: Some(format!("imports via {}", edge.label)),
+                                    });
+                                }
+                            }
+                        }
+                        None => {
+                            results.push(QueryMatch {
+                                file: edge.from.clone(),
+                                line: None,
+                                context: Some(format!("imports via {}", edge.label)),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1057,7 +1219,7 @@ mod tests {
         assert!(!result.results.is_empty());
     }
 
-    /// Swift multi-file module regression (loctree-fail.md 2026-07-25,
+    /// Swift multi-file module regression (loctree-feedback.md 2026-07-25,
     /// blinksh/blink): `who-imports` must verify `implicit_symbol` edges
     /// against real symbol usages instead of reporting module membership.
     /// The snapshot deliberately carries the noisy pre-guard edges (as stale
@@ -1153,6 +1315,206 @@ mod tests {
             .find(|m| m.file == "Module/Consumer.swift")
             .expect("consumer match");
         assert_eq!(consumer.line, Some(21));
+    }
+
+    /// G2 (loctree-feedback.md, atuin): a symbol-scoped `who-imports` must not
+    /// credit every importer of the DEFINING FILE as a consumer of the
+    /// queried symbol. Module `m` exports both `a` and `b`; file `x` only
+    /// `use`s `a`, file `y` only `use`s `b`. `who-imports a` must return `x`
+    /// alone, not `y`.
+    #[test]
+    fn who_imports_symbol_excludes_importers_of_sibling_symbols() {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+
+        let mut module = FileAnalysis::new("src/m.rs".into());
+        module.exports.push(crate::types::ExportSymbol::new(
+            "a".to_string(),
+            "function",
+            "named",
+            Some(1),
+        ));
+        module.exports.push(crate::types::ExportSymbol::new(
+            "b".to_string(),
+            "function",
+            "named",
+            Some(5),
+        ));
+        snapshot.files.push(module);
+
+        let mut file_x = FileAnalysis::new("src/x.rs".into());
+        let mut import_a =
+            crate::types::ImportEntry::new("m".to_string(), crate::types::ImportKind::Static);
+        import_a.resolved_path = Some("src/m.rs".to_string());
+        import_a.symbols.push(crate::types::ImportSymbol {
+            name: "a".to_string(),
+            alias: None,
+            is_default: false,
+        });
+        file_x.imports.push(import_a);
+        snapshot.files.push(file_x);
+
+        let mut file_y = FileAnalysis::new("src/y.rs".into());
+        let mut import_b =
+            crate::types::ImportEntry::new("m".to_string(), crate::types::ImportKind::Static);
+        import_b.resolved_path = Some("src/m.rs".to_string());
+        import_b.symbols.push(crate::types::ImportSymbol {
+            name: "b".to_string(),
+            alias: None,
+            is_default: false,
+        });
+        file_y.imports.push(import_b);
+        snapshot.files.push(file_y);
+
+        snapshot.edges.push(crate::snapshot::GraphEdge {
+            from: "src/x.rs".to_string(),
+            to: "src/m.rs".to_string(),
+            label: "import".to_string(),
+        });
+        snapshot.edges.push(crate::snapshot::GraphEdge {
+            from: "src/y.rs".to_string(),
+            to: "src/m.rs".to_string(),
+            label: "import".to_string(),
+        });
+
+        let result = query_who_imports(&snapshot, "a");
+        let files: Vec<&str> = result.results.iter().map(|m| m.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["src/x.rs"],
+            "only the importer that actually names `a` may be reported, not the importer of sibling `b`: {:?}",
+            result.results
+        );
+    }
+
+    /// G2 companion: glob/star imports (`use m::*;`) cannot prove absence of
+    /// the symbol, so they must stay counted even though no `ImportEntry`
+    /// names the symbol directly.
+    #[test]
+    fn who_imports_symbol_keeps_glob_imports_counted() {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+
+        let mut module = FileAnalysis::new("src/m.rs".into());
+        module.exports.push(crate::types::ExportSymbol::new(
+            "a".to_string(),
+            "function",
+            "named",
+            Some(1),
+        ));
+        snapshot.files.push(module);
+
+        let mut file_glob = FileAnalysis::new("src/glob.rs".into());
+        let mut import_star =
+            crate::types::ImportEntry::new("m".to_string(), crate::types::ImportKind::Static);
+        import_star.resolved_path = Some("src/m.rs".to_string());
+        import_star.symbols.push(crate::types::ImportSymbol {
+            name: "*".to_string(),
+            alias: None,
+            is_default: false,
+        });
+        file_glob.imports.push(import_star);
+        snapshot.files.push(file_glob);
+
+        snapshot.edges.push(crate::snapshot::GraphEdge {
+            from: "src/glob.rs".to_string(),
+            to: "src/m.rs".to_string(),
+            label: "import".to_string(),
+        });
+
+        let result = query_who_imports(&snapshot, "a");
+        let files: Vec<&str> = result.results.iter().map(|m| m.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["src/glob.rs"],
+            "glob imports cannot prove absence of the symbol and must stay counted"
+        );
+    }
+
+    /// G2 companion: `lazy_import`-labelled edges must remain distinguishable
+    /// in `who-imports` output after the symbol-precision filter — the edge
+    /// label stays embedded in `context` for both file- and symbol-mode
+    /// queries.
+    #[test]
+    fn who_imports_marks_lazy_import_edges_distinguishably() {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+        snapshot
+            .files
+            .push(FileAnalysis::new("src/utils.ts".into()));
+        snapshot.files.push(FileAnalysis::new("src/app.ts".into()));
+        snapshot.edges.push(crate::snapshot::GraphEdge {
+            from: "src/app.ts".to_string(),
+            to: "src/utils.ts".to_string(),
+            label: "lazy_import".to_string(),
+        });
+
+        let result = query_who_imports(&snapshot, "src/utils.ts");
+        assert_eq!(result.results.len(), 1);
+        assert!(
+            result.results[0]
+                .context
+                .as_deref()
+                .is_some_and(|c| c.contains("lazy_import")),
+            "lazy_import edges must be distinguishable in who-imports output: {:?}",
+            result.results[0].context
+        );
+    }
+
+    /// G10.1 (loctree-feedback.md): a vendored copy at
+    /// `lua-api-crates/mux/src/pane.rs` must not collide with a genuine
+    /// `mux/src/pane.rs` that also exists in the snapshot. `paths_match`'s
+    /// suffix heuristic alone cannot tell the two apart; `who-imports` must
+    /// require an exact match once the query resolves to a real, distinct
+    /// file.
+    #[test]
+    fn who_imports_does_not_collide_vendored_path_with_genuine_file() {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+
+        // The genuine crate file.
+        snapshot
+            .files
+            .push(FileAnalysis::new("mux/src/pane.rs".into()));
+        // A vendored copy living under an unrelated ancestor directory.
+        snapshot
+            .files
+            .push(FileAnalysis::new("lua-api-crates/mux/src/pane.rs".into()));
+
+        // Only the vendored copy has an importer.
+        snapshot.edges.push(crate::snapshot::GraphEdge {
+            from: "lua-api-crates/mux/src/lib.rs".to_string(),
+            to: "lua-api-crates/mux/src/pane.rs".to_string(),
+            label: "import".to_string(),
+        });
+
+        let result = query_who_imports(&snapshot, "mux/src/pane.rs");
+        assert!(
+            result.results.is_empty(),
+            "importer of the vendored lua-api-crates copy must not be reported as an importer \
+             of the genuine mux/src/pane.rs: {:?}",
+            result.results
+        );
+    }
+
+    /// G10.1 companion: the legitimate case must still work — a bare/partial
+    /// query name with exactly one real owner still suffix-matches.
+    #[test]
+    fn who_imports_still_suffix_matches_when_target_has_one_real_owner() {
+        let mut snapshot = Snapshot::new(vec!["src".to_string()]);
+        snapshot
+            .files
+            .push(FileAnalysis::new("src/components/utils.ts".into()));
+        snapshot.files.push(FileAnalysis::new("src/app.ts".into()));
+        snapshot.edges.push(crate::snapshot::GraphEdge {
+            from: "src/app.ts".to_string(),
+            to: "src/components/utils.ts".to_string(),
+            label: "import".to_string(),
+        });
+
+        let result = query_who_imports(&snapshot, "utils.ts");
+        let files: Vec<&str> = result.results.iter().map(|m| m.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec!["src/app.ts"],
+            "a bare filename with one real owner must still resolve via suffix match"
+        );
     }
 
     #[test]

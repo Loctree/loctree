@@ -219,6 +219,12 @@ pub struct FindOptions {
     /// separate, explicitly-labeled section and are never promoted as matches.
     pub literal: bool,
 
+    /// True only for an explicit `--literal` / `--mode literal` spelling.
+    /// A plain positional query sets `literal` alone; the default human
+    /// output then adds the entity-first rollup, while the explicit literal
+    /// spelling keeps the flat per-hit contract (audit N05).
+    pub literal_explicit: bool,
+
     /// Regex truth mode: scan raw file TEXT (not just identifier tokens) for a
     /// regex pattern, keeping loct's artifact-fence coverage accounting and
     /// per-hit context labels (comment / string_literal / code). For
@@ -487,6 +493,12 @@ pub struct FollowOptions {
 
     /// Treat `pub` items in library crates as crate-internal (closed workspace).
     pub workspace_closed: bool,
+
+    /// CSV twin class filter. Only `follow twins`.
+    pub class: Option<String>,
+
+    /// Twin-family groups to skip after the class filter. Only `follow twins`.
+    pub offset: usize,
 }
 
 impl Default for FollowOptions {
@@ -497,6 +509,8 @@ impl Default for FollowOptions {
             limit: None,
             roots: Vec::new(),
             workspace_closed: false,
+            class: None,
+            offset: 0,
         }
     }
 }
@@ -749,8 +763,20 @@ pub struct TwinsOptions {
     /// Root directory to analyze (defaults to current directory)
     pub path: Option<PathBuf>,
 
-    /// Global maximum number of findings emitted across every family.
+    /// Maximum twin-family groups (exact twins, then route twins).
+    /// Dead parrots use a fixed cap and do not spend this budget.
     pub limit: Option<usize>,
+
+    /// Twin-family groups to skip after the class filter, before `limit`.
+    pub offset: usize,
+
+    /// CSV class filter. Empty means every class.
+    /// Tokens: EXACT, SHAPE_SIMILAR, NAME_COLLISION, IDIOM.
+    /// Aliases: `structural`, `naming`.
+    pub class: Option<String>,
+
+    /// Set by `follow twins`. That surface does not emit dead parrots.
+    pub omit_dead_parrots: bool,
 
     /// Show only dead parrots (symbols with 0 imports)
     pub dead_only: bool,

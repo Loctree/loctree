@@ -1,3 +1,4 @@
+import { formatHealthScore } from '../gateway';
 import type { ContextPillViewModel } from './viewModel';
 import { scopeKey } from './scope';
 
@@ -65,6 +66,6 @@ export function buildAgentContextMarkdown(vm: ContextPillViewModel, task: string
   lines.push(
     `Repo-wide: ${vm.repoFindings.hotspots} hotspots · ${vm.repoFindings.dead} dead · ${vm.repoFindings.cycles} cycles`,
   );
-  lines.push(`Repo health: ${vm.repoHealth}/100`);
+  lines.push(`Repo health: ${formatHealthScore(vm.repoHealth)}`);
   return lines.join('\n');
 }

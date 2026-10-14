@@ -45,7 +45,7 @@ static PRIVATE_IP: Lazy<Regex> = Lazy::new(|| {
     )
     .expect("private IP regex")
 });
-/// Home-directory *prefix* only (`/Users/name`, `/home/name`, `C:\Users\name`)
+/// Home-directory *prefix* only (`/home/name`, `/home/name`, `C:\Users\name`)
 /// so distinct paths under the same home stay distinct after redaction.
 static HOME_UNIX: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?:/Users|/home)/[A-Za-z0-9._-]+").expect("unix home regex"));
@@ -110,13 +110,13 @@ mod tests {
         let raw = concat!(
             "token sk-test_abcdefghijklmnopqrstuvwxyz12 ",
             "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK8=\n-----END RSA PRIVATE KEY----- ",
-            "path /Users/alice/.ssh/id_rsa ip 10.1.2.3",
+            "path /home/alice/.ssh/id_rsa ip 10.1.2.3",
         );
         let result = redact_secrets(raw);
         assert!(result.count >= 4, "count={}", result.count);
         assert!(!result.text.contains("sk-test_"), "{}", result.text);
         assert!(!result.text.contains("BEGIN RSA"), "{}", result.text);
-        assert!(!result.text.contains("/Users/alice"), "{}", result.text);
+        assert!(!result.text.contains("/home/alice"), "{}", result.text);
         assert!(!result.text.contains("10.1.2.3"), "{}", result.text);
         assert!(result.text.contains(REDACTED), "{}", result.text);
         assert!(result.text.contains("/.ssh/id_rsa"), "{}", result.text);

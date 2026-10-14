@@ -586,7 +586,9 @@ fn fence_norm_path(p: &str) -> String {
 /// - aggregated `metadata.entrypoints`,
 /// - manifest-declared roots (Cargo `[[bin]]`/`lib`, package.json
 ///   `main`/`module`/`bin`/`exports`, pyproject scripts) that resolve to an
-///   existing file.
+///   existing file,
+/// - Astro page files (`pages/*.astro`, including nested routes) when the
+///   snapshot indexes an `astro.config.{js,ts,mjs}`.
 pub fn runtime_entrypoint_paths(
     snapshot: &crate::snapshot::Snapshot,
 ) -> std::collections::HashSet<String> {
@@ -608,7 +610,87 @@ pub fn runtime_entrypoint_paths(
         }
     }
 
+    // F2a: metadata.manifest_summary only summarizes the scan roots
+    // themselves, so a monorepo's nested manifest (vibecrafted-core/
+    // pyproject.toml with 26 [project.scripts]) never fences its script
+    // targets and `loct dead` reports them all. Summarize every nested
+    // manifest straight off the indexed file list; declared paths come back
+    // relative to the manifest's own directory, so re-prefix them.
+    let scan_roots: Vec<std::path::PathBuf> = snapshot
+        .metadata
+        .roots
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    for file in &snapshot.files {
+        let rel = fence_norm_path(&file.path);
+        let is_manifest = ["pyproject.toml", "package.json", "Cargo.toml"]
+            .iter()
+            .any(|m| rel == *m || rel.ends_with(&format!("/{m}")));
+        if !is_manifest {
+            continue;
+        }
+        let Some(parent) = std::path::Path::new(&rel).parent() else {
+            continue;
+        };
+        if parent.as_os_str().is_empty() {
+            continue; // the root manifest is already in manifest_summary
+        }
+        for root in &scan_roots {
+            let abs_dir = root.join(parent);
+            if !abs_dir.is_dir() {
+                continue;
+            }
+            let summary = crate::analyzer::manifests::summarize_manifests(&abs_dir);
+            for declared in crate::snapshot::collect_declared_entrypoints(&summary) {
+                if declared.resolved && declared.exists {
+                    set.insert(fence_norm_path(&format!(
+                        "{}/{}",
+                        parent.display(),
+                        declared.path
+                    )));
+                }
+            }
+            break;
+        }
+    }
+
+    // Astro file routes. `metadata.manifest_summary` only covers scan-root
+    // manifests, and `astro.config.*` is not one of those names, so a site
+    // that lives at `site/` would never fence `site/src/pages/*.astro`.
+    // Walk the indexed file list instead. The row stays in `loct dead --full`
+    // (F2a): this set downgrades confidence, it does not drop the export.
+    // `astro.config.mts`, `pages/**/*.{md,mdx}`, and `pages/api/**` are out
+    // of this fence. A component outside `pages/` (Orphan.astro) is not.
+    if snapshot_indexes_astro_config(snapshot) {
+        for file in &snapshot.files {
+            let rel = fence_norm_path(&file.path);
+            if is_astro_page_path(&rel) {
+                set.insert(rel);
+            }
+        }
+    }
+
     set
+}
+
+/// `astro.config.{js,ts,mjs}` anywhere in the indexed tree (repo root or a
+/// nested site). `astro.config.mts` is intentionally not a gate.
+fn snapshot_indexes_astro_config(snapshot: &crate::snapshot::Snapshot) -> bool {
+    snapshot.files.iter().any(|file| {
+        let rel = fence_norm_path(&file.path);
+        let name = rel.rsplit('/').next().unwrap_or(rel.as_str());
+        matches!(
+            name,
+            "astro.config.js" | "astro.config.ts" | "astro.config.mjs"
+        )
+    })
+}
+
+/// Astro page route: `.astro` under a `pages/` segment (`pages/terms.astro`,
+/// `src/pages/terms.astro`, `site/src/pages/voice/lab.astro`).
+fn is_astro_page_path(rel: &str) -> bool {
+    rel.ends_with(".astro") && (rel.starts_with("pages/") || rel.contains("/pages/"))
 }
 
 /// Disk probe for entry markers the per-language analyzers may not record:
@@ -712,7 +794,7 @@ const SWIFT_DELEGATE_PREFIXES: &[&str] = &[
 ///
 /// Not covered: `extension` of a type declared outside the repo, and witnesses
 /// whose names collide with ordinary helpers. Those need resolved conformances.
-/// (loctree-fail 2026-08-12, Pensieve report: ~90% of "high-confidence dead"
+/// (loctree-feedback 2026-08-12, Pensieve report: ~90% of "high-confidence dead"
 /// were AppKit/SwiftUI witnesses.)
 pub fn probe_framework_dispatched_declaration(
     full_path: &std::path::Path,

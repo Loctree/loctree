@@ -546,6 +546,7 @@ mod tests {
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         };
 
         let dead = vec![mock_dead("src/utils.ts", "unusedHelper", Some(10))];

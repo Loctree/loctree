@@ -1,6 +1,6 @@
 //! Cut 11 — budget engine for the pill renderer.
 //!
-//! Hard contract: total markdown ≤ 1000 lines, fixed per-section caps,
+//! Hard contract: total markdown ≤ 250 lines, fixed per-section caps,
 //! ranking-aware truncation with a uniform tail line. The engine is a
 //! pure-data utility (no I/O); the pill renderer feeds it ranked content
 //! and gets back content trimmed to budget.
@@ -9,13 +9,13 @@
 //!
 //! | Section          | Cap | Notes                                     |
 //! |------------------|-----|-------------------------------------------|
-//! | TL;DR            | 100 | generated last, rendered first            |
-//! | Where You Are    | 200 | hubs, cycles, recent activity, risk       |
-//! | What's Live      | 200 | idiom tags, dispatch, env, reachability   |
-//! | Memory           | 200 | AICX entries (already capped upstream)    |
-//! | Action           | 100 | ≤3 next-safe commands + gates + tests     |
-//! | Authority Index  | 100 | bucket counts (no enumeration)            |
-//! | Total            |1000 | preserved by [`Budget::TOTAL_CEILING`]    |
+//! | TL;DR            |  30 | generated last, rendered first            |
+//! | Where You Are    |  40 | hubs, cycles, recent activity, risk       |
+//! | What's Live      |  40 | idiom tags, dispatch, env, reachability   |
+//! | Memory           |  30 | AICX entries (already capped upstream)    |
+//! | Action           |  40 | ≤3 next-safe commands + gates + tests     |
+//! | Authority Index  |  20 | bucket counts (no enumeration)            |
+//! | Total            | 250 | preserved by [`Budget::TOTAL_CEILING`]    |
 //!
 //! When ranked content exceeds a section's cap, the engine drops the
 //! lowest-ranked rows and appends a uniform tail line so the operator
@@ -28,14 +28,14 @@ pub struct Budget;
 
 impl Budget {
     /// Total markdown line ceiling for the pill output.
-    pub const TOTAL_CEILING: usize = 1000;
+    pub const TOTAL_CEILING: usize = 250;
 
-    pub const TLDR_CAP: usize = 100;
-    pub const WHERE_CAP: usize = 200;
-    pub const LIVE_CAP: usize = 200;
-    pub const MEMORY_CAP: usize = 200;
-    pub const ACTION_CAP: usize = 100;
-    pub const AUTHORITY_CAP: usize = 100;
+    pub const TLDR_CAP: usize = 30;
+    pub const WHERE_CAP: usize = 40;
+    pub const LIVE_CAP: usize = 40;
+    pub const MEMORY_CAP: usize = 30;
+    pub const ACTION_CAP: usize = 40;
+    pub const AUTHORITY_CAP: usize = 20;
 
     /// Sum of section caps. Always ≤ [`Self::TOTAL_CEILING`]; the gap is
     /// reserved for the header, footer, and inter-section blank lines so

@@ -407,7 +407,11 @@ pub(crate) fn resolve_reexport_target(
     let candidate = parent.join(spec);
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext == "py" || ext == "pyi" {
-        resolve_python_candidate(candidate, root, exts)
+        // No registered py_roots reach this call site (a relative reexport
+        // spec is always resolved against the importing file, never a
+        // registered root) — is_namespace_package falls back to its
+        // permissive (root-agnostic) behaviour for an empty slice.
+        resolve_python_candidate(candidate, root, &[], exts)
     } else {
         resolve_with_extensions_hint(candidate, root, exts, Some("ts"))
     }
@@ -444,7 +448,9 @@ pub(crate) fn resolve_python_relative(
         base.join(remainder)
     };
 
-    resolve_python_candidate(joined, root, exts)
+    // Same as resolve_reexport_target above: a relative import has no
+    // registered py_roots list at this call site.
+    resolve_python_candidate(joined, root, &[], exts)
 }
 
 pub(crate) fn resolve_js_relative(
@@ -464,6 +470,7 @@ pub(crate) fn resolve_js_relative(
 pub(crate) fn resolve_python_candidate(
     candidate: PathBuf,
     root: &Path,
+    py_roots: &[PathBuf],
     exts: Option<&HashSet<String>>,
 ) -> Option<String> {
     if candidate.is_dir() {
@@ -478,15 +485,40 @@ pub(crate) fn resolve_python_candidate(
             }
         }
 
-        if is_namespace_package(&candidate) {
+        if is_namespace_package(&candidate, py_roots) {
             return canonical_rel(&candidate, root).or_else(|| canonical_abs(&candidate));
         }
+
+        // G5: this directory is neither a regular package (`__init__.py`)
+        // nor a qualifying namespace package — refuse it outright instead of
+        // falling through to resolve_with_extensions_hint below. That
+        // function's directory branch unconditionally resolves ANY existing
+        // directory to its own path once it decides the candidate "exists"
+        // (it has no notion of package-shape at all), which would silently
+        // re-admit exactly the phantom nodes is_namespace_package above was
+        // just tightened to reject (a bare `scripts` dir, a Zig `src/os`
+        // dir) — the bounded namespace-package check would otherwise have
+        // been checked for nothing.
+        return None;
     }
 
     resolve_with_extensions_hint(candidate, root, exts, Some("py"))
 }
 
-fn is_namespace_package(dir: &Path) -> bool {
+/// G5: a namespace package (PEP 420 — no `__init__.py`) is only a real import
+/// target when `dir` (a) is actually reachable from one of the registered
+/// `py_roots` and (b) directly looks package-shaped: it either holds a `.py`/
+/// `.pyi` file itself, or a direct child subdirectory that is a regular
+/// package (`__init__.py`) or itself directly holds `.py` files. The previous
+/// version recursed without any depth bound, so ANY directory that
+/// transitively contained a `.py` file *anywhere* below it — a bare `scripts`
+/// dir, a Zig `src/os` dir — was wrongly accepted as a namespace package,
+/// producing phantom graph nodes.
+fn is_namespace_package(dir: &Path, py_roots: &[PathBuf]) -> bool {
+    if !is_reachable_from_py_root(dir, py_roots) {
+        return false;
+    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
@@ -499,14 +531,45 @@ fn is_namespace_package(dir: &Path) -> bool {
             {
                 return true;
             }
-        } else if path.is_dir() {
-            let subdir_init = path.join("__init__.py");
-            if subdir_init.exists() || is_namespace_package(&path) {
-                return true;
-            }
+        } else if path.is_dir()
+            && (path.join("__init__.py").exists() || directly_holds_py_files(&path))
+        {
+            return true;
         }
     }
     false
+}
+
+/// True when `dir` sits at or under one of `py_roots`. An empty `py_roots`
+/// slice means the call site has no root list to check against (relative
+/// imports / reexports never carry one) — permissive by design, since those
+/// resolutions are always anchored to a real file the caller already knows
+/// about, not a bare directory guess.
+fn is_reachable_from_py_root(dir: &Path, py_roots: &[PathBuf]) -> bool {
+    if py_roots.is_empty() {
+        return true;
+    }
+    let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    py_roots.iter().any(|py_root| {
+        let root_canon = py_root.canonicalize().unwrap_or_else(|_| py_root.clone());
+        dir_canon.starts_with(&root_canon)
+    })
+}
+
+/// One bounded level: does `dir` itself (not a further descendant) contain a
+/// `.py`/`.pyi` file directly?
+fn directly_holds_py_files(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_file()
+            && path
+                .extension()
+                .map(|ext| ext == "py" || ext == "pyi")
+                .unwrap_or(false)
+    })
 }
 
 pub(crate) fn has_py_typed_marker(package_dir: &Path) -> bool {
@@ -522,7 +585,9 @@ pub(crate) fn resolve_python_absolute(
     let normalized = module.replace('.', "/");
     for base in roots {
         let candidate = base.join(&normalized);
-        if let Some(resolved) = resolve_python_candidate(candidate.clone(), root_for_rel, exts) {
+        if let Some(resolved) =
+            resolve_python_candidate(candidate.clone(), root_for_rel, roots, exts)
+        {
             return Some(resolved);
         }
     }
@@ -1264,6 +1329,22 @@ pub(crate) fn resolve_rust_import(
         if !source.contains("::") {
             return None;
         }
+        // G4.3: a bare `use foo::Bar;` that didn't resolve as a workspace
+        // member or a `path = "../foo"` dependency above still isn't
+        // automatically a *local* module. If `foo` is a dependency this
+        // crate's own manifest actually declares (registry or otherwise) and
+        // there is no explicit `mod foo;` bringing a same-named local file
+        // into the module tree, falling through to resolve_rust_module_path
+        // below would coincidentally match an unrelated local file that
+        // merely happens to share the dependency's name (e.g. a local
+        // `rmp.rs` shadowing the `rmp` crate). Refuse that coincidental
+        // match and report unresolved-external instead.
+        let head = source.split("::").next().unwrap_or(source);
+        if is_declared_external_dependency(head, crate_root, root)
+            && !has_local_mod_declaration(head, crate_root)
+        {
+            return None;
+        }
         resolve_rust_module_path(source, crate_root)
     };
 
@@ -1335,40 +1416,152 @@ fn resolve_cross_crate_import(
         None => (source, ""),
     };
 
-    let members = get_workspace_members(crate_root, root)?;
+    if let Some(members) = get_workspace_members(crate_root, root) {
+        for member in members {
+            let matches = member.lib_name.as_deref() == Some(crate_ident)
+                || member.package_name == crate_ident
+                || member.package_name.replace('-', "_") == crate_ident
+                || member
+                    .targets
+                    .iter()
+                    .any(|t| t.kind == TargetKind::Lib && t.name == crate_ident);
 
-    for member in members {
-        let matches = member.lib_name.as_deref() == Some(crate_ident)
-            || member.package_name == crate_ident
-            || member.package_name.replace('-', "_") == crate_ident
-            || member
+            if !matches {
+                continue;
+            }
+
+            let target = member
                 .targets
                 .iter()
-                .any(|t| t.kind == TargetKind::Lib && t.name == crate_ident);
+                .find(|t| t.kind == TargetKind::Lib)
+                .or_else(|| member.targets.iter().find(|t| t.kind == TargetKind::Bin))?;
 
-        if !matches {
-            continue;
+            let lib_path = &target.path;
+            let search_dir = lib_path.parent()?;
+
+            if !remainder.is_empty()
+                && let Some(mod_file) = resolve_rust_module_path(remainder, search_dir)
+            {
+                return canonical_rel(&mod_file, root).or_else(|| canonical_abs(&mod_file));
+            }
+
+            return canonical_rel(lib_path, root).or_else(|| canonical_abs(lib_path));
         }
-
-        let target = member
-            .targets
-            .iter()
-            .find(|t| t.kind == TargetKind::Lib)
-            .or_else(|| member.targets.iter().find(|t| t.kind == TargetKind::Bin))?;
-
-        let lib_path = &target.path;
-        let search_dir = lib_path.parent()?;
-
-        if !remainder.is_empty()
-            && let Some(mod_file) = resolve_rust_module_path(remainder, search_dir)
-        {
-            return canonical_rel(&mod_file, root).or_else(|| canonical_abs(&mod_file));
-        }
-
-        return canonical_rel(lib_path, root).or_else(|| canonical_abs(lib_path));
     }
 
-    None
+    // G3: crate pulled in via a `path = "../foo"` dependency declared on the
+    // importing crate's OWN manifest, without being listed under
+    // `[workspace].members` (wezterm-style: termwiz, mux, codec are wired
+    // together purely through path deps). `get_workspace_members` above only
+    // ever sees `[workspace].members`, so this never resolved before.
+    resolve_path_dependency_import(crate_ident, remainder, crate_root, root)
+}
+
+/// Resolve `crate_ident::remainder` against the path dependencies declared on
+/// the nearest Cargo.toml above `crate_root` — the G3 fallback for crates
+/// that participate via `path = "../foo"` without being workspace members.
+fn resolve_path_dependency_import(
+    crate_ident: &str,
+    remainder: &str,
+    crate_root: &Path,
+    root: &Path,
+) -> Option<String> {
+    let manifest_path =
+        crate::analyzer::cargo_manifest::find_nearest_crate_manifest(crate_root, root)?;
+    let deps = crate::analyzer::cargo_manifest::parse_path_dependencies(&manifest_path);
+    let dep = deps.iter().find(|d| d.name == crate_ident)?;
+
+    let dep_manifest = dep.crate_dir.join("Cargo.toml");
+    let lib_path = dep_manifest
+        .exists()
+        .then(|| crate::analyzer::cargo_manifest::parse_crate_manifest(&dep_manifest).ok())
+        .flatten()
+        .and_then(|manifest| {
+            manifest
+                .targets
+                .into_iter()
+                .find(|t| t.kind == TargetKind::Lib)
+                .map(|t| t.path)
+        })
+        .unwrap_or_else(|| dep.crate_dir.join("src/lib.rs"));
+
+    if !remainder.is_empty()
+        && let Some(search_dir) = lib_path.parent()
+        && let Some(mod_file) = resolve_rust_module_path(remainder, search_dir)
+    {
+        return canonical_rel(&mod_file, root).or_else(|| canonical_abs(&mod_file));
+    }
+
+    canonical_rel(&lib_path, root).or_else(|| canonical_abs(&lib_path))
+}
+
+/// G4.3: does the importing crate's own manifest declare `ident` as a
+/// dependency (registry or path — either way, the identifier belongs to an
+/// external crate, not a local module)?
+fn is_declared_external_dependency(ident: &str, crate_root: &Path, root: &Path) -> bool {
+    let Some(manifest_path) =
+        crate::analyzer::cargo_manifest::find_nearest_crate_manifest(crate_root, root)
+    else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return false;
+    };
+    for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(table) = value.get(table_name).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        if table.keys().any(|key| key.replace('-', "_") == ident) {
+            return true;
+        }
+    }
+    false
+}
+
+/// G4.3: is there an explicit `mod <ident>;` (or `pub mod <ident>;` /
+/// `pub(crate) mod <ident>;`) declaration in one of the crate's likely
+/// module-tree entry files? A real local module is always brought into scope
+/// this way; a bare filesystem coincidence (a local file sharing a
+/// dependency's name) never is.
+fn has_local_mod_declaration(ident: &str, crate_root: &Path) -> bool {
+    for entry_name in ["lib.rs", "main.rs", "mod.rs"] {
+        let path = crate_root.join(entry_name);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if file_declares_mod(&content, ident) {
+            return true;
+        }
+    }
+    false
+}
+
+fn file_declares_mod(content: &str, ident: &str) -> bool {
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let after_mod = trimmed
+            .strip_prefix("pub(crate) mod ")
+            .or_else(|| trimmed.strip_prefix("pub(super) mod "))
+            .or_else(|| trimmed.strip_prefix("pub mod "))
+            .or_else(|| trimmed.strip_prefix("mod "));
+        let Some(rest) = after_mod else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(after_ident) = rest.strip_prefix(ident) else {
+            continue;
+        };
+        // Word boundary: `mod rmp;` matches, `mod rmp_extra;` must not.
+        match after_ident.chars().next() {
+            Some(c) if c == ';' || c == '{' || c.is_whitespace() => return true,
+            None => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn resolve_rust_module_path(module: &str, base: &Path) -> Option<PathBuf> {
@@ -1377,7 +1570,7 @@ fn resolve_rust_module_path(module: &str, base: &Path) -> Option<PathBuf> {
     // Trailing ::Item or ::{...} (the imported symbol(s)) must not prevent resolution
     // to the defining module file. This powers consumer edges for impact/slice/who-imports
     // on leaf modules and on module-directory facades (mod.rs).
-    // See loctree-fail.md:2997 (facade), 3144 (cross-module use with item), 2900 (fn-body use).
+    // See loctree-feedback.md:2997 (facade), 3144 (cross-module use with item), 2900 (fn-body use).
     let segments: Vec<&str> = module.split("::").collect();
     if segments.is_empty() {
         return None;
@@ -1391,9 +1584,20 @@ fn resolve_rust_module_path(module: &str, base: &Path) -> Option<PathBuf> {
         let as_file = search_base.join(format!("{}.rs", seg));
         if as_file.exists() {
             last_resolved = Some(as_file.clone());
-            // Parent dir becomes search base for any submodules (though items inside this file
-            // would terminate the module path here).
-            search_base = as_file.parent().unwrap_or(&search_base).to_path_buf();
+            // G4.4: when `seg.rs` also has a `seg/` sibling directory (e.g.
+            // `store.rs` declaring `pub mod entry;` backed by `store/entry.rs`),
+            // any further segments are submodules living under `store/`, not
+            // under the crate root. The next search_base must be that
+            // directory; only fall back to the unchanged base (the file's own
+            // parent, i.e. no-op) when no such directory exists — otherwise
+            // `crate::store::entry::KvEntry` wrongly resolved to store.rs
+            // itself instead of store/entry.rs.
+            let submodule_dir = search_base.join(seg);
+            search_base = if submodule_dir.is_dir() {
+                submodule_dir
+            } else {
+                as_file.parent().unwrap_or(&search_base).to_path_buf()
+            };
             // If this was the final segment in the provided path, it is the module surface.
             // If more segments follow, they are items inside; we still return this file as owner
             // (handled by the non-match of next segment below).
@@ -1800,7 +2004,8 @@ mod tests {
     fn test_resolve_python_candidate_directory_with_init() {
         let dir = create_python_project();
         assert!(
-            resolve_python_candidate(dir.path().join("src/mypackage"), dir.path(), None).is_some()
+            resolve_python_candidate(dir.path().join("src/mypackage"), dir.path(), &[], None)
+                .is_some()
         );
     }
 
@@ -1808,8 +2013,13 @@ mod tests {
     fn test_resolve_python_candidate_file() {
         let dir = create_python_project();
         assert!(
-            resolve_python_candidate(dir.path().join("src/mypackage/utils.py"), dir.path(), None)
-                .is_some()
+            resolve_python_candidate(
+                dir.path().join("src/mypackage/utils.py"),
+                dir.path(),
+                &[],
+                None
+            )
+            .is_some()
         );
     }
 
@@ -1828,6 +2038,49 @@ mod tests {
         let dir = create_python_project();
         let roots = vec![dir.path().join("src")];
         assert!(resolve_python_absolute("nonexistent.module", &roots, dir.path(), None).is_none());
+    }
+
+    #[test]
+    fn g5_namespace_package_rejects_bare_dir_with_only_deep_py_file() {
+        // A `scripts` dir with no package shape at all: only non-Python
+        // content at the top, and a single .py file buried several levels
+        // down. Nothing about this directory looks like a namespace package
+        // — it just happens to contain a .py file somewhere underneath.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("scripts/deploy/tools/misc")).unwrap();
+        fs::write(root.join("scripts/readme.txt"), "not python").unwrap();
+        fs::write(
+            root.join("scripts/deploy/tools/misc/helper.py"),
+            "VALUE = 1",
+        )
+        .unwrap();
+
+        let py_roots = vec![root.to_path_buf()];
+        let result = resolve_python_candidate(root.join("scripts"), root, &py_roots, None);
+        assert!(
+            result.is_none(),
+            "bare 'scripts' dir with only a deeply nested .py file must not resolve as a namespace package, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn g5_namespace_package_accepts_directly_package_shaped_dir() {
+        // Sanity check: a directory that DOES directly look like a namespace
+        // package (holds a .py file itself, or a direct child that is a
+        // regular/namespace package) must still resolve — the fix bounds the
+        // recursion depth, it does not disable namespace packages outright.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("ns_pkg/sub")).unwrap();
+        fs::write(root.join("ns_pkg/module.py"), "VALUE = 1").unwrap();
+
+        let py_roots = vec![root.to_path_buf()];
+        let result = resolve_python_candidate(root.join("ns_pkg"), root, &py_roots, None);
+        assert!(
+            result.is_some(),
+            "expected ns_pkg to resolve as a namespace package"
+        );
     }
 
     #[test]
@@ -1971,6 +2224,35 @@ mod tests {
     }
 
     #[test]
+    fn g4_4_module_file_then_subdirectory_resolves_to_submodule() {
+        // store.rs declares `pub mod entry;` backed by a store/entry.rs file
+        // living *alongside* store.rs (not inside a store/mod.rs facade).
+        // `crate::store::entry::KvEntry` must resolve to store/entry.rs, not
+        // to store.rs (the module surface that owns the `entry` item name).
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("src/store")).unwrap();
+        fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "mod store;").unwrap();
+        fs::write(dir.path().join("src/store.rs"), "pub mod entry;").unwrap();
+        fs::write(dir.path().join("src/store/entry.rs"), "pub struct KvEntry;").unwrap();
+
+        let file = dir.path().join("src/lib.rs");
+        let crate_root = dir.path().join("src");
+        let result = resolve_rust_import(
+            "crate::store::entry::KvEntry",
+            &file,
+            &crate_root,
+            dir.path(),
+        );
+        assert!(result.is_some());
+        let result_path = result.unwrap();
+        assert!(
+            result_path.ends_with("store/entry.rs"),
+            "Expected store/entry.rs, got: {result_path}"
+        );
+    }
+
+    #[test]
     fn test_resolve_rust_import_nested_module_dir() {
         let dir = TempDir::new().unwrap();
         fs::create_dir_all(dir.path().join("src/foo/bar")).unwrap();
@@ -2052,7 +2334,7 @@ mod tests {
 
         // 1. Python candidate resolution must deterministically choose .py, never .swift
         for _ in 0..10 {
-            let res = resolve_python_candidate(src.join("helper"), dir.path(), Some(&exts));
+            let res = resolve_python_candidate(src.join("helper"), dir.path(), &[], Some(&exts));
             assert!(res.is_some());
             let path = res.unwrap();
             assert!(
@@ -2063,7 +2345,7 @@ mod tests {
 
         // 2. Python candidate resolution must NEVER resolve to .swift even if .py does not exist
         fs::remove_file(src.join("helper.py")).unwrap();
-        let res_no_py = resolve_python_candidate(src.join("helper"), dir.path(), Some(&exts));
+        let res_no_py = resolve_python_candidate(src.join("helper"), dir.path(), &[], Some(&exts));
         assert!(
             res_no_py.is_none(),
             "Python candidate must not resolve to swift or other languages, got: {:?}",
@@ -2196,6 +2478,99 @@ mod tests {
                 .iter()
                 .any(|c| c.file == lib_b_path),
             "Crate B lib.rs must be visible as a direct consumer of crate A lib.rs"
+        );
+    }
+
+    #[test]
+    fn g3_path_dependency_resolves_without_workspace_membership() {
+        // Crate A depends on Crate B via `path = "../b"`, but there is NO
+        // `[workspace]` manifest at all (wezterm-style: some crates are wired
+        // together purely through path deps, never registered as workspace
+        // members anywhere).
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        let crate_a_dir = root.join("crates/a");
+        fs::create_dir_all(crate_a_dir.join("src")).unwrap();
+        fs::write(
+            crate_a_dir.join("Cargo.toml"),
+            "[package]\nname = \"a\"\n\n[dependencies]\nb = { path = \"../b\" }\n",
+        )
+        .unwrap();
+        fs::write(crate_a_dir.join("src/lib.rs"), "use b::Thing;").unwrap();
+
+        let crate_b_dir = root.join("crates/b");
+        fs::create_dir_all(crate_b_dir.join("src")).unwrap();
+        fs::write(crate_b_dir.join("Cargo.toml"), "[package]\nname = \"b\"\n").unwrap();
+        fs::write(crate_b_dir.join("src/lib.rs"), "pub struct Thing;").unwrap();
+
+        let file_a = crate_a_dir.join("src/lib.rs");
+        let crate_a_root = crate_a_dir.join("src");
+
+        let resolved = resolve_rust_import("b::Thing", &file_a, &crate_a_root, root);
+        assert!(
+            resolved.is_some(),
+            "expected path-dependency crate b to resolve without being a workspace member"
+        );
+        let resolved_path = resolved.unwrap();
+        assert!(
+            resolved_path.ends_with("crates/b/src/lib.rs"),
+            "expected resolution to crates/b/src/lib.rs, got: {resolved_path}"
+        );
+    }
+
+    #[test]
+    fn g4_3_dependency_name_never_falls_back_to_coincidental_local_file() {
+        // `rmp` is declared as a REGISTRY dependency (no path — this is not a
+        // G3 path-dep scenario), and an unrelated local file `rmp.rs` happens
+        // to share the name. `use rmp::Serializer;` must not coincidentally
+        // resolve to that local file: there is no `mod rmp;` anywhere
+        // bringing it into the module tree, so it is not actually reachable
+        // as `crate::rmp` — the bare `use rmp::...` can only mean the crate.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"test\"\n\n[dependencies]\nrmp = \"0.8\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "fn main() {}").unwrap();
+        // Unrelated local file that merely shares the dependency's name.
+        fs::write(root.join("src/rmp.rs"), "pub struct Serializer;").unwrap();
+
+        let file = root.join("src/lib.rs");
+        let crate_root = root.join("src");
+        let resolved = resolve_rust_import("rmp::Serializer", &file, &crate_root, root);
+        assert!(
+            resolved.is_none(),
+            "expected `use rmp::Serializer` to stay unresolved-external, got: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn g4_3_local_module_with_matching_mod_declaration_still_resolves() {
+        // Sanity check for the gate above: a *genuine* local module that
+        // happens to share a dependency's name (declared via `mod rmp;`)
+        // must still resolve locally — the gate only refuses the
+        // coincidental, undeclared case.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"test\"\n\n[dependencies]\nrmp = \"0.8\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "mod rmp;").unwrap();
+        fs::write(root.join("src/rmp.rs"), "pub struct Serializer;").unwrap();
+
+        let file = root.join("src/lib.rs");
+        let crate_root = root.join("src");
+        let resolved = resolve_rust_import("rmp::Serializer", &file, &crate_root, root);
+        assert!(
+            resolved.is_some(),
+            "expected a genuinely mod-declared local `rmp` to still resolve"
         );
     }
 }

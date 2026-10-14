@@ -38,6 +38,17 @@ pub(super) fn parse_plugin_command(cmd_name: &str) -> (String, Option<String>) {
     (cmd_name.to_string(), None)
 }
 
+/// H2: does `name` look like a valid Rust function identifier (the shape a
+/// real Tauri `#[tauri::command]` handler name must have)? Real command
+/// names are snake_case Rust identifiers - they can never contain a hyphen,
+/// space, or other punctuation. UI action/event labels commonly do (e.g.
+/// `"reattach-workspace"`), which is the actual signal that separates a
+/// genuine invoke command name from a look-alike picked up by the bare
+/// `*Command` substring heuristic below.
+fn looks_like_command_identifier(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Check if file uses Flow type annotations.
 ///
 /// Flow files start with `// @flow` or `/* @flow */`
@@ -83,18 +94,25 @@ impl<'a> JsVisitor<'a> {
 
     /// Handle call expression for command and event detection.
     pub(super) fn handle_call_expression(&mut self, call: &CallExpression<'a>) {
-        let callee_name = match &call.callee {
-            Expression::Identifier(ident) => Some(ident.name.to_string()),
+        // Keep the receiver of a member call: `server.listen(..)` and
+        // `appWindow.listen(..)` spell the same method name but are not the
+        // same fact (audit N06).
+        let (callee_name, receiver) = match &call.callee {
+            Expression::Identifier(ident) => (Some(ident.name.to_string()), None),
             Expression::StaticMemberExpression(member) => {
+                let receiver = match &member.object {
+                    Expression::Identifier(obj) => Some(obj.name.to_string()),
+                    _ => None,
+                };
                 // Handle obj.emit(...)
-                Some(member.property.name.to_string())
+                (Some(member.property.name.to_string()), receiver)
             }
-            _ => None,
+            _ => (None, None),
         };
 
         if let Some(name) = callee_name {
             self.handle_command_detection(&name, call);
-            self.handle_event_detection(&name, call);
+            self.handle_event_detection(&name, receiver.as_deref(), call);
         }
     }
 
@@ -149,6 +167,23 @@ impl<'a> JsVisitor<'a> {
                 // e.g., "plugin:window|set_icon" -> plugin_name="window", actual_cmd="set_icon"
                 let (actual_cmd, plugin_name) = parse_plugin_command(&cmd_name);
 
+                // H2: the bare `*Command` name heuristic (e.g.
+                // `broadcastWindowCommand`) is not enough signal on its own -
+                // UI action/broadcast helpers commonly carry "Command" in
+                // their name without being anywhere near a Tauri invoke call.
+                // When "invoke" isn't in the callee name at all, require the
+                // extracted argument to actually look like a Rust command
+                // identifier. `broadcastWindowCommand('reattach-workspace')`
+                // fails this (hyphenated event-style label) and is skipped
+                // entirely here, at detection time, so this data can never
+                // surface downstream as a CRITICAL missing-handler finding
+                // (see for_ai.rs, not owned by this executor).
+                // `customCommandWrapper("another_cmd", ...)` style wrappers
+                // keep working: "another_cmd" is identifier-shaped.
+                if !name_lower.contains("invoke") && !looks_like_command_identifier(&actual_cmd) {
+                    return;
+                }
+
                 // Payload casing drift: if command name looks snake_case and payload keys are camelCase
                 let mut casing_issues: Vec<CommandPayloadCasing> = Vec::new();
                 if actual_cmd.contains('_')
@@ -186,13 +221,23 @@ impl<'a> JsVisitor<'a> {
                     generic_type: generic,
                     payload: None,
                     plugin_name,
+                    // A wrapper-shaped name (`*Command*`) with no "invoke" in
+                    // the callee is spelling, not proof. The file-level
+                    // post-pass clears this when a Tauri import is present
+                    // (audit N06).
+                    unconfirmed_import: !name_lower.contains("invoke"),
                 });
             }
         }
     }
 
     /// Detect event emit/listen patterns and record event references.
-    fn handle_event_detection(&mut self, name: &str, call: &CallExpression<'a>) {
+    fn handle_event_detection(
+        &mut self,
+        name: &str,
+        receiver: Option<&str>,
+        call: &CallExpression<'a>,
+    ) {
         // Events: emit / listen
         // Heuristic: function name contains "emit" or "listen"
         let is_emit = name == "emit" || name.ends_with("emit"); // e.g. window.emit, appWindow.emit
@@ -243,7 +288,16 @@ impl<'a> JsVisitor<'a> {
                     if let Some(val) = self.analysis.event_consts.get(&id_name) {
                         (val.clone(), Some(id_name), "const", false)
                     } else {
-                        (id_name.clone(), Some(id_name), "ident", false)
+                        // H1: a bare identifier that doesn't resolve to a
+                        // known string-literal constant is not a safe event
+                        // name to register. Without this guard, generic
+                        // `.listen()`/`.emit()` name-matching (e.g.
+                        // `server.listen(PORT)`, `emitter.emit(someVar)`)
+                        // synthesizes an event literally named after the
+                        // variable ("PORT", "someVar") - a fabricated event
+                        // name, not a real one. Skip the whole call instead
+                        // of recording a made-up event.
+                        return;
                     }
                 }
                 _ => ("?".to_string(), None, "unknown", false),
@@ -261,6 +315,7 @@ impl<'a> JsVisitor<'a> {
                     awaited: false, // Todo: check await parent
                     payload,
                     is_dynamic,
+                    receiver: receiver.map(str::to_string),
                 });
             } else {
                 // listen
@@ -273,6 +328,7 @@ impl<'a> JsVisitor<'a> {
                     awaited: false,
                     payload: None,
                     is_dynamic,
+                    receiver: receiver.map(str::to_string),
                 });
             }
         }
@@ -403,6 +459,128 @@ mod tests {
         assert!(matches!(lazy_import.kind, ImportKind::Dynamic));
     }
 
+    /// H1 RED: `server.listen(PORT)` where PORT is a bare, unresolved
+    /// identifier (not a string-literal-valued const) must not fabricate an
+    /// event listener named "PORT".
+    #[test]
+    fn test_bare_identifier_listen_arg_not_registered_as_event() {
+        let content = r#"
+            const PORT = 3000;
+            server.listen(PORT);
+        "#;
+
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/server.ts"),
+            Path::new("src"),
+            None,
+            None,
+            "server.ts".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+
+        assert!(
+            analysis.event_listens.is_empty(),
+            "server.listen(PORT) must not register any event listener, found: {:?}",
+            analysis
+                .event_listens
+                .iter()
+                .map(|e| &e.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// H1 RED: `emitter.emit(someVar)` where someVar is a bare, unresolved
+    /// identifier must not fabricate an event named after the variable.
+    #[test]
+    fn test_bare_identifier_emit_arg_not_registered_as_event() {
+        let content = r#"
+            function notify(someVar) {
+                emitter.emit(someVar);
+            }
+        "#;
+
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/notify.ts"),
+            Path::new("src"),
+            None,
+            None,
+            "notify.ts".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+
+        assert!(
+            !analysis.event_emits.iter().any(|e| e.name == "someVar"),
+            "emitter.emit(someVar) must not register an event named after the variable, found: {:?}",
+            analysis
+                .event_emits
+                .iter()
+                .map(|e| &e.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// H2 RED: a bare `*Command`-named function whose argument is a
+    /// hyphenated, event-style label (not a valid Rust command identifier)
+    /// must not be treated as a Tauri invoke command bridge.
+    #[test]
+    fn test_broadcast_window_command_not_treated_as_invoke() {
+        let content = r#"
+            broadcastWindowCommand('reattach-workspace');
+        "#;
+
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/window.ts"),
+            Path::new("src"),
+            None,
+            None,
+            "window.ts".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+
+        assert!(
+            analysis.command_calls.is_empty(),
+            "broadcastWindowCommand('reattach-workspace') must not be treated as a Tauri invoke command, found: {:?}",
+            analysis
+                .command_calls
+                .iter()
+                .map(|c| &c.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Guard: legitimate `*Command` wrapper functions with identifier-shaped
+    /// (snake_case) command names must keep being detected - this mirrors
+    /// `customCommandWrapper("another_cmd", options)` in
+    /// `analyzer/js.rs::detects_commands_reexports_and_exports`, which must
+    /// keep passing after the H2 fix.
+    #[test]
+    fn test_command_wrapper_with_identifier_name_still_detected() {
+        let content = r#"
+            customCommandWrapper("another_cmd", options);
+        "#;
+
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/app.tsx"),
+            Path::new("src"),
+            None,
+            None,
+            "app.tsx".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+
+        assert!(
+            analysis
+                .command_calls
+                .iter()
+                .any(|c| c.name == "another_cmd"),
+            "customCommandWrapper('another_cmd', ...) should still be detected as a command"
+        );
+    }
+
     #[test]
     fn test_flow_file_detection() {
         // Test Flow annotation detection at start of file
@@ -457,6 +635,83 @@ export const myValue = 42;
         assert!(
             !analysis.is_flow_file,
             "File without @flow annotation should NOT be detected as Flow file"
+        );
+    }
+    #[test]
+    fn server_listen_without_tauri_import_is_not_an_event() {
+        // Audit N06: the method NAME `listen` on a foreign receiver is not a
+        // Tauri event; only spelling matched before.
+        let content = r#"
+            const server = createServer();
+            server.listen("http");
+        "#;
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/server.ts"),
+            Path::new("src"),
+            None,
+            None,
+            "server.ts".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+        assert!(
+            analysis.event_listens.is_empty(),
+            "server.listen(\"http\") in a file with no Tauri import must not register an event, got: {:?}",
+            analysis.event_listens
+        );
+    }
+
+    #[test]
+    fn tauri_import_keeps_member_call_events() {
+        let content = r#"
+            import { listen } from "@tauri-apps/api/event";
+            import { appWindow } from "@tauri-apps/api/window";
+            appWindow.listen("scale-changed", () => {});
+        "#;
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/win.ts"),
+            Path::new("src"),
+            None,
+            None,
+            "win.ts".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+        assert!(
+            analysis
+                .event_listens
+                .iter()
+                .any(|e| e.name == "scale-changed"),
+            "a member-call listen in a Tauri-importing file is a real event, got: {:?}",
+            analysis.event_listens
+        );
+    }
+
+    #[test]
+    fn command_wrapper_without_tauri_import_is_unconfirmed() {
+        // Audit N06: still detected (the wrapper heuristic has value), but
+        // explicitly carried as unconfirmed evidence so downstream gap
+        // analysis never claims CRITICAL from spelling alone.
+        let content = r#"
+            customCommandWrapper("another_cmd", options);
+        "#;
+        let analysis = analyze_js_file_ast(
+            content,
+            Path::new("src/app.tsx"),
+            Path::new("src"),
+            None,
+            None,
+            "app.tsx".to_string(),
+            &CommandDetectionConfig::default(),
+        );
+        let call = analysis
+            .command_calls
+            .iter()
+            .find(|c| c.name == "another_cmd")
+            .expect("wrapper command still detected");
+        assert!(
+            call.unconfirmed_import,
+            "a wrapper-shaped command in a file with no Tauri import must be marked unconfirmed"
         );
     }
 }

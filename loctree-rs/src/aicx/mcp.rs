@@ -399,6 +399,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(aicx_env)]
     fn mcp_call_timeout_honors_aicx_timeout_env() {
         let old_value = std::env::var(shell::AICX_TIMEOUT_ENV).ok();
         {

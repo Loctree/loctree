@@ -607,10 +607,12 @@ impl HolographicSlice {
         }
 
         // Symbol-graph consumer layer (Wave C-1): files using symbols defined
-        // in the target without importing it. Composed unconditionally — this
+        // in the target without importing it. Included with consumers — this
         // is the only consumer surface for same-module Swift, where
         // `include_consumers` over import edges finds nothing.
-        if let Some(graph) = &snapshot.symbol_graph {
+        if config.include_consumers
+            && let Some(graph) = &snapshot.symbol_graph
+        {
             let target_as_path = PathBuf::from(&target_path_norm);
             for (consumer_path, symbols) in graph.file_symbol_consumers(&target_as_path) {
                 let file = snapshot
@@ -1188,6 +1190,7 @@ mod tests {
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         }
     }
 
@@ -1334,6 +1337,49 @@ mod tests {
     }
 
     #[test]
+    fn no_consumers_hides_both_import_and_symbol_layers() {
+        let mut snapshot = create_test_snapshot();
+        let mut graph = crate::symbols::SymbolGraph::default();
+        graph.symbols.push(
+            serde_json::from_value(serde_json::json!({
+                "id": "lib::run", "language": "swift", "kind": "func",
+                "name": "run", "file": "src/lib.rs", "provenance": "tree_sitter"
+            }))
+            .expect("definition"),
+        );
+        graph.occurrences.push(crate::symbols::SymbolOccurrence {
+            symbol_id: "lib::run".into(),
+            file: "src/main.rs".into(),
+            range: Default::default(),
+            role: crate::symbols::OccurrenceRole::Call,
+            confidence: crate::symbols::Confidence::Heuristic,
+            engine: crate::symbols::SymbolProvenance::TreeSitter,
+        });
+        snapshot.symbol_graph = Some(graph);
+        let full = HolographicSlice::from_path(&snapshot, "src/lib.rs", &SliceConfig::default())
+            .expect("default slice");
+        assert!(
+            !full.consumers.is_empty(),
+            "fixture must exercise import consumers"
+        );
+        assert_eq!(full.symbol_consumers.len(), 1);
+
+        let bounded = HolographicSlice::from_path(
+            &snapshot,
+            "src/lib.rs",
+            &SliceConfig {
+                include_consumers: false,
+                ..Default::default()
+            },
+        )
+        .expect("bounded slice");
+        assert!(bounded.consumers.is_empty());
+        assert!(bounded.symbol_consumers.is_empty());
+        assert_eq!(bounded.core.len(), full.core.len());
+        assert_eq!(bounded.deps.len(), full.deps.len());
+    }
+
+    #[test]
     fn test_slice_not_found() {
         let snapshot = create_test_snapshot();
         let config = SliceConfig::default();
@@ -1368,7 +1414,7 @@ mod tests {
     fn test_slice_empty_target_is_absent_not_ambiguous() {
         // An empty / whitespace target must resolve to None WITHOUT tripping the
         // "Ambiguous slice target" branch. Regression for the 2026-06-26
-        // loctree-fail report: `loct context --full --markdown` composed an empty
+        // loctree-feedback report: `loct context --full --markdown` composed an empty
         // default target, `path.ends_with("")` matched every file, and the slicer
         // spammed the whole repo list as an ambiguity warning.
         let snapshot = create_test_snapshot();
@@ -1580,6 +1626,7 @@ mod tests {
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         };
 
         let config = SliceConfig {
@@ -1679,6 +1726,7 @@ mod tests {
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         };
 
         let config = SliceConfig {

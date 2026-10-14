@@ -15,13 +15,15 @@ use std::path::{Path, PathBuf};
 use super::super::super::command::{FindOptions, OccurrencesOptions};
 use super::super::{DispatchResult, GlobalOptions, load_or_create_query_snapshot_for_roots};
 use crate::analyzer::occurrences::{
-    FileScope, FileScopeResolution, LiteralOccurrence, MatchMode, OccurrenceResults, ReportOptions,
-    ScanOptions, attach_near_matches, enrich_with_snapshot, expand_literal_patterns,
-    positional_dot_query_error, scan_files_multi_literal, scan_files_with,
-    scan_files_with_regex_opts,
+    FileScope, FileScopeResolution, GroupedEntity, LiteralOccurrence, MatchMode, OccurrenceResults,
+    ReportOptions, ScanOptions, ScopeClassification, attach_near_matches, enrich_with_snapshot,
+    expand_literal_patterns, group_by_entity, positional_dot_query_error, scan_files_multi_literal,
+    scan_files_with, scan_files_with_regex_opts,
 };
 use crate::analyzer::search::{FuzzySuggestion, literal_fuzzy_suggestions};
 use crate::snapshot::Snapshot;
+
+mod find_context;
 
 /// Handle the `occurrences` command directly (does not go through ParsedArgs).
 pub fn handle_occurrences_command(
@@ -374,8 +376,23 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
         named_zero_hit_exclusion(&literal_matches, zero_hit_ctx),
     );
 
+    let symbol_context = if !opts.literal_explicit
+        && !opts.compact
+        && !literal_matches.slim
+        && patterns.len() == 1
+        && literal_matches.query_kind == crate::analyzer::occurrences::QueryKind::Identifier
+        && literal_matches.total > 0
+    {
+        Some(find_context::SymbolContext::collect(
+            &snapshot,
+            &literal_matches,
+        ))
+    } else {
+        None
+    };
+
     if global.json {
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "mode": "literal",
             "query": display_query,
             "patterns": patterns,
@@ -404,6 +421,15 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
                 "file_scope_resolved": file_scope_resolved,
             },
         });
+        if let Some(context) = &symbol_context {
+            match serde_json::to_value(context) {
+                Ok(context) => payload["symbol_context"] = context,
+                Err(error) => {
+                    eprintln!("[loct][error] Failed to serialize symbol context: {error}");
+                    return DispatchResult::Exit(1);
+                }
+            }
+        }
         match serde_json::to_string_pretty(&payload) {
             Ok(json) => println!("{}", json),
             Err(e) => {
@@ -419,6 +445,8 @@ pub fn handle_find_literal_command(opts: &FindOptions, global: &GlobalOptions) -
             &literal_matches,
             &fuzzy_suggestions,
             zero_hit_ctx,
+            !opts.literal_explicit,
+            symbol_context.as_ref(),
         );
     }
 
@@ -439,7 +467,7 @@ fn scan_multi_literal(
 ///
 /// This is the mode `--literal` could never be: `--literal` is exact-string and,
 /// on a query carrying regex metacharacters, can only report "matched as exact
-/// string" (loctree-fail.md 2026-06-21 — the dangerous false-clean). `--regex`
+/// string" (loctree-feedback.md 2026-06-21 — the dangerous false-clean). `--regex`
 /// actually compiles and evaluates the pattern, so a clean result is genuinely
 /// trustworthy. It keeps loct's artifact-fence coverage accounting and per-hit
 /// context labels (comment / string_literal / code) that the grep/sed fallback
@@ -839,9 +867,13 @@ fn occurrence_detail_suffix(occ: &LiteralOccurrence, include_ignored: bool) -> S
         suffix.push_str(&format!("  in {}", enclosing.symbol_id));
     }
     if let Some(facts) = &occ.enclosing_facts {
+        // A5: `fan_in` is the FILE's importer count, not the symbol's usage
+        // count — a 4-importer file can still export a symbol nobody calls.
+        // Label both explicitly so neither reads as the other.
         suffix.push_str(&format!(
-            "  [fan-in {}, {}]",
+            "  [file-fan-in {}, symbol-uses {}, {}]",
             facts.fan_in,
+            facts.symbol_usages,
             if facts.exported { "exported" } else { "local" }
         ));
     }
@@ -967,7 +999,7 @@ fn named_zero_hit_exclusion(results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) ->
 /// rather than a literal string. A lone `.` is deliberately EXCLUDED: it is
 /// ambiguous (IP addresses like `100.64.0.1`, filenames like `package.json`) and
 /// flagging it would flood every legitimate literal query with false warnings.
-/// The 2026-06-21 loctree-fail report draws exactly this line — the clean
+/// The 2026-06-21 loctree-feedback report draws exactly this line — the clean
 /// `100.64.0.1` (dots only) versus the dangerous `100\.[0-9]+\.[0-9]+`
 /// (backslash, character class, quantifier).
 fn query_has_regex_metachars(query: &str) -> bool {
@@ -1034,13 +1066,24 @@ struct UntrackedOverlay {
     included: bool,
     scanned: usize,
     known: bool,
+    /// N4 (round-2): first [`UNTRACKED_SAMPLE_CAP`] untracked paths - the
+    /// list was already enumerated for the count, so naming it is free.
+    sample: Vec<String>,
 }
 
 fn apply_untracked_overlay(results: &mut OccurrenceResults, overlay: UntrackedOverlay) {
     if overlay.known {
-        results.declare_untracked_overlay(overlay.count, overlay.included, overlay.scanned);
+        results.declare_untracked_overlay(
+            overlay.count,
+            overlay.included,
+            overlay.scanned,
+            overlay.sample,
+        );
     }
 }
+
+/// Cap for the untracked path sample carried into universe accounting.
+const UNTRACKED_SAMPLE_CAP: usize = 50;
 
 /// Snapshot bytes plus optional in-memory untracked overlay.
 ///
@@ -1060,6 +1103,7 @@ fn read_literal_contents(
                 included: include_untracked,
                 scanned: 0,
                 known: false,
+                sample: Vec::new(),
             },
         );
     };
@@ -1081,6 +1125,9 @@ fn read_literal_contents(
         })
         .collect();
     let count = extra.len();
+    // N4 (round-2): keep a capped sample of the untracked paths instead of
+    // throwing the enumerated list away - universe accounting names them.
+    let sample: Vec<String> = extra.iter().take(UNTRACKED_SAMPLE_CAP).cloned().collect();
     let mut scanned = 0;
     if include_untracked {
         for path in &extra {
@@ -1098,6 +1145,7 @@ fn read_literal_contents(
             included: include_untracked,
             scanned,
             known: true,
+            sample,
         },
     )
 }
@@ -1163,8 +1211,104 @@ fn print_human(results: &OccurrenceResults, compact: bool, ctx: ZeroHitCtx<'_>) 
         print_suggested_next(results);
         return;
     }
-    print_occurrence_rows(&results.occurrences, false);
+    if print_grouped_summary(&results.occurrences) {
+        print_rows_with_scope_collapse(&results.occurrences, false);
+    } else {
+        print_occurrence_rows(&results.occurrences, false);
+    }
     print_suggested_next(results);
+}
+
+/// C: entity-first summary for the default (non-`--literal`) text output.
+///
+/// Prints ABOVE the existing flat per-hit rows rather than replacing them —
+/// `--literal` never reaches `print_human`'s non-compact branch (it always
+/// forces `compact: true`, see `handle_find_literal_command`), so this is
+/// additive to the plain `occurrences` text output and never touches
+/// `--literal`'s byte-for-byte contract.
+fn print_grouped_summary(occurrences: &[LiteralOccurrence]) -> bool {
+    let groups = group_by_entity(occurrences);
+    // The rollup is where definitions and callers get told apart and where
+    // test/docs noise collapses — a single resolved identity earns it just as
+    // much as several (audit N05). Only a set that resolved nothing stays
+    // flat: grouping unresolved hits under one fabricated header adds nothing.
+    if !groups.iter().any(|group| group.symbol_id.is_some()) {
+        return false;
+    }
+    println!("  by entity:");
+    for group in &groups {
+        print_grouped_entity_row(group);
+    }
+    true
+}
+
+/// Flat rows minus the scopes the entity rollup above already collapsed.
+/// Test/docs hits stay counted (never silently dropped) and the note names
+/// the spelling that prints every row.
+fn print_rows_with_scope_collapse(occurrences: &[LiteralOccurrence], include_ignored: bool) {
+    let shown: Vec<LiteralOccurrence> = occurrences
+        .iter()
+        .filter(|occ| {
+            !matches!(
+                occ.scope_classification,
+                ScopeClassification::Test | ScopeClassification::Docs
+            )
+        })
+        .cloned()
+        .collect();
+    print_occurrence_rows(&shown, include_ignored);
+    let tests = occurrences
+        .iter()
+        .filter(|occ| occ.scope_classification == ScopeClassification::Test)
+        .count();
+    let docs = occurrences
+        .iter()
+        .filter(|occ| occ.scope_classification == ScopeClassification::Docs)
+        .count();
+    if tests + docs > 0 {
+        let mut parts = Vec::new();
+        if tests > 0 {
+            parts.push(format!("{tests} test"));
+        }
+        if docs > 0 {
+            parts.push(format!("{docs} docs"));
+        }
+        println!(
+            "  ({} row(s) collapsed into the entity rollup above — `find --literal` prints every row)",
+            parts.join(" + ")
+        );
+    }
+}
+
+fn print_grouped_entity_row(group: &GroupedEntity) {
+    let mut collapsed = Vec::new();
+    if group.test_count > 0 {
+        collapsed.push(format!("{} test", group.test_count));
+    }
+    if group.docs_count > 0 {
+        collapsed.push(format!("{} docs", group.docs_count));
+    }
+    if group.other_count > 0 {
+        collapsed.push(format!("{} other", group.other_count));
+    }
+    let collapsed_suffix = if collapsed.is_empty() {
+        String::new()
+    } else {
+        format!("  ({})", collapsed.join(", "))
+    };
+    println!(
+        "    {}  [{} definition(s), {} production caller(s)]{}",
+        group.label,
+        group.definitions.len(),
+        group.production_callers.len(),
+        collapsed_suffix
+    );
+    for (file, line) in &group.definitions {
+        println!("      {}:{}  [definition]", file, line);
+    }
+    for (file, line, role) in &group.production_callers {
+        println!("      {}:{}  [{}]", file, line, role.as_str());
+    }
 }
 
 fn print_compact(results: &OccurrenceResults, ctx: ZeroHitCtx<'_>) {
@@ -1252,12 +1396,18 @@ fn print_literal_find_human(
     literal: &OccurrenceResults,
     fuzzy: &[FuzzySuggestion],
     ctx: ZeroHitCtx<'_>,
+    entity_grouped: bool,
+    symbol_context: Option<&find_context::SymbolContext>,
 ) {
     let looks_like_regex = query_has_regex_metachars(query);
     println!(
         "=== Literal Matches ({} in {} file(s)) [source: {}] ===",
         literal.total, literal.files_matched, literal.source
     );
+    if let Some(context) = symbol_context {
+        context.print(literal);
+        return;
+    }
     if !literal.coverage_line.is_empty() {
         println!("  {}", literal.coverage_line);
     }
@@ -1277,6 +1427,10 @@ fn print_literal_find_human(
         print_file_context(literal);
         if literal.slim {
             println!("  (occurrence list suppressed — count_only/slim)");
+        } else if entity_grouped && print_grouped_summary(&literal.occurrences) {
+            // Default `find` is entity-first (recipe C / audit N05); the
+            // explicit `--literal` spelling keeps the flat per-hit contract.
+            print_rows_with_scope_collapse(&literal.occurrences, true);
         } else {
             print_occurrence_rows(&literal.occurrences, true);
         }
@@ -1326,8 +1480,17 @@ fn print_role_summary(results: &OccurrenceResults) {
     if summary.definitions > 0 {
         parts.push(format!("{} definition", summary.definitions));
     }
-    if summary.callsites > 0 {
-        parts.push(format!("{} callsite", summary.callsites));
+    if summary.references > 0 {
+        parts.push(format!("{} reference", summary.references));
+    }
+    if summary.mutations > 0 {
+        parts.push(format!("{} mutation", summary.mutations));
+    }
+    if summary.field_emissions > 0 {
+        parts.push(format!("{} field emission", summary.field_emissions));
+    }
+    if summary.local_bindings > 0 {
+        parts.push(format!("{} local binding", summary.local_bindings));
     }
     if summary.imports > 0 {
         parts.push(format!("{} import", summary.imports));
@@ -1457,12 +1620,12 @@ mod tests {
 
     #[test]
     fn regex_metachars_flag_pattern_queries_but_not_plain_literals() {
-        // Regression for the 2026-06-21 loctree-fail report: `--literal` must not
+        // Regression for the 2026-06-21 loctree-feedback report: `--literal` must not
         // claim a "trustworthy absence" for a query it could only exact-match.
         // Pattern-shaped queries (the dangerous false-clean case) must flag true.
         for pattern in [
             r"100\.[0-9]+\.[0-9]+",
-            r"/Users/[^/]+/",
+            r"/home/[^/]+/",
             "foo|bar",
             "key.*path",
             "a+b",

@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
     LoctreeGateway,
+    formatHealthScore,
     LoctreeNotRunningError,
     isSnapshotNotLoaded,
     type LspRuntimeState,
@@ -12,6 +13,12 @@ type Request = {
     method: string;
     params: unknown;
 };
+
+test('unknown health is distinct from a measured zero', () => {
+    assert.equal(formatHealthScore(null), 'unknown');
+    assert.equal(formatHealthScore(0), '0/100');
+    assert.equal(formatHealthScore(71), '71/100');
+});
 
 function createGateway(running = true) {
     const requests: Request[] = [];

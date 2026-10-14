@@ -802,8 +802,7 @@ pub(crate) fn compose_context_pack_with_global(
     // I1-01: the bare path consumes the C0-01 `aicx overlay` cache instead
     // of the budgeted `aicx intents` shell-out (which timed out on 100% of
     // bare invocations against a live store). Pure read — never waits.
-    let overlay_state =
-        compose_bare_overlay_state(&effective_opts, bare_context, project_root, &snapshot);
+    let overlay_state = compose_cached_overlay_state(&effective_opts, project_root, &snapshot);
     {
         let resolved_scope =
             resolve_context_scope_for_opts(&effective_opts, project_root, &snapshot)?;
@@ -832,7 +831,8 @@ pub(crate) fn compose_context_pack_with_global(
         }
         bind_pack_coverage(&mut pack, &snapshot, targets.len());
         if targets.is_empty() && resolved_scope.is_some() {
-            pack.risk = compose_risk_slice(&effective_opts, &snapshot);
+            let structural = compose_structural_slice(&effective_opts, &snapshot);
+            pack.risk = compose_risk_slice(&effective_opts, &snapshot, &structural);
         } else if targets.is_empty() && (effective_opts.changed || effective_opts.task.is_some()) {
             if effective_opts.changed {
                 eprintln!("Not a git repository or no changed files found in snapshot.");
@@ -850,7 +850,7 @@ pub(crate) fn compose_context_pack_with_global(
 
                 let structural = compose_structural_slice(&single_opts, &snapshot);
                 let runtime = compose_runtime_slice(&single_opts, &snapshot);
-                let risk = compose_risk_slice(&single_opts, &snapshot);
+                let risk = compose_risk_slice(&single_opts, &snapshot, &structural);
                 let action =
                     compose_action_slice(&single_opts, &snapshot, &structural, &runtime, &risk);
                 let memory =
@@ -874,7 +874,7 @@ pub(crate) fn compose_context_pack_with_global(
         } else {
             pack.structural = compose_structural_slice(&effective_opts, &snapshot);
             pack.runtime = compose_runtime_slice(&effective_opts, &snapshot);
-            pack.risk = compose_risk_slice(&effective_opts, &snapshot);
+            pack.risk = compose_risk_slice(&effective_opts, &snapshot, &pack.structural);
             pack.action = compose_action_slice(
                 &effective_opts,
                 &snapshot,
@@ -934,8 +934,7 @@ pub fn compose_context_pack_from_snapshot(
     // I1-01 — same overlay-cache contract as
     // `compose_context_pack_with_global` above. Pure read, never spawns:
     // this entry point also serves the LSP.
-    let overlay_state =
-        compose_bare_overlay_state(&effective_opts, bare_context, project_root, snapshot);
+    let overlay_state = compose_cached_overlay_state(&effective_opts, project_root, snapshot);
 
     let resolved_scope = resolve_context_scope_for_opts(&effective_opts, project_root, snapshot)?;
     if effective_opts.file.is_some() && !effective_opts.scopes.is_empty() {
@@ -964,7 +963,8 @@ pub fn compose_context_pack_from_snapshot(
     bind_pack_coverage(&mut pack, snapshot, targets.len());
 
     if targets.is_empty() && resolved_scope.is_some() {
-        pack.risk = compose_risk_slice(&effective_opts, snapshot);
+        let structural = compose_structural_slice(&effective_opts, snapshot);
+        pack.risk = compose_risk_slice(&effective_opts, snapshot, &structural);
     } else if targets.is_empty() && (effective_opts.changed || effective_opts.task.is_some()) {
         if !effective_opts.json {
             pack.risk = RiskSlice::missing_snapshot();
@@ -977,7 +977,7 @@ pub fn compose_context_pack_from_snapshot(
 
             let structural = compose_structural_slice(&single_opts, snapshot);
             let runtime = compose_runtime_slice(&single_opts, snapshot);
-            let risk = compose_risk_slice(&single_opts, snapshot);
+            let risk = compose_risk_slice(&single_opts, snapshot, &structural);
             let action = compose_action_slice(&single_opts, snapshot, &structural, &runtime, &risk);
             let memory =
                 compose_memory_slice(&single_opts, &structural, &runtime, aicx_client.as_ref());
@@ -1000,7 +1000,7 @@ pub fn compose_context_pack_from_snapshot(
     } else {
         pack.structural = compose_structural_slice(&effective_opts, snapshot);
         pack.runtime = compose_runtime_slice(&effective_opts, snapshot);
-        pack.risk = compose_risk_slice(&effective_opts, snapshot);
+        pack.risk = compose_risk_slice(&effective_opts, snapshot, &pack.structural);
         pack.action = compose_action_slice(
             &effective_opts,
             snapshot,
@@ -1127,37 +1127,51 @@ fn try_load_snapshot_with_auto_scan(
     let root = context_snapshot_root(opts);
 
     if global.fresh {
-        eprintln!(
-            "[loct][context] --fresh requested for {}, rescanning...",
-            root.display()
-        );
-        run_context_scan(&root, &roots, true, ScanKind::Fresh, global.force_non_git)?;
+        if global.verbose && !global.quiet {
+            eprintln!(
+                "[loct][context] --fresh requested for {}, rescanning...",
+                root.display()
+            );
+        }
+        run_context_scan(&root, &roots, true, ScanKind::Fresh, global)?;
         return load_snapshot_after_scan(&root);
     }
 
-    match Snapshot::load(&root) {
-        Ok(snapshot) => ensure_fresh_with_mtime_check(snapshot, &root, &roots, global),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => match load_latest_snapshot(&root) {
-            Ok(Some(snapshot)) => ensure_fresh_with_mtime_check(snapshot, &root, &roots, global),
-            Ok(None) => {
-                if global.no_scan {
-                    return Err(ContextLoadError::NoSnapshotNoScanMode { root });
-                }
+    let cached = match Snapshot::load(&root) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => load_latest_snapshot(&root),
+        Err(err) => Err(err),
+    };
+    match cached {
+        Ok(Some(snapshot)) => ensure_fresh_with_mtime_check(snapshot, &root, &roots, global),
+        Ok(None) => {
+            if global.no_scan {
+                return Err(ContextLoadError::NoSnapshotNoScanMode { root });
+            }
+            if global.verbose && !global.quiet {
                 eprintln!(
                     "[loct][context] no snapshot found in {}, scanning... (use --no-scan to skip)",
                     root.display()
                 );
-                run_context_scan(
-                    &root,
-                    &roots,
-                    false,
-                    ScanKind::Initial,
-                    global.force_non_git,
-                )?;
-                load_snapshot_after_scan(&root)
             }
-            Err(err) => Err(ContextLoadError::LatestSnapshotLoadFailed(err)),
-        },
+            run_context_scan(&root, &roots, false, ScanKind::Initial, global)?;
+            load_snapshot_after_scan(&root)
+        }
+        Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+            if global.no_scan || global.fail_stale {
+                return Err(ContextLoadError::LatestSnapshotLoadFailed(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Snapshot cache is incompatible or invalid: {err}. Automatic rebuild is disabled; run 'loct scan --fresh' to refresh."
+                    ),
+                )));
+            }
+            if global.verbose && !global.quiet {
+                eprintln!("[loct][context] incompatible snapshot cache; rebuilding from source...");
+            }
+            run_context_scan(&root, &roots, true, ScanKind::Fresh, global)?;
+            load_snapshot_after_scan(&root)
+        }
         Err(err) => Err(ContextLoadError::LatestSnapshotLoadFailed(err)),
     }
 }
@@ -1191,12 +1205,14 @@ fn ensure_fresh_with_mtime_check(
             return Ok(snapshot);
         }
 
-        eprintln!(
-            "[loct][context] snapshot stale (git HEAD {} -> {}), rescanning... (use --no-scan to keep stale)",
-            short_sha(&snapshot_head),
-            short_sha(&current_head)
-        );
-        run_context_scan(root, roots, true, ScanKind::Full, global.force_non_git)?;
+        if global.verbose && !global.quiet {
+            eprintln!(
+                "[loct][context] snapshot stale (git HEAD {} -> {}), rescanning... (use --no-scan to keep stale)",
+                short_sha(&snapshot_head),
+                short_sha(&current_head)
+            );
+        }
+        run_context_scan(root, roots, true, ScanKind::Full, global)?;
         return load_snapshot_after_scan(root);
     }
 
@@ -1227,23 +1243,19 @@ fn ensure_fresh_with_mtime_check(
         return Ok(snapshot);
     }
 
-    if changed_files > 0 {
-        eprintln!(
-            "[loct][context] {changed_files} file(s) changed since last scan, incremental rescan..."
-        );
-    } else {
-        eprintln!(
-            "[loct][context] snapshot older than {}, incremental rescan...",
-            format_duration(max_age)
-        );
+    if global.verbose && !global.quiet {
+        if changed_files > 0 {
+            eprintln!(
+                "[loct][context] {changed_files} file(s) changed since last scan, incremental rescan..."
+            );
+        } else {
+            eprintln!(
+                "[loct][context] snapshot older than {}, incremental rescan...",
+                format_duration(max_age)
+            );
+        }
     }
-    run_context_scan(
-        root,
-        roots,
-        false,
-        ScanKind::Incremental,
-        global.force_non_git,
-    )?;
+    run_context_scan(root, roots, false, ScanKind::Incremental, global)?;
     load_snapshot_after_scan(root)
 }
 
@@ -1290,7 +1302,7 @@ fn run_context_scan(
     roots: &[PathBuf],
     full_scan: bool,
     kind: ScanKind,
-    force_non_git: bool,
+    global: &GlobalOptions,
 ) -> Result<(), ContextLoadError> {
     let scan_roots = if roots.is_empty() {
         vec![root.to_path_buf()]
@@ -1299,12 +1311,15 @@ fn run_context_scan(
     };
     // Unified file universe: internal rescans must cover the same file set as
     // the initial `loct` scan (detect-applied extensions + .loctignore).
-    let mut parsed =
-        crate::snapshot::unified_scan_args(scan_roots.first().map_or(root, |r| r.as_path()), false);
+    let verbose = global.verbose && !global.quiet;
+    let mut parsed = crate::snapshot::unified_scan_args(
+        scan_roots.first().map_or(root, |r| r.as_path()),
+        verbose,
+    );
     parsed.root_list = scan_roots.clone();
     parsed.full_scan = full_scan;
     parsed.output = OutputMode::Human;
-    parsed.force_non_git = force_non_git;
+    parsed.force_non_git = global.force_non_git;
 
     let scan_start = Instant::now();
     crate::snapshot::run_init_with_options(&scan_roots, &parsed, true).map_err(
@@ -1316,11 +1331,13 @@ fn run_context_scan(
         },
     )?;
     let scan_duration = scan_start.elapsed();
-    eprintln!(
-        "[loct][context] scan completed in {:.2}s",
-        scan_duration.as_secs_f64()
-    );
-    if scan_duration > Duration::from_secs(30) {
+    if verbose {
+        eprintln!(
+            "[loct][context] scan completed in {:.2}s",
+            scan_duration.as_secs_f64()
+        );
+    }
+    if verbose && scan_duration > Duration::from_secs(30) {
         eprintln!(
             "[loct][context] scan exceeded 30s; consider `loct scan --watch` during long development sessions"
         );
@@ -2566,7 +2583,11 @@ fn file_root(file: &Path) -> PathBuf {
 /// hubs, while cache scope reports whether the loaded snapshot matches current
 /// git reality. Import fan-in is Loctree-derived; cache scope is repo-verified
 /// because it comes from git and snapshot metadata comparisons.
-pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSlice {
+pub fn compose_risk_slice(
+    opts: &ContextOptions,
+    snapshot: &Snapshot,
+    structural: &StructuralSlice,
+) -> RiskSlice {
     const HOTSPOT_LIMIT: usize = 5;
     const HIGH_FAN_IN_THRESHOLD: usize = 10;
 
@@ -2585,7 +2606,7 @@ pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSli
     );
     let importer_counts = importer_counts_direct(snapshot);
 
-    let mut scoped_counts: Vec<(String, usize)> = risk_scope_files(opts, snapshot)
+    let mut scoped_counts: Vec<(String, usize)> = risk_scope_files(opts, snapshot, structural)
         .into_iter()
         .map(|file| {
             let importers = importer_counts.get(&file).copied().unwrap_or(0);
@@ -2618,7 +2639,7 @@ pub fn compose_risk_slice(opts: &ContextOptions, snapshot: &Snapshot) -> RiskSli
 
     // Successful zero-file corpus is not `missing_snapshot` and not a normal
     // populated `fresh` tree — consumers need an explicit empty state
-    // (loctree-fail 2026-08-11 empty-directory scan).
+    // (loctree-feedback 2026-08-11 empty-directory scan).
     let empty_corpus = snapshot.files.is_empty();
 
     RiskSlice {
@@ -2689,7 +2710,23 @@ pub fn compute_power_path(
 
         // 3. Body for named symbols
         let mut target_sym = None;
-        if let Some(sym) = structural.symbols.first() {
+        if let Some(sym) = structural
+            .symbols
+            .iter()
+            .find(|sym| {
+                opts.task
+                    .as_ref()
+                    .is_some_and(|task| task.to_lowercase().contains(&sym.name.to_lowercase()))
+            })
+            .or_else(|| {
+                // A file-only request still has grounded definitions to open.
+                // Never substitute a symbol from a dependency/consumer file.
+                opts.task
+                    .is_none()
+                    .then(|| structural.symbols.iter().find(|sym| sym.file == file_str))
+                    .flatten()
+            })
+        {
             target_sym = Some(sym.name.clone());
             path.push(SuggestedCommand {
                 command: format!("loct body {}", sym.name),
@@ -3285,11 +3322,28 @@ fn snapshot_health_label(
     }
 }
 
-fn risk_scope_files(opts: &ContextOptions, snapshot: &Snapshot) -> Vec<String> {
-    if let Some(file) = &opts.file {
-        return resolve_context_file(snapshot, file)
-            .map(|file| vec![file])
-            .unwrap_or_else(|| vec![normalize_requested_path(snapshot, file)]);
+/// Files the risk surface (hotspots, high-fan-in) should look at.
+///
+/// F7: `compose_structural_slice` computes a BFS depth-2 neighborhood around
+/// `opts.file` (the atlas "corpus: N") — target + deps + consumers. This used
+/// to collapse straight to `vec![file]` whenever a file was scoped, so a real
+/// hub one or two hops away from the scoped file never crossed the fan-in
+/// threshold and the atlas printed "no hubs above fan-in threshold" on
+/// repositories that plainly had one. Reusing the same neighborhood the
+/// structural slice already computed fixes that; when the structural BFS
+/// came back empty (an unresolved/missing path), fall back to the naive
+/// single-file resolution so risk still reports partial data instead of
+/// silently scoping to nothing.
+fn risk_scope_files(
+    opts: &ContextOptions,
+    snapshot: &Snapshot,
+    structural: &StructuralSlice,
+) -> Vec<String> {
+    if opts.file.is_some() {
+        if !structural.files.is_empty() {
+            return structural.files.iter().map(|f| f.path.clone()).collect();
+        }
+        return risk_scope_single_file(opts, snapshot);
     }
 
     snapshot
@@ -3297,6 +3351,17 @@ fn risk_scope_files(opts: &ContextOptions, snapshot: &Snapshot) -> Vec<String> {
         .iter()
         .map(|file| file.path.clone())
         .collect()
+}
+
+/// The pre-F7 single-file resolution, kept as the fallback for a scoped path
+/// the structural BFS could not resolve into any neighborhood at all.
+fn risk_scope_single_file(opts: &ContextOptions, snapshot: &Snapshot) -> Vec<String> {
+    let Some(file) = &opts.file else {
+        return Vec::new();
+    };
+    resolve_context_file(snapshot, file)
+        .map(|file| vec![file])
+        .unwrap_or_else(|| vec![normalize_requested_path(snapshot, file)])
 }
 
 fn action_scope_files(
@@ -3316,7 +3381,7 @@ fn action_scope_files(
         .map(|file| file.path.clone())
         .collect();
     if scope.is_empty() {
-        scope = risk_scope_files(opts, snapshot);
+        scope = risk_scope_files(opts, snapshot, structural);
     }
     scope.sort();
     scope.dedup();
@@ -3602,23 +3667,28 @@ fn next_safe_commands_for(
             push_unique(format!("loct context --file {}", file.path), &mut cmds);
         }
     } else {
-        // Targeted: stay anchored to the operator's chosen file/scope.
-        if let Some(hot) = risk.hotspots.first() {
-            push_unique(format!("loct slice {}", hot.file), &mut cmds);
-            push_unique(format!("loct impact {}", hot.file), &mut cmds);
-        }
-        // Replace the third "context --file <same>" suggestion with a
-        // structurally distinct probe (symbol search). The targeted call
-        // already viewed `--file <target>`, so we want a different shape.
-        if let Some(target_sym) = first_target_symbol(structural) {
-            push_unique(format!("loct find {target_sym}"), &mut cmds);
-        } else if let Some(file) = structural.files.first() {
-            push_unique(format!("loct context --file {}", file.path), &mut cmds);
-        }
-        // Also surface the matching tauri command / FastAPI route for trace
-        // when one exists in scope.
-        if let Some(handler_sym) = first_runtime_handler_symbol(runtime) {
-            push_unique(format!("loct follow trace --to {handler_sym}"), &mut cmds);
+        // Targeted: the chosen target comes before neighboring/global hubs.
+        // An arbitrary first symbol (often a logger or utility) is not a task probe.
+        let target = opts
+            .file
+            .as_ref()
+            .and_then(|path| {
+                resolve_context_file(snapshot, path).or_else(|| non_empty_context_path(path))
+            })
+            .or_else(|| {
+                structural
+                    .files
+                    .iter()
+                    .find(|file| file.role == StructuralRole::Target)
+                    .map(|file| file.path.clone())
+            })
+            .or_else(|| risk.hotspots.first().map(|hot| hot.file.clone()));
+        if let Some(target) = target {
+            push_unique(format!("loct slice {target}"), &mut cmds);
+            if let Some(handler_sym) = first_runtime_handler_symbol(runtime) {
+                push_unique(format!("loct follow trace --to {handler_sym}"), &mut cmds);
+            }
+            push_unique(format!("loct impact {target}"), &mut cmds);
         }
     }
 
@@ -3674,10 +3744,6 @@ fn top_imported_public_symbol(snapshot: &Snapshot) -> Option<String> {
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
         .map(|(name, _)| name)
-}
-
-fn first_target_symbol(structural: &StructuralSlice) -> Option<String> {
-    structural.symbols.first().map(|s| s.name.clone())
 }
 
 fn first_runtime_handler_symbol(runtime: &RuntimeSlice) -> Option<String> {
@@ -3981,7 +4047,7 @@ fn is_bare_context(opts: &ContextOptions) -> bool {
 /// I1-01 retired the bare-path budgeted client: the 300 ms budget timed out
 /// on 100% of bare invocations against a live store (`aicx intents` needs
 /// tens of seconds there), so the bare path now consumes the C0-01
-/// `aicx overlay` cache instead — see [`compose_bare_overlay_state`]. The
+/// `aicx overlay` cache instead — see [`compose_cached_overlay_state`]. The
 /// budgeted [`AicxClient::new_budgeted`] machinery stays for callers that
 /// genuinely want a bounded synchronous transport.
 fn build_context_aicx_client(opts: &ContextOptions) -> Option<AicxClient> {
@@ -4002,13 +4068,14 @@ fn build_context_aicx_client(opts: &ContextOptions) -> Option<AicxClient> {
 /// is pure in-process work, ~tens of ms) plus the repo identity.
 /// Producer-side revisions are trusted as signed and converged by the
 /// detached refresh.
-fn compose_bare_overlay_state(
+fn compose_cached_overlay_state(
     opts: &ContextOptions,
-    bare_context: bool,
     project_root: &Path,
     snapshot: &Snapshot,
 ) -> Option<crate::aicx::overlay::OverlayRenderState> {
-    if !bare_context || opts.no_aicx || opts.with_aicx {
+    // Every default context mode carries cache freshness, including scoped/task
+    // briefings. Explicit live recall and explicit opt-out retain their contracts.
+    if opts.no_aicx || opts.with_aicx {
         return None;
     }
     let mut local = crate::aicx::overlay::LocalTruth {
@@ -4768,7 +4835,7 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
     }
     md.push('\n');
 
-    // W6.4 / loctree-fail.md 3352: synthesis-first for --full so Risk/Action survive
+    // W6.4 / loctree-feedback.md 3352: synthesis-first for --full so Risk/Action survive
     // read-truncation (Read tool ~450 lines, MCP token caps). Pill is already
     // synthesis-first; --full was enumeration wall first. Move Risk+Action here
     // (after identity, before bulk Files/Symbols/Imports/Consumers tables).
@@ -5199,7 +5266,7 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
             );
             for entry in &pack.memory.entries {
                 let text = summarize_entry(&entry.text).text.replace('|', "\\|");
-                // loctree-fail hak 2026-05-23 #2: never leak raw
+                // loctree-feedback hak 2026-05-23 #2: never leak raw
                 // `~/.aicx/store/...` absolute paths into commitable markdown
                 // output. Use the same opaque `chunk:<hash>` reference the
                 // pill renderer emits.
@@ -6263,6 +6330,73 @@ mod tests {
         snapshot
     }
 
+    /// A `leaf` file that itself has no importers, but depends directly on a
+    /// hub with `importer_count` importers — a BFS-2 neighborhood from
+    /// `leaf` must reach that hub.
+    fn hub_via_dependency_snapshot(importer_count: usize) -> Snapshot {
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+
+        let mut leaf = FileAnalysis::new("loctree-rs/src/leaf.rs".to_string());
+        leaf.language = "rust".to_string();
+        snapshot.files.push(leaf);
+
+        let mut hub = FileAnalysis::new("loctree-rs/src/types.rs".to_string());
+        hub.language = "rust".to_string();
+        hub.loc = 800;
+        snapshot.files.push(hub);
+
+        // leaf depends on the hub — the dependency edge the structural BFS
+        // must walk to reach it.
+        snapshot.edges.push(GraphEdge {
+            from: "loctree-rs/src/leaf.rs".to_string(),
+            to: "loctree-rs/src/types.rs".to_string(),
+            label: "import".to_string(),
+        });
+
+        for index in 0..importer_count {
+            let path = format!("loctree-rs/src/consumer_{index}.rs");
+            let mut consumer = FileAnalysis::new(path.clone());
+            consumer.language = "rust".to_string();
+            snapshot.files.push(consumer);
+            snapshot.edges.push(GraphEdge {
+                from: path,
+                to: "loctree-rs/src/types.rs".to_string(),
+                label: "import".to_string(),
+            });
+        }
+
+        snapshot
+    }
+
+    /// F7 — `--file leaf.rs` must scope risk to leaf's BFS-2 neighborhood,
+    /// not to `leaf` alone. Before this fix, `risk_scope_files` collapsed to
+    /// `vec![file]` whenever a file was scoped, so a real hub one hop away
+    /// from the scoped file never crossed the fan-in threshold and the atlas
+    /// printed "no hubs above fan-in threshold" on repos that plainly had
+    /// one.
+    #[test]
+    fn compose_risk_slice_scoped_to_a_leaf_still_finds_neighborhood_hub() {
+        let snapshot = hub_via_dependency_snapshot(12);
+        let opts = ContextOptions {
+            file: Some(PathBuf::from("loctree-rs/src/leaf.rs")),
+            ..ContextOptions::default()
+        };
+
+        let structural = compose_structural_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
+
+        assert!(
+            !risk.high_fan_in.is_empty(),
+            "leaf's neighborhood includes the hub; its fan-in must surface \
+             even when risk is scoped to leaf"
+        );
+        assert!(
+            risk.high_fan_in
+                .iter()
+                .any(|h| h.file == "loctree-rs/src/types.rs")
+        );
+    }
+
     #[test]
     fn compose_risk_slice_with_hotspots() {
         let snapshot = hub_snapshot(12);
@@ -6271,7 +6405,8 @@ mod tests {
             ..ContextOptions::default()
         };
 
-        let risk = compose_risk_slice(&opts, &snapshot);
+        let structural = compose_structural_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
 
         assert_eq!(risk.hotspots.len(), 1);
         assert_eq!(risk.hotspots[0].file, "loctree-rs/src/types.rs");
@@ -6302,7 +6437,8 @@ mod tests {
             ..ContextOptions::default()
         };
 
-        let risk = compose_risk_slice(&opts, &snapshot);
+        let structural = compose_structural_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
 
         assert!(risk.dirty_worktree);
         assert!(!risk.stale_snapshot);
@@ -6313,7 +6449,7 @@ mod tests {
 
     #[test]
     fn compose_risk_slice_empty_corpus_is_empty_snapshot_not_missing() {
-        // loctree-fail 2026-08-11: successful zero-file scan must not read as
+        // loctree-feedback 2026-08-11: successful zero-file scan must not read as
         // missing_snapshot — emit empty_snapshot so verified absence is explicit.
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut snapshot = Snapshot::new(vec![tmp.path().display().to_string()]);
@@ -6324,7 +6460,8 @@ mod tests {
             project: Some(tmp.path().to_path_buf()),
             ..ContextOptions::default()
         };
-        let risk = compose_risk_slice(&opts, &snapshot);
+        let structural = compose_structural_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
 
         assert_eq!(risk.snapshot_health.as_deref(), Some("empty_snapshot"));
         assert_ne!(risk.snapshot_health.as_deref(), Some("missing_snapshot"));
@@ -6548,7 +6685,8 @@ mod tests {
             file: Some(PathBuf::from("types.rs")),
             ..ContextOptions::default()
         };
-        let risk = compose_risk_slice(&opts, &snapshot);
+        let structural = compose_structural_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
 
         let action = compose_action_slice(
             &opts,
@@ -6597,11 +6735,11 @@ mod tests {
 
         let opts = ContextOptions {
             file: Some(PathBuf::from("types.rs")),
-            task: Some("fix auth in types.rs".to_string()),
+            task: Some("fix my_cool_fn auth in types.rs".to_string()),
             ..ContextOptions::default()
         };
 
-        let risk = compose_risk_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
         let action = compose_action_slice(
             &opts,
             &snapshot,
@@ -6646,6 +6784,22 @@ mod tests {
                 .any(|c| c.command == "loct occurrences my_cool_fn")
         );
         assert!(action.power_path.iter().any(|c| c.command == "loct follow"));
+
+        let file_only = ContextOptions { task: None, ..opts };
+        let mut scoped = structural.clone();
+        let mut foreign = scoped.symbols[0].clone();
+        foreign.file = "other.rs".to_string();
+        foreign.name = "foreign_symbol".to_string();
+        scoped.symbols.insert(0, foreign);
+        let path = compute_power_path(
+            &file_only,
+            &scoped,
+            &RuntimeSlice::default(),
+            &risk,
+            &snapshot,
+        );
+        assert!(path.iter().any(|c| c.command == "loct body my_cool_fn"));
+        assert!(!path.iter().any(|c| c.command == "loct body foreign_symbol"));
     }
 
     #[test]
@@ -6939,7 +7093,7 @@ python_version = "3.12"
     }
 
     #[test]
-    fn next_safe_commands_references_top_hub() {
+    fn next_safe_commands_prefers_explicit_target_to_neighbor_hub() {
         let structural = StructuralSlice {
             files: vec![StructuralFile {
                 path: "Makefile".to_string(),
@@ -6968,12 +7122,12 @@ python_version = "3.12"
         let snapshot = Snapshot::new(vec![".".to_string()]);
         let commands = next_safe_commands_for(&opts, &structural, &runtime, &risk, &snapshot);
 
-        assert_eq!(commands[0], "loct slice src/hub.py");
-        assert_eq!(commands[1], "loct impact src/hub.py");
+        assert_eq!(commands[0], "loct slice Makefile");
+        assert_eq!(commands[1], "loct impact Makefile");
         assert!(
             !commands
                 .iter()
-                .any(|command| command == "loct slice Makefile")
+                .any(|command| command.contains("src/hub.py"))
         );
     }
 
@@ -7539,9 +7693,9 @@ python_version = "3.12"
     fn compose_memory_slice_includes_source_chunk_paths() {
         let dir = tempfile::tempdir().expect("tempdir");
         let payload = r#"[
-            {"kind":"decision","summary":"context composer chooses absolute paths","project":"loctree-suite","agent":"claude","date":"2026-04-28","timestamp":"2026-04-28T01:00:00Z","session_id":"sa","source_chunk":"/Users/op/.aicx/store/loctree-suite/2026/04/28/sa.md"},
-            {"kind":"task","summary":"context source chunk wiring test","project":"loctree-suite","agent":"codex","date":"2026-04-28","timestamp":"2026-04-28T01:01:00Z","session_id":"sb","source_chunk":"/Users/op/.aicx/store/loctree-suite/2026/04/28/sb.md"},
-            {"kind":"task","summary":"another context follow-up referencing same chunk","project":"loctree-suite","agent":"codex","date":"2026-04-28","timestamp":"2026-04-28T01:02:00Z","session_id":"sc","source_chunk":"/Users/op/.aicx/store/loctree-suite/2026/04/28/sb.md"}
+            {"kind":"decision","summary":"context composer chooses absolute paths","project":"loctree-suite","agent":"claude","date":"2026-04-28","timestamp":"2026-04-28T01:00:00Z","session_id":"sa","source_chunk":"/home/op/.aicx/store/loctree-suite/2026/04/28/sa.md"},
+            {"kind":"task","summary":"context source chunk wiring test","project":"loctree-suite","agent":"codex","date":"2026-04-28","timestamp":"2026-04-28T01:01:00Z","session_id":"sb","source_chunk":"/home/op/.aicx/store/loctree-suite/2026/04/28/sb.md"},
+            {"kind":"task","summary":"another context follow-up referencing same chunk","project":"loctree-suite","agent":"codex","date":"2026-04-28","timestamp":"2026-04-28T01:02:00Z","session_id":"sc","source_chunk":"/home/op/.aicx/store/loctree-suite/2026/04/28/sb.md"}
         ]"#;
         let script = write_mock_aicx(dir.path(), payload);
 
@@ -7590,12 +7744,12 @@ python_version = "3.12"
         assert!(
             memory
                 .source_chunks
-                .contains(&"/Users/op/.aicx/store/loctree-suite/2026/04/28/sa.md".to_string())
+                .contains(&"/home/op/.aicx/store/loctree-suite/2026/04/28/sa.md".to_string())
         );
         assert!(
             memory
                 .source_chunks
-                .contains(&"/Users/op/.aicx/store/loctree-suite/2026/04/28/sb.md".to_string())
+                .contains(&"/home/op/.aicx/store/loctree-suite/2026/04/28/sb.md".to_string())
         );
     }
 
@@ -7836,7 +7990,7 @@ python_version = "3.12"
     /// (same envelope shape) but asserts on the per-entry `authority`
     /// field rather than the per-entry `retrieval_mode`. Closes the
     /// audit finding documented at
-    /// `~/.vibecrafted/inbox/Loctree/aicx/blockers/loctree-side-needs.md`.
+    /// `~/internal-artifacts/inbox/Loctree/aicx/blockers/loctree-side-needs.md`.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial(aicx_env)]
@@ -8269,7 +8423,7 @@ python_version = "3.12"
                 "token sk-test_abcdefghijklmnopqrstuvwxyz12".to_string(),
                 "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK8=\n-----END RSA PRIVATE KEY-----"
                     .to_string(),
-                "wrote /Users/alice/.ssh/id_rsa".to_string(),
+                "wrote /home/alice/.ssh/id_rsa".to_string(),
             ],
             scope_paths: Vec::new(),
             refresh_command: "aicx overlay --repo /tmp/loctree --format json".to_string(),
@@ -8289,7 +8443,7 @@ python_version = "3.12"
             kind: "decision".to_string(),
             // Fake PEM fixture exercising the redaction path (W5-01) — not a credential.
             // nosemgrep: generic.secrets.security.detected-private-key.detected-private-key
-            text: "token sk-test_abcdefghijklmnopqrstuvwxyz12 pem -----BEGIN RSA PRIVATE KEY----- MIIBOgIBAAJBAK8= -----END RSA PRIVATE KEY----- path /Users/alice/.ssh/id_rsa".to_string(),
+            text: "token sk-test_abcdefghijklmnopqrstuvwxyz12 pem -----BEGIN RSA PRIVATE KEY----- MIIBOgIBAAJBAK8= -----END RSA PRIVATE KEY----- path /home/alice/.ssh/id_rsa".to_string(),
             authority: AuthorityLabel::AicxOperator,
             source_chunk: "/tmp/aicx/store/s1.md".to_string(),
             agent: "claude".to_string(),
@@ -8334,7 +8488,7 @@ python_version = "3.12"
             "PEM material must not survive pack markdown: {md}"
         );
         assert!(
-            !md.contains("/Users/alice"),
+            !md.contains("/home/alice"),
             "abs home path must not survive pack markdown: {md}"
         );
         let overlay = pack.memory.overlay.as_ref().expect("overlay");
@@ -8342,7 +8496,7 @@ python_version = "3.12"
         assert!(joined.contains("[redacted]"), "{joined}");
         assert!(!joined.contains("sk-test_"), "{joined}");
         assert!(!joined.contains("BEGIN RSA"), "{joined}");
-        assert!(!joined.contains("/Users/alice"), "{joined}");
+        assert!(!joined.contains("/home/alice"), "{joined}");
         assert_eq!(
             overlay.store_revision,
             format!("sr1:{}", "a".repeat(64)),
@@ -8562,5 +8716,74 @@ python_version = "3.12"
             Some("sx"),
             "newest session_id must be first under recency fallback"
         );
+    }
+    #[test]
+    fn targeted_navigation_avoids_neighbor_hub_and_arbitrary_first_symbol() {
+        let snapshot = hub_snapshot(12);
+        let opts = ContextOptions {
+            file: Some(PathBuf::from("consumer.rs")),
+            task: Some("recover Max consultation at startup".into()),
+            ..ContextOptions::default()
+        };
+        let structural = StructuralSlice {
+            symbols: vec![StructuralSymbol {
+                name: "appLogger".into(),
+                kind: "function".into(),
+                export_type: "local".into(),
+                file: "consumer.rs".into(),
+                line: Some(1),
+                authority: AuthorityLabel::RepoVerified,
+            }],
+            ..StructuralSlice::default()
+        };
+        let risk = RiskSlice {
+            hotspots: vec![HotspotFile {
+                file: "unrelated_hub.rs".into(),
+                importers: 94,
+                authority: AuthorityLabel::LoctreeDerived,
+            }],
+            ..RiskSlice::default()
+        };
+        let action = compose_action_slice(
+            &opts,
+            &snapshot,
+            &structural,
+            &RuntimeSlice::default(),
+            &risk,
+        );
+        assert_eq!(
+            action.next_safe_commands.first().unwrap(),
+            "loct slice consumer.rs"
+        );
+        assert!(
+            !action
+                .next_safe_commands
+                .iter()
+                .any(|cmd| cmd.contains("appLogger") || cmd.contains("unrelated_hub"))
+        );
+        assert!(
+            !action
+                .power_path
+                .iter()
+                .any(|cmd| cmd.command.contains("appLogger"))
+        );
+    }
+    #[test]
+    fn scoped_context_carries_cached_intent_freshness_without_claiming_opt_out() {
+        let tmp = tempfile::TempDir::new().expect("temporary overlay root");
+        let snapshot = hub_snapshot(12);
+        let mut opts = ContextOptions {
+            scopes: vec!["path:loctree-rs/src".into()],
+            task: Some("startup recovery".into()),
+            ..ContextOptions::default()
+        };
+        let state = compose_cached_overlay_state(&opts, tmp.path(), &snapshot)
+            .expect("scoped default needs freshness evidence");
+        assert!(
+            state.stale_marker().is_some(),
+            "missing cache must remain explicit"
+        );
+        opts.no_aicx = true;
+        assert!(compose_cached_overlay_state(&opts, tmp.path(), &snapshot).is_none());
     }
 }

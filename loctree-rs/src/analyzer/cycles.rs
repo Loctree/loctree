@@ -149,7 +149,6 @@ pub struct ClassifiedCycle {
     pub classification: CycleClassification,
     pub compilability: CycleCompilability,
     pub has_wildcard: bool,
-    pub is_cfg_gated: bool,
     /// Provenance: every member is a test/fixture path, so this cycle is an
     /// intentional fixture, not a production regression. See [`is_fixture_cycle`].
     #[serde(default)]
@@ -166,7 +165,6 @@ impl ClassifiedCycle {
     pub fn new(nodes: Vec<String>, edges: &[(String, String, String)]) -> Self {
         let classification = classify_cycle(&nodes, edges);
         let has_wildcard = check_has_wildcard(&nodes, edges);
-        let is_cfg_gated = check_is_cfg_gated(&nodes, edges);
         let compilability = determine_compilability(&classification, &nodes, edges);
         let fixture = is_fixture_cycle(&nodes);
         let (pattern, risk, suggestion) = describe_cycle(&classification, &compilability, &nodes);
@@ -176,7 +174,6 @@ impl ClassifiedCycle {
             classification,
             compilability,
             has_wildcard,
-            is_cfg_gated,
             fixture,
             pattern,
             risk,
@@ -198,27 +195,45 @@ fn determine_compilability(
         CycleClassification::CfgGated => CycleCompilability::Structural,
         CycleClassification::FanPattern => CycleCompilability::DiamondDependency,
 
-        // Hard bidirectional and wildcard need deeper analysis
-        CycleClassification::HardBidirectional | CycleClassification::WildcardImport => {
-            // Check if this is a Rust mod/use pattern (structural, not breaking)
+        // A wildcard re-export's own risk signal is the implicit coupling,
+        // not a runtime value cycle — it stays out of "breaking" even when
+        // it survives the diamond check. `findings::classify_cycles` reads
+        // this same `compilability` and has always labeled WildcardImport
+        // "structural"; keeping it out of the Breaking arm here is what
+        // keeps the two surfaces agreeing (F5/F6).
+        CycleClassification::WildcardImport => {
+            if is_diamond_pattern(nodes, edges) {
+                CycleCompilability::DiamondDependency
+            } else {
+                CycleCompilability::Structural
+            }
+        }
+
+        // Hard bidirectional needs deeper analysis before it can be called
+        // Breaking: a Rust mod/use split, a type-only edge set, or a hidden
+        // diamond are all structural/non-defect carve-outs. Once a cycle
+        // survives every carve-out, it IS the "one truth" this repo already
+        // uses elsewhere: `health_inputs::structural_defects` and
+        // `findings::classify_cycles` both call a surviving
+        // `HardBidirectional` cycle "breaking". Before this fix this arm
+        // always fell through to `Structural` regardless — `loct cycles`
+        // reported 0 breaking on a repository `findings.json` called 9.
+        // This is the one truth chosen for the disagreement: HardBidirectional
+        // that survives every structural carve-out => Breaking, everywhere.
+        CycleClassification::HardBidirectional => {
             if is_rust_mod_use_pattern(nodes, edges) {
                 return CycleCompilability::Structural;
             }
 
-            // Check if edges are type-only imports (structural)
             if all_edges_type_only(nodes, edges) {
                 return CycleCompilability::Structural;
             }
 
-            // Check if it's actually a diamond (shared dependency)
             if is_diamond_pattern(nodes, edges) {
                 return CycleCompilability::DiamondDependency;
             }
 
-            // Default to structural since most cycles that make it through
-            // Tarjan's SCC in real code actually compile.
-            // True "Breaking" would require detecting value-level circular init.
-            CycleCompilability::Structural
+            CycleCompilability::Breaking
         }
 
         CycleClassification::Unknown => {
@@ -244,8 +259,15 @@ fn is_rust_mod_use_pattern(nodes: &[String], edges: &[(String, String, String)])
         let is_mod_declaration =
             (from.ends_with("/mod.rs") || from.ends_with("\\mod.rs")) && kind == "mod";
 
-        // Check for use patterns going back to parent
-        let is_use_to_parent = kind == "use" || kind == "import";
+        // Check for use patterns going back to parent. This used to match on
+        // `kind` alone ("use" or "import"), which is the kind almost every
+        // real edge in this graph carries — it made this function true for
+        // nearly any cycle regardless of path, which in turn made
+        // `determine_compilability`'s hard-bidirectional arm fall through to
+        // `Structural` unconditionally (loct cycles always said 0 breaking;
+        // see F5). The path relationship is the actual signal.
+        let is_use_to_parent = (kind == "use" || kind == "import")
+            && (is_parent_child_module(from, to) || is_parent_child_module(to, from));
 
         if is_mod_declaration || is_use_to_parent {
             return true;
@@ -402,6 +424,15 @@ fn check_has_wildcard(nodes: &[String], edges: &[(String, String, String)]) -> b
     })
 }
 
+/// Edge-kind vocabulary this checks against ("cfg"/"conditional") is never
+/// emitted by any production edge builder in this crate — the real
+/// vocabulary is `mod | type_import | lazy_import | dynamic_import | import |
+/// reexport` (see `output::build_cycle_edges`). No parser threads `#[cfg]`
+/// gating into an edge label today, so `CycleClassification::CfgGated` is
+/// unreachable from real scans; it only fires in tests that hand-craft a
+/// "cfg" label. Wiring real `#[cfg]` detection through the edge builders
+/// would make this reachable — until then this is aspirational taxonomy,
+/// not a live signal (F5).
 fn check_is_cfg_gated(nodes: &[String], edges: &[(String, String, String)]) -> bool {
     let node_set: HashSet<&str> = nodes.iter().map(|s| s.as_str()).collect();
     edges.iter().any(|(from, to, kind)| {
@@ -539,15 +570,21 @@ pub fn find_cycles_with_lazy(
     // Rust `mod foo;` declarations are NOT import edges - they create module relationships
     let strict_edges: Vec<_> = edges
         .iter()
-        .filter(|(_, _, kind)| kind != "lazy_import" && kind != "type_import" && kind != "mod")
+        .filter(|(_, _, kind)| {
+            kind != "lazy_import" && kind != "type_import" && kind != "mod" && kind != "call"
+        })
         .cloned()
         .collect();
     let strict_cycles = find_cycles(&strict_edges);
 
-    // For lazy cycle detection, filter out type imports and mod declarations
+    // For lazy cycle detection, filter out type imports and mod declarations.
+    // `call` edges (G1: path-qualified call sites) are excluded from BOTH
+    // passes: cycles here mean *import* cycles, and mutual calls are ordinary
+    // recursion — including them also densifies the graph enough to make
+    // cycle enumeration blow up on real repos (aicx hung >900s).
     let edges_no_type: Vec<_> = edges
         .iter()
-        .filter(|(_, _, kind)| kind != "type_import" && kind != "mod")
+        .filter(|(_, _, kind)| kind != "type_import" && kind != "mod" && kind != "call")
         .cloned()
         .collect();
     let all_cycles = find_cycles(&edges_no_type);
@@ -907,15 +944,24 @@ fn find_cycles_normalized(edges: &[(String, String)]) -> Vec<Vec<String>> {
             let scc_set: HashSet<&String> = scc.iter().collect();
 
             const MAX_CYCLES_PER_SCC: usize = 10;
+            // The cycle cap alone does not bound the WORK: on a large, dense
+            // SCC (ghostty's Zig graph, visible since G6) the DFS explores
+            // exponentially many simple paths while the dedup keeps
+            // cycles.len() below the cap, so enumeration never terminates.
+            // A per-SCC step budget keeps the result partial but bounded;
+            // short cycles are found long before the budget runs out.
+            const MAX_DFS_STEPS_PER_SCC: usize = 200_000;
+            let mut dfs_steps: usize = 0;
 
             for start_node in &scc {
-                if cycles.len() >= MAX_CYCLES_PER_SCC {
+                if cycles.len() >= MAX_CYCLES_PER_SCC || dfs_steps >= MAX_DFS_STEPS_PER_SCC {
                     break;
                 }
 
                 let mut stack = vec![(start_node, vec![start_node.clone()])];
                 while let Some((curr, path)) = stack.pop() {
-                    if cycles.len() >= MAX_CYCLES_PER_SCC {
+                    dfs_steps += 1;
+                    if cycles.len() >= MAX_CYCLES_PER_SCC || dfs_steps >= MAX_DFS_STEPS_PER_SCC {
                         break;
                     }
 
@@ -1110,7 +1156,7 @@ mod tests {
 
     #[test]
     fn shared_node_cycles_stay_separate_without_phantom_edge() {
-        // Regression for loctree-fail 2026-05-18: two real cycles sharing
+        // Regression for loctree-feedback 2026-05-18: two real cycles sharing
         // `types.rs` must not be merged into a longer trail by inventing a
         // `types.rs -> menu.rs` edge.
         let edges = vec![
@@ -1457,6 +1503,43 @@ mod tests {
         assert_eq!(classified[0].classification.severity(), 3);
     }
 
+    /// F5 — cross-surface truth: a genuinely mutual pair (unrelated files,
+    /// no Rust mod/use split, no type-only edges, no diamond) must classify
+    /// as `Breaking`, not fall through to `Structural`. Before this fix,
+    /// `determine_compilability`'s hard-bidirectional arm had no reachable
+    /// `Breaking` arm at all (it always fell through to `Structural`), and
+    /// `is_rust_mod_use_pattern` additionally short-circuited on `kind ==
+    /// "import"` alone (the kind nearly every real edge carries) regardless
+    /// of any actual parent/child relationship — so `loct cycles` always
+    /// reported 0 breaking cycles while `findings.json` (which derived
+    /// "breaking" straight from the classification) reported the true count.
+    /// This is the one truth both surfaces must now agree on.
+    #[test]
+    fn call_edges_never_form_cycles() {
+        // G1 call edges densify the graph enough to make cycle enumeration
+        // explode on real repos (aicx: >900s); mutual calls are ordinary
+        // recursion, not import cycles, so both passes must skip them.
+        let edges = vec![
+            ("a.rs".to_string(), "b.rs".to_string(), "call".to_string()),
+            ("b.rs".to_string(), "a.rs".to_string(), "call".to_string()),
+        ];
+        let (strict, lazy) = super::find_cycles_with_lazy(&edges);
+        assert!(strict.is_empty(), "call edges must not form strict cycles");
+        assert!(lazy.is_empty(), "call edges must not form lazy cycles");
+    }
+
+    #[test]
+    fn test_hard_bidirectional_compiles_to_breaking() {
+        use super::{CycleCompilability, find_cycles_classified};
+        let edges = vec![
+            ("a.rs".to_string(), "b.rs".to_string(), "import".to_string()),
+            ("b.rs".to_string(), "a.rs".to_string(), "import".to_string()),
+        ];
+        let classified = find_cycles_classified(&edges);
+        assert_eq!(classified.len(), 1);
+        assert_eq!(classified[0].compilability, CycleCompilability::Breaking);
+    }
+
     #[test]
     fn test_classify_module_self_reference() {
         use super::{CycleClassification, find_cycles_classified};
@@ -1502,6 +1585,16 @@ mod tests {
         assert!(classified[0].has_wildcard);
     }
 
+    /// F5 — this pins the classifier's own contract in isolation, NOT
+    /// real-world reachability: no production edge builder in this crate
+    /// ever emits a "cfg" or "conditional" label (see
+    /// `output::build_cycle_edges`'s vocabulary — `mod | type_import |
+    /// lazy_import | dynamic_import | import | reexport`). This label is
+    /// hand-crafted here because `CycleClassification::CfgGated` is
+    /// otherwise unreachable from a real scan today. The `is_cfg_gated`
+    /// boolean field was removed from `ClassifiedCycle`'s reported contract
+    /// for the same reason — a field that is always false on every real
+    /// snapshot is a misleading promise, not a detector.
     #[test]
     fn test_classify_cfg_gated() {
         use super::{CycleClassification, find_cycles_classified};
@@ -1513,13 +1606,12 @@ mod tests {
         assert_eq!(classified.len(), 1);
         assert_eq!(classified[0].classification, CycleClassification::CfgGated);
         assert_eq!(classified[0].classification.severity(), 1);
-        assert!(classified[0].is_cfg_gated);
     }
 
     #[test]
     fn is_fixture_cycle_flags_test_fixture_paths() {
         use super::is_fixture_cycle;
-        // Regression for loctree-fail 2026-06-03: the intentional
+        // Regression for loctree-feedback 2026-06-03: the intentional
         // tests/fixtures/circular_imports fixture was counted as a real cycle.
         let nodes = vec![
             "loctree-rs/tests/fixtures/circular_imports/src/c.ts".to_string(),
@@ -1565,7 +1657,7 @@ mod tests {
     #[test]
     fn classified_cycle_carries_fixture_provenance() {
         use super::find_cycles_classified;
-        // The exact false-positive shape from loctree-fail L479-L499:
+        // The exact false-positive shape from loctree-feedback L479-L499:
         // a.ts -> b.ts -> c.ts -> a.ts under tests/fixtures/circular_imports.
         let base = "loctree-rs/tests/fixtures/circular_imports/src";
         let edges = vec![

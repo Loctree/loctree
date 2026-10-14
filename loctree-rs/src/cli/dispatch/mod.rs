@@ -625,6 +625,16 @@ pub enum DispatchResult {
 ///
 /// Returns a DispatchResult indicating what action to take.
 pub fn dispatch_command(parsed_cmd: &ParsedCommand) -> DispatchResult {
+    if let Command::Find(opts) = &parsed_cmd.command
+        && opts.include_untracked
+        && !opts.literal
+        && !opts.regex
+    {
+        eprintln!(
+            "[loct][error] --include-untracked requires find --literal or --regex; symbol and --file searches use the indexed snapshot. Run 'loct scan --fresh' to index new files first."
+        );
+        return DispatchResult::Exit(2);
+    }
     // Emit deprecation warning if this was from legacy syntax
     parsed_cmd.emit_deprecation_warning();
 
@@ -682,6 +692,18 @@ pub fn dispatch_command(parsed_cmd: &ParsedCommand) -> DispatchResult {
         // `--literal`.
         Command::Find(opts) if opts.regex => {
             return handlers::occurrences::handle_find_regex_command(opts, &parsed_cmd.global);
+        }
+        Command::Find(opts)
+            if opts.file.is_some()
+                && opts.query.is_none()
+                && opts.queries.is_empty()
+                && opts.symbol.is_none()
+                && opts.similar.is_none()
+                && opts.impact.is_none()
+                && !opts.dead_only
+                && !opts.exported_only =>
+        {
+            return handlers::query::handle_find_files_command(opts, &parsed_cmd.global);
         }
         Command::Impact(opts) => {
             // Execute impact analysis and return result

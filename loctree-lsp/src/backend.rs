@@ -1589,7 +1589,16 @@ impl Backend {
         }
 
         let query = find::build_query(&params);
-        let results = loctree::analyzer::search::run_search(&query, &loaded.snapshot.files);
+        let results = loctree::analyzer::search::run_search(
+            &query,
+            &loaded.snapshot.files,
+            loaded
+                .snapshot
+                .metadata
+                .roots
+                .first()
+                .map(std::path::Path::new),
+        );
         let snapshot_id = semantic_handler::snapshot_pagination_id(&loaded.snapshot);
         let chunk_size = match params.chunk_size {
             Some(value) => value,

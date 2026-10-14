@@ -429,7 +429,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
                 }
             }
             Err(err) => {
-                eprintln!("[loctree][warn] failed to write auto artifacts: {}", err);
+                crate::snapshot::auto_artifacts_failure(&snapshot_root, err)?;
             }
         }
     }
@@ -704,6 +704,7 @@ pub fn run_import_analyzer(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Re
             event_bridges: vec![],
             barrels: vec![],
             semantic_facts: None,
+            scan_diagnostics: None,
             symbol_graph: {
                 #[cfg(any(
                     feature = "deep-index",
@@ -993,7 +994,7 @@ mod tests {
         }
     }
 
-    /// Regression for recurring loctree-fail entries where `Cargo.toml`,
+    /// Regression for recurring loctree-feedback entries where `Cargo.toml`,
     /// workflow YAML, and repo-local markdown plans were missing from the
     /// snapshot, forcing shell fallback for docs/manifest truth.
     #[test]

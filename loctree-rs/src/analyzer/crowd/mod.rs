@@ -11,18 +11,42 @@ pub mod types;
 pub use clustering::{cluster_by_name, detect_name_patterns};
 pub use output::*;
 pub use similarity::{
-    build_import_sets, count_importers, count_importers_direct_edges, count_importers_transitive,
-    jaccard_similarity, similarity_matrix,
+    EdgeIndex, ImporterCounts, build_import_sets, count_importers, count_importers_direct_edges,
+    count_importers_transitive, jaccard_similarity, similarity_matrix,
 };
 pub use types::*;
+
+use std::collections::{HashMap, HashSet};
 
 use crate::snapshot::GraphEdge;
 use crate::types::FileAnalysis;
 
+/// Pattern-independent inputs of crowd detection: import sets and importer
+/// counts for every file. Computed once per run and shared by every pattern;
+/// recomputing them per pattern multiplied the whole edge walk by the number
+/// of patterns.
+struct CrowdContext {
+    import_sets: HashMap<String, HashSet<String>>,
+    counts: ImporterCounts,
+}
+
+impl CrowdContext {
+    fn new(files: &[FileAnalysis], edges: Option<&[GraphEdge]>) -> Self {
+        let counts = match edges {
+            Some(edges) => ImporterCounts::from_edges(files, edges),
+            None => ImporterCounts::from_imports(files),
+        };
+        Self {
+            import_sets: build_import_sets(files),
+            counts,
+        }
+    }
+}
+
 /// Detect a crowd around a specific pattern
 /// Note: For accurate importer counts with re-exports, use detect_crowd_with_edges
 pub fn detect_crowd(files: &[FileAnalysis], pattern: &str) -> Crowd {
-    detect_crowd_internal(files, pattern, None)
+    detect_crowd_in_context(files, pattern, &CrowdContext::new(files, None))
 }
 
 /// Detect a crowd around a specific pattern with transitive importer counting
@@ -32,14 +56,10 @@ pub fn detect_crowd_with_edges(
     pattern: &str,
     edges: &[GraphEdge],
 ) -> Crowd {
-    detect_crowd_internal(files, pattern, Some(edges))
+    detect_crowd_in_context(files, pattern, &CrowdContext::new(files, Some(edges)))
 }
 
-fn detect_crowd_internal(
-    files: &[FileAnalysis],
-    pattern: &str,
-    edges: Option<&[GraphEdge]>,
-) -> Crowd {
+fn detect_crowd_in_context(files: &[FileAnalysis], pattern: &str, ctx: &CrowdContext) -> Crowd {
     // 1. Find files matching the pattern by name
     let matching_files = cluster_by_name(files, pattern);
 
@@ -53,22 +73,13 @@ fn detect_crowd_internal(
         };
     }
 
-    // 2. Build import sets and count importers
-    let import_sets = build_import_sets(files);
-
-    // Use transitive counting if edges are available
-    let (importer_counts, direct_counts) = if let Some(edges) = edges {
-        (
-            count_importers_transitive(files, edges),
-            count_importers_direct_edges(files, edges),
-        )
-    } else {
-        let direct = count_importers(files);
-        (direct.clone(), direct)
-    };
+    // 2. Import sets and importer counts come from the shared context.
+    let import_sets = &ctx.import_sets;
+    let importer_counts = &ctx.counts.transitive;
+    let direct_counts = &ctx.counts.direct;
 
     // 3. Calculate similarities between crowd members
-    let similarities = similarity_matrix(&matching_files, &import_sets);
+    let similarities = similarity_matrix(&matching_files, import_sets);
 
     // 4. Build crowd members with stats
     let mut members: Vec<CrowdMember> = matching_files
@@ -346,11 +357,87 @@ pub fn detect_all_crowds_with_edges(files: &[FileAnalysis], edges: &[GraphEdge])
 
 fn detect_all_crowds_internal(files: &[FileAnalysis], edges: Option<&[GraphEdge]>) -> Vec<Crowd> {
     let patterns = detect_name_patterns(files);
+    let ctx = CrowdContext::new(files, edges);
 
     patterns
         .into_iter()
         .take(10) // Limit to top 10 patterns
-        .map(|pattern| detect_crowd_internal(files, &pattern, edges))
+        .map(|pattern| detect_crowd_in_context(files, &pattern, &ctx))
         .filter(|crowd| crowd.members.len() >= 2) // Only include actual crowds
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str) -> FileAnalysis {
+        FileAnalysis {
+            path: path.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn edge(from: &str, to: &str, label: &str) -> GraphEdge {
+        GraphEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn shared_context_yields_the_same_crowds_as_per_pattern_detection() {
+        // Two name patterns ("message", "widget") over one file set; the
+        // barrel makes transitive and direct counts differ, so a context
+        // reused across patterns must still carry the real per-file numbers.
+        let files = vec![
+            file("src/messageStore.ts"),
+            file("src/messageList.ts"),
+            file("src/messageItem.ts"),
+            file("src/widgetPanel.ts"),
+            file("src/widgetRail.ts"),
+            file("src/widgetIcon.ts"),
+            file("src/index.ts"),
+        ];
+        let edges = vec![
+            edge("src/index.ts", "src/messageStore.ts", "reexport"),
+            edge("app/a.ts", "src/index.ts", "import"),
+            edge("app/b.ts", "src/index.ts", "import"),
+            edge("app/c.ts", "src/messageList.ts", "import"),
+            edge("app/d.ts", "src/widgetPanel.ts", "import"),
+        ];
+
+        let all = detect_all_crowds_with_edges(&files, &edges);
+        assert!(
+            all.iter().any(|c| c.pattern == "message") && all.iter().any(|c| c.pattern == "widget"),
+            "expected both patterns, got {:?}",
+            all.iter().map(|c| c.pattern.as_str()).collect::<Vec<_>>()
+        );
+
+        for crowd in &all {
+            let single = detect_crowd_with_edges(&files, &crowd.pattern, &edges);
+            assert_eq!(
+                serde_json::to_value(crowd).unwrap(),
+                serde_json::to_value(&single).unwrap(),
+                "crowd for pattern {} diverged between shared and per-pattern context",
+                crowd.pattern
+            );
+        }
+
+        let message = all.iter().find(|c| c.pattern == "message").unwrap();
+        let store = message
+            .members
+            .iter()
+            .find(|m| m.file == "src/messageStore.ts")
+            .unwrap();
+        assert_eq!(
+            store.importer_count, 2,
+            "consumers reached through the barrel"
+        );
+        assert_eq!(
+            store.importer_count_direct, 1,
+            "only the barrel points at it directly"
+        );
+    }
 }

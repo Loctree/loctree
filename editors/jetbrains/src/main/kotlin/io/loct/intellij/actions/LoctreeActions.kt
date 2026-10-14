@@ -117,7 +117,7 @@ class ShowHealthAction : LoctreeProjectAction() {
         runRequest(project, LoctreeBundle.message("action.io.loct.intellij.actions.ShowHealthAction.text")) {
             val health = gateway(project).health(HealthParams(includeTopRisks = true))
                 ?: return@runRequest LoctreeBundle.message("notify.lspNotRunning")
-            "Loctree Health: ${health.healthScore}/100 (${health.status}) — " +
+            "Loctree Health: ${health.healthScoreLabel} (${health.status}) — " +
                 "${health.deadExports} Dead, ${health.cycles} Cycles, ${health.twins} Twins"
         }
     }

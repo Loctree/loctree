@@ -5,7 +5,7 @@
 //! without running tests or inspecting runtime behavior.
 
 use crate::snapshot::Snapshot;
-use crate::types::FileAnalysis;
+use crate::types::{FileAnalysis, ReexportKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -88,7 +88,13 @@ pub fn analyze_test_coverage(snapshot: &Snapshot) -> TestCoverageReport {
     let prod_exports = build_export_map(&prod_files);
 
     // Build map: production_symbol -> test_files_that_import_it
-    let symbol_coverage = build_symbol_coverage_map(&test_files, &prod_files, &prod_exports);
+    let mut symbol_coverage = build_symbol_coverage_map(&test_files, &prod_files, &prod_exports);
+
+    // H4(c): credit files with an inline `#[cfg(test)]` module (or Zig
+    // `test "…"` block) as covering their own exports - see
+    // `credit_inline_test_coverage` for the per-symbol inline-test credit,
+    // not a per-symbol one.
+    credit_inline_test_coverage(&prod_files, &mut symbol_coverage);
 
     // Analyze handlers (Tauri commands)
     let handlers = analyze_handler_coverage(snapshot, &symbol_coverage);
@@ -96,9 +102,25 @@ pub fn analyze_test_coverage(snapshot: &Snapshot) -> TestCoverageReport {
     // Find exports without test coverage
     let exports_without_tests = find_uncovered_exports(&prod_files, &symbol_coverage);
 
-    // Calculate overall coverage percentage
-    let total_exports: usize = prod_exports.values().map(|syms| syms.len()).sum();
-    let covered_exports = symbol_coverage.len();
+    // Calculate overall coverage percentage.
+    // N1 (round-2): both sides of the ratio count only testable export kinds
+    // (function/method). Types, consts, re-exports and FFI externs have no
+    // behavior to cover; counting them in the denominator type-inflated the
+    // percentage.
+    let mut total_exports = 0usize;
+    let mut covered_exports = 0usize;
+    for file in &prod_files {
+        for export in &file.exports {
+            if !super::coverage_gaps::is_testable_export_kind(&export.kind) {
+                continue;
+            }
+            total_exports += 1;
+            let coverage_key = format!("{}::{}", file.path, export.name);
+            if symbol_coverage.contains_key(&coverage_key) {
+                covered_exports += 1;
+            }
+        }
+    }
     let coverage_percent = if total_exports > 0 {
         (covered_exports as f32 / total_exports as f32) * 100.0
     } else {
@@ -268,6 +290,174 @@ fn analyze_handler_coverage(
     handlers
 }
 
+/// H4(b): `pub use` targets whose source root is a well-known stdlib/core
+/// crate (`pub use std::process::Command;`) are not a symbol this repo
+/// defines - they're forwarding an external item. `ExportSymbol` (the type
+/// `file.exports` holds) carries no origin field, but the matching
+/// `FileAnalysis::reexports` entry does (`ReexportEntry::source`, e.g.
+/// `"std::process::Command"`). Deliberately conservative/short list: it
+/// only recognizes the standard-library family, not arbitrary third-party
+/// crates (that would need the file's own crate name to distinguish a
+/// same-crate absolute path from an external one, which isn't available
+/// here) - so this only ever REMOVES noise, never hides a real local gap.
+const EXTERNAL_REEXPORT_ROOTS: &[&str] = &["std", "core", "alloc", "proc_macro", "proc_macro2"];
+
+fn is_external_reexport_source(source: &str) -> bool {
+    let root = source.split("::").next().unwrap_or(source);
+    EXTERNAL_REEXPORT_ROOTS.contains(&root)
+}
+
+/// Names in `file.exports` that are re-exports of an external/stdlib item
+/// per [`is_external_reexport_source`], cross-referenced from
+/// `file.reexports`.
+fn external_reexport_names(file: &FileAnalysis) -> HashSet<&str> {
+    let mut names = HashSet::new();
+    for reexport in &file.reexports {
+        if !is_external_reexport_source(&reexport.source) {
+            continue;
+        }
+        if let ReexportKind::Named(pairs) = &reexport.kind {
+            for (_, exported) in pairs {
+                names.insert(exported.as_str());
+            }
+        }
+    }
+    names
+}
+
+/// H4(c): does this file carry its own inline test module/blocks? Rust
+/// `#[cfg(test)] mod ... { ... }` and Zig `test "…" { ... }` both put tests
+/// in the SAME file as the production code they exercise, so a purely
+/// path/kind-based test/prod partition (see `partition_files`) never
+/// classifies such a file as having any test coverage at all - every one of
+/// its exports reads as "uncovered" even on a thoroughly inline-tested
+/// repo, producing a flat, wrong 0.0% coverage reading.
+///
+/// This is a best-effort, FILE-granularity signal only: it does not attempt
+/// to map a specific inline test to the specific export it exercises -
+/// `FileAnalysis` carries no such per-symbol data today, and adding a
+/// dedicated sensor field is out of this executor's edit scope (`types.rs`
+/// and the Layer 1 Rust/Zig sensors are owned elsewhere). Flagged for the
+/// integrator: the principled fix is Layer 1 recording this once per file
+/// instead of every downstream consumer re-reading the file from disk.
+fn inline_test_region(file: &FileAnalysis, content: &str) -> Option<String> {
+    match file.language.as_str() {
+        "rs" => {
+            let ranges = crate::analyzer::occurrences::cfg_test_line_ranges(content);
+            if ranges.is_empty() {
+                return None;
+            }
+            let mut region = String::new();
+            for (idx, line) in content.lines().enumerate() {
+                let line_no = idx + 1;
+                if ranges
+                    .iter()
+                    .any(|(start, end)| line_no >= *start && line_no <= *end)
+                {
+                    region.push_str(line);
+                    region.push('\n');
+                }
+            }
+            (!region.trim().is_empty()).then_some(region)
+        }
+        "zig" => zig_test_regions(content),
+        _ => None,
+    }
+}
+
+/// Concatenated bodies of Zig `test "…" { … }` blocks, brace-matched.
+fn zig_test_regions(content: &str) -> Option<String> {
+    let mut region = String::new();
+    let mut search = 0usize;
+    while let Some(pos) = content[search..].find("test \"") {
+        let start = search + pos;
+        let Some(brace_rel) = content[start..].find('{') else {
+            break;
+        };
+        let brace = start + brace_rel;
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, ch) in content[brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            break;
+        };
+        region.push_str(&content[start..end]);
+        region.push('\n');
+        search = end;
+    }
+    (!region.is_empty()).then_some(region)
+}
+
+/// Boundary-aware "does this identifier appear in the region" check.
+fn identifier_in_region(region: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = region.as_bytes();
+    let mut from = 0usize;
+    while let Some(pos) = region[from..].find(name) {
+        let begin = from + pos;
+        let end = begin + name.len();
+        let before_ok =
+            begin == 0 || !(bytes[begin - 1].is_ascii_alphanumeric() || bytes[begin - 1] == b'_');
+        let after_ok =
+            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if before_ok && after_ok {
+            return true;
+        }
+        from = begin + 1;
+    }
+    false
+}
+
+/// Credit exports of an inline-tested prod file with a synthetic
+/// "inline_test" marker — but only the exports whose NAME actually appears
+/// inside the inline test region. "The file contains a test module" and
+/// "this symbol is exercised by a test" are different facts: crediting every
+/// export for the mere presence of `#[cfg(test)]` text handed coverage to
+/// untouched functions, empty test modules, and even a marker inside a
+/// comment (audit N07).
+fn credit_inline_test_coverage(
+    prod_files: &[&FileAnalysis],
+    symbol_coverage: &mut HashMap<String, HashSet<PathBuf>>,
+) {
+    for file in prod_files {
+        if file.language != "rs" && file.language != "zig" {
+            continue;
+        }
+        let Ok(Some(content)) = crate::semantic::io::try_read_validated_semantic_input(&file.path)
+        else {
+            continue;
+        };
+        let Some(region) = inline_test_region(file, &content) else {
+            continue;
+        };
+        let marker = PathBuf::from(format!("{}::inline_test", file.path));
+        for export in &file.exports {
+            if !identifier_in_region(&region, &export.name) {
+                continue;
+            }
+            let key = format!("{}::{}", file.path, export.name);
+            symbol_coverage
+                .entry(key)
+                .or_default()
+                .insert(marker.clone());
+        }
+    }
+}
+
 /// Find production exports that have no test coverage
 fn find_uncovered_exports(
     prod_files: &[&FileAnalysis],
@@ -276,7 +466,18 @@ fn find_uncovered_exports(
     let mut uncovered = Vec::new();
 
     for file in prod_files {
+        let external_reexports = external_reexport_names(file);
         for export in &file.exports {
+            // N1 (round-2): only functions/methods are testable exports;
+            // types, consts, re-exports and FFI externs are excluded from
+            // this list entirely (integrator decision - supersedes the
+            // round-1 H4(b) guard that kept local re-exports visible here).
+            if !super::coverage_gaps::is_testable_export_kind(&export.kind) {
+                continue;
+            }
+            if external_reexports.contains(export.name.as_str()) {
+                continue;
+            }
             let coverage_key = format!("{}::{}", file.path, export.name);
             let tested_by: Vec<PathBuf> = symbol_coverage
                 .get(&coverage_key)
@@ -303,7 +504,7 @@ fn find_uncovered_exports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExportSymbol, ImportEntry, ImportKind, ImportSymbol};
+    use crate::types::{ExportSymbol, ImportEntry, ImportKind, ImportSymbol, ReexportEntry};
 
     fn make_test_file(path: &str, imports: Vec<ImportEntry>) -> FileAnalysis {
         let mut file = FileAnalysis::new(path.to_string());
@@ -427,6 +628,182 @@ mod tests {
         assert!(!uncovered[0].is_covered);
     }
 
+    /// H4(b) RED: `pub use std::process::Command;` surfaces in
+    /// `file.exports` as `kind == "reexport"`, but it forwards a stdlib item
+    /// - it must not be reported as an untested app export.
+    #[test]
+    fn find_uncovered_exports_skips_stdlib_pub_use_reexport() {
+        let mut prod_file = make_prod_file(
+            "src/util.rs",
+            vec![ExportSymbol::new(
+                "Command".to_string(),
+                "reexport",
+                "named",
+                None,
+            )],
+        );
+        prod_file.reexports.push(ReexportEntry {
+            source: "std::process::Command".to_string(),
+            kind: crate::types::ReexportKind::Named(vec![(
+                "Command".to_string(),
+                "Command".to_string(),
+            )]),
+            resolved: None,
+        });
+
+        let prod_files = vec![&prod_file];
+        let test_imports = HashMap::new();
+        let uncovered = find_uncovered_exports(&prod_files, &test_imports);
+
+        assert!(
+            !uncovered.iter().any(|u| u.symbol == "Command"),
+            "stdlib pub-use reexport must not show up as an untested export, found: {:?}",
+            uncovered
+        );
+    }
+
+    /// N1 (round-2): re-exports (local or stdlib) no longer appear in
+    /// `exports_without_tests` at all - the kind allowlist
+    /// (function/method only) supersedes the round-1 H4(b) guard that kept
+    /// local `pub use` re-exports visible. The H4(b) stdlib filter stays as
+    /// defense-in-depth for any future kind the allowlist might admit.
+    #[test]
+    fn find_uncovered_exports_skips_reexports_by_kind() {
+        let mut prod_file = make_prod_file(
+            "src/lib.rs",
+            vec![ExportSymbol::new(
+                "PublicThing".to_string(),
+                "reexport",
+                "named",
+                None,
+            )],
+        );
+        prod_file.reexports.push(ReexportEntry {
+            source: "crate::inner::PublicThing".to_string(),
+            kind: crate::types::ReexportKind::Named(vec![(
+                "PublicThing".to_string(),
+                "PublicThing".to_string(),
+            )]),
+            resolved: None,
+        });
+
+        let prod_files = vec![&prod_file];
+        let test_imports = HashMap::new();
+        let uncovered = find_uncovered_exports(&prod_files, &test_imports);
+
+        assert!(
+            !uncovered.iter().any(|u| u.symbol == "PublicThing"),
+            "reexports are outside the testable-kind allowlist (round-2 N1), found: {:?}",
+            uncovered
+        );
+    }
+
+    /// N1 (round-2): struct/decl/extern exports are not "uncovered exports";
+    /// an uncovered function still fires.
+    #[test]
+    fn find_uncovered_exports_skips_non_function_kinds() {
+        let prod_file = make_prod_file(
+            "src/lib.rs",
+            vec![
+                ExportSymbol::new("AppConfig".to_string(), "struct", "named", Some(1)),
+                ExportSymbol::new("MAX_RETRIES".to_string(), "decl", "named", Some(2)),
+                ExportSymbol::new("ax_copy_value".to_string(), "extern", "named", Some(3)),
+                ExportSymbol::new("real_untested".to_string(), "function", "named", Some(4)),
+            ],
+        );
+
+        let prod_files = vec![&prod_file];
+        let uncovered = find_uncovered_exports(&prod_files, &HashMap::new());
+
+        for type_like in ["AppConfig", "MAX_RETRIES", "ax_copy_value"] {
+            assert!(
+                !uncovered.iter().any(|u| u.symbol == type_like),
+                "non-function export `{type_like}` must not be listed as uncovered, found: {:?}",
+                uncovered
+            );
+        }
+        assert!(
+            uncovered.iter().any(|u| u.symbol == "real_untested"),
+            "an uncovered function must still be listed, found: {:?}",
+            uncovered
+        );
+    }
+
+    /// N1 (round-2): the coverage percentage denominator counts only
+    /// function/method exports - types must not inflate or deflate it.
+    #[test]
+    fn coverage_percent_counts_only_testable_kinds() {
+        let prod_file = make_prod_file(
+            "src/utils.rs",
+            vec![
+                ExportSymbol::new("covered".to_string(), "function", "named", Some(1)),
+                ExportSymbol::new("uncovered".to_string(), "function", "named", Some(2)),
+                ExportSymbol::new("SomeStruct".to_string(), "struct", "named", Some(3)),
+                ExportSymbol::new("SOME_CONST".to_string(), "decl", "named", Some(4)),
+            ],
+        );
+        let test_file = make_test_file(
+            "tests/utils_test.rs",
+            vec![make_import("src/utils.rs", vec!["covered"])],
+        );
+
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.files = vec![prod_file, test_file];
+
+        let report = analyze_test_coverage(&snapshot);
+        assert_eq!(
+            report.coverage_percent, 50.0,
+            "1 of 2 function exports covered; struct/const must not enter the ratio"
+        );
+    }
+
+    /// H4(c) RED: a Rust file with an inline `#[cfg(test)]` module must not
+    /// read as 0% covered / all-exports-uncovered just because no separate
+    /// test FILE imports it.
+    #[test]
+    fn test_inline_cfg_test_module_credits_own_file_coverage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lib.rs");
+        std::fs::write(
+            &path,
+            r#"
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds() { assert_eq!(add(1, 2), 3); }
+}
+"#,
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut prod_file = FileAnalysis::new(path_str);
+        prod_file.kind = "code".to_string();
+        prod_file.language = "rs".to_string();
+        prod_file.exports = vec![ExportSymbol::new(
+            "add".to_string(),
+            "function",
+            "named",
+            Some(2),
+        )];
+
+        let mut snapshot = Snapshot::new(vec![tmp.path().to_string_lossy().to_string()]);
+        snapshot.files = vec![prod_file];
+
+        let report = analyze_test_coverage(&snapshot);
+
+        assert_eq!(
+            report.exports_without_tests.len(),
+            0,
+            "inline #[cfg(test)]-tested export should not count as uncovered, got: {:?}",
+            report.exports_without_tests
+        );
+    }
+
     #[test]
     fn test_analyze_test_coverage() {
         let prod_file = make_prod_file(
@@ -453,5 +830,93 @@ mod tests {
         assert_eq!(report.prod_file_count, 1);
         assert_eq!(report.coverage_percent, 100.0);
         assert_eq!(report.exports_without_tests.len(), 0);
+    }
+    /// N07 (audit): a file with an inline test module exercising ONLY `add`
+    /// must not hand coverage to the untouched `other` export.
+    #[test]
+    fn inline_test_credit_is_per_symbol_not_per_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lib.rs");
+        std::fs::write(
+            &path,
+            r#"
+pub fn add(a: i32, b: i32) -> i32 { a + b }
+pub fn other() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adds() { assert_eq!(add(1, 2), 3); }
+}
+"#,
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut prod_file = FileAnalysis::new(path_str);
+        prod_file.kind = "code".to_string();
+        prod_file.language = "rs".to_string();
+        prod_file.exports = vec![
+            ExportSymbol::new("add".to_string(), "function", "named", Some(2)),
+            ExportSymbol::new("other".to_string(), "function", "named", Some(3)),
+        ];
+
+        let mut snapshot = Snapshot::new(vec![tmp.path().to_string_lossy().to_string()]);
+        snapshot.files = vec![prod_file];
+
+        let report = analyze_test_coverage(&snapshot);
+        assert!(
+            report
+                .exports_without_tests
+                .iter()
+                .any(|u| u.symbol == "other"),
+            "`other` is never touched by the inline test and must stay uncovered, got: {:?}",
+            report.exports_without_tests
+        );
+        assert!(
+            !report
+                .exports_without_tests
+                .iter()
+                .any(|u| u.symbol == "add"),
+            "`add` is exercised by the inline test and must be covered"
+        );
+    }
+
+    /// N07 (audit): an EMPTY `#[cfg(test)] mod tests {}` proves nothing.
+    #[test]
+    fn empty_inline_test_module_credits_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("lib.rs");
+        std::fs::write(
+            &path,
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }\n\n#[cfg(test)]\nmod tests {}\n",
+        )
+        .unwrap();
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut prod_file = FileAnalysis::new(path_str);
+        prod_file.kind = "code".to_string();
+        prod_file.language = "rs".to_string();
+        prod_file.exports = vec![ExportSymbol::new(
+            "add".to_string(),
+            "function",
+            "named",
+            Some(1),
+        )];
+
+        let mut snapshot = Snapshot::new(vec![tmp.path().to_string_lossy().to_string()]);
+        snapshot.files = vec![prod_file];
+
+        let report = analyze_test_coverage(&snapshot);
+        assert!(
+            report
+                .exports_without_tests
+                .iter()
+                .any(|u| u.symbol == "add"),
+            "an empty test module must not credit any export, got: {:?}",
+            report.exports_without_tests
+        );
     }
 }

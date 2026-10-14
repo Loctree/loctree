@@ -525,6 +525,99 @@ impl TwinClass {
     }
 }
 
+/// Dead parrots on `loct twins` use this cap and do not spend `--limit`.
+/// `follow twins` emits none.
+pub const DEAD_PARROTS_PAGE_CAP: usize = 10;
+
+fn twin_class_page_rank(class: TwinClass) -> u8 {
+    match class {
+        TwinClass::Exact => 0,
+        TwinClass::ShapeSimilar => 1,
+        TwinClass::NameCollision => 2,
+        TwinClass::Idiom => 3,
+    }
+}
+
+/// Parse a CSV class filter.
+///
+/// Tokens: `EXACT`, `SHAPE_SIMILAR`, `NAME_COLLISION`, `IDIOM`.
+/// Family aliases: `structural` = EXACT + SHAPE_SIMILAR, `naming` = NAME_COLLISION + IDIOM.
+/// Matching is case-insensitive. Unknown tokens are an error.
+pub fn parse_twin_class_filter(spec: &str) -> Result<Vec<TwinClass>, String> {
+    let mut out = Vec::new();
+    if spec.trim().is_empty() {
+        return Err(
+            "twin class filter is empty. Expected EXACT, SHAPE_SIMILAR, NAME_COLLISION, IDIOM, structural, or naming"
+                .to_string(),
+        );
+    }
+    for raw in spec.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let classes: &[TwinClass] = match token.to_ascii_uppercase().as_str() {
+            "EXACT" => &[TwinClass::Exact],
+            "SHAPE_SIMILAR" | "SHAPE-SIMILAR" => &[TwinClass::ShapeSimilar],
+            "NAME_COLLISION" | "NAME-COLLISION" => &[TwinClass::NameCollision],
+            "IDIOM" => &[TwinClass::Idiom],
+            "STRUCTURAL" => &[TwinClass::Exact, TwinClass::ShapeSimilar],
+            "NAMING" => &[TwinClass::NameCollision, TwinClass::Idiom],
+            _ => {
+                return Err(format!(
+                    "unknown twin class '{token}'. Expected EXACT, SHAPE_SIMILAR, NAME_COLLISION, IDIOM, structural, or naming"
+                ));
+            }
+        };
+        for class in classes {
+            if !out.contains(class) {
+                out.push(*class);
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(
+            "twin class filter is empty. Expected EXACT, SHAPE_SIMILAR, NAME_COLLISION, IDIOM, structural, or naming"
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// `(skip, take)` windows for families walked in order.
+///
+/// `offset` skips items across the families. `limit: None` keeps everything
+/// that remains after the skip.
+pub fn page_family_windows(
+    lengths: &[usize],
+    offset: usize,
+    limit: Option<usize>,
+) -> Vec<(usize, usize)> {
+    let mut skip_left = offset;
+    let mut take_left = limit;
+    let mut windows = Vec::with_capacity(lengths.len());
+    for &len in lengths {
+        let skip = skip_left.min(len);
+        skip_left -= skip;
+        let available = len - skip;
+        let take = match take_left {
+            Some(left) => {
+                let n = left.min(available);
+                take_left = Some(left - n);
+                n
+            }
+            None => available,
+        };
+        windows.push((skip, take));
+    }
+    windows
+}
+
+/// True when items remain after `offset + returned` in a filtered census of `total`.
+pub fn page_has_more(total: usize, offset: usize, returned: usize) -> bool {
+    offset.saturating_add(returned) < total
+}
+
 /// Idiomatic constructor/conversion method names: `from_env`, `to_json`,
 /// `into_inner`, `as_str`, `with_capacity`, `try_parse`, ... Same name on
 /// unrelated types is a language convention, not duplication.
@@ -538,11 +631,22 @@ fn is_idiom_method_name(name: &str) -> bool {
 /// `all_methods` must be true when every location is a method on some impl
 /// type (kind == "method" from indexed extraction, or the symbol appears in
 /// `FileAnalysis::impl_methods` for regex-based Rust extraction).
+///
+/// `impl_qualifiers` carries the implemented type/receiver per location
+/// (from `FileAnalysis::impl_methods[].qualifier`) when known, `None` when
+/// not. Two or more locations with DIFFERENT known qualifiers (F3: a
+/// delegation chain like `Screen::resize_pane_with_id` calling
+/// `Tab::resize_pane_with_id`) is proof the match is a same-name/same-shape
+/// coincidence, never a literal duplicate — this refuses EXACT even when
+/// the folded param/return type fingerprint is identical, because that
+/// fingerprint never compared the bodies (or the receivers) at all. Pass an
+/// empty slice when receiver data is unavailable; that never downgrades.
 pub fn classify_twin_class(
     name: &str,
     locations: &[TwinLocation],
     signature_similarity: Option<f32>,
     all_methods: bool,
+    impl_qualifiers: &[Option<&str>],
 ) -> TwinClass {
     if all_methods {
         // Methods of different enums/structs or impls of the same trait:
@@ -571,7 +675,12 @@ pub fn classify_twin_class(
         return TwinClass::NameCollision;
     }
 
+    let distinct_qualifiers: std::collections::HashSet<&str> =
+        impl_qualifiers.iter().filter_map(|q| *q).collect();
+    let receivers_differ = distinct_qualifiers.len() > 1;
+
     match signature_similarity {
+        Some(sim) if sim >= 0.999 && receivers_differ => TwinClass::NameCollision,
         Some(sim) if sim >= 0.999 => TwinClass::Exact,
         Some(sim) if sim >= 0.4 => TwinClass::ShapeSimilar,
         _ => TwinClass::NameCollision,
@@ -609,6 +718,24 @@ pub struct ExactTwin {
     /// Equal to `!shape_match && single_module_target`.
     #[serde(default)]
     pub exclude_from_score: bool,
+}
+
+/// Page order: EXACT and SHAPE_SIMILAR, then NAME_COLLISION and IDIOM.
+/// Within a class, longer location lists stay first (stable).
+pub fn order_twins_for_page(twins: &mut [ExactTwin]) {
+    twins.sort_by(|a, b| {
+        twin_class_page_rank(a.class)
+            .cmp(&twin_class_page_rank(b.class))
+            .then(b.locations.len().cmp(&a.locations.len()))
+    });
+}
+
+/// Drop groups outside `classes`. An empty filter keeps every group.
+pub fn retain_twin_classes(twins: &mut Vec<ExactTwin>, classes: &[TwinClass]) {
+    if classes.is_empty() {
+        return;
+    }
+    twins.retain(|twin| classes.contains(&twin.class));
 }
 
 /// True when every location carries the same signature fingerprint.
@@ -682,6 +809,8 @@ pub enum Language {
     Rust,
     Python,
     Go,
+    Swift,
+    Zig,
     Other,
 }
 
@@ -712,6 +841,10 @@ pub fn detect_language(path: &str) -> Language {
         Language::Python
     } else if path.ends_with(".go") {
         Language::Go
+    } else if path.ends_with(".swift") {
+        Language::Swift
+    } else if path.ends_with(".zig") {
+        Language::Zig
     } else {
         Language::Other
     }
@@ -1293,7 +1426,28 @@ pub fn detect_exact_twins_with_frameworks(
                     || l.file_path.contains("ipc_client")
             });
 
-        let class = classify_twin_class(&name, &locations, signature_similarity, all_methods);
+        // F3: per-location receiver/impl-type, when `impl_methods` recorded
+        // one for that (file, name). Used only to REFUSE a false EXACT
+        // (never to force one) when the fingerprint folds two different
+        // receivers' shapes onto the same string.
+        let impl_qualifiers: Vec<Option<&str>> = locations
+            .iter()
+            .map(|loc| {
+                analyses
+                    .iter()
+                    .find(|a| a.path == loc.file_path)
+                    .and_then(|a| a.impl_methods.iter().find(|m| m.name == name))
+                    .map(|m| m.qualifier.as_str())
+            })
+            .collect();
+
+        let class = classify_twin_class(
+            &name,
+            &locations,
+            signature_similarity,
+            all_methods,
+            &impl_qualifiers,
+        );
 
         // Legacy classification stays in the contract; derive it consistently
         // with the shape-evidence class: only shape-backed twins are
@@ -1925,23 +2079,96 @@ mod tests {
         // Identical fingerprints everywhere -> EXACT
         let locs = vec![loc(Some("Cfg|Out")), loc(Some("Cfg|Out"))];
         assert_eq!(
-            classify_twin_class("render_widget", &locs, Some(1.0), false),
+            classify_twin_class("render_widget", &locs, Some(1.0), false, &[]),
             TwinClass::Exact
         );
 
         // Overlapping but different -> SHAPE_SIMILAR
         let locs = vec![loc(Some("Cfg|Out")), loc(Some("Cfg,Extra|Out"))];
         assert_eq!(
-            classify_twin_class("render_widget", &locs, Some(0.66), false),
+            classify_twin_class("render_widget", &locs, Some(0.66), false, &[]),
             TwinClass::ShapeSimilar
         );
 
         // Missing fingerprint at one location -> NAME_COLLISION, never EXACT
         let locs = vec![loc(Some("Cfg|Out")), loc(None)];
         assert_eq!(
-            classify_twin_class("render_widget", &locs, Some(1.0), false),
+            classify_twin_class("render_widget", &locs, Some(1.0), false, &[]),
             TwinClass::NameCollision
         );
+    }
+
+    /// F3 RED: two methods, same name, same folded param/return-type
+    /// fingerprint, but on DIFFERENT receiver structs (a delegation chain
+    /// like `Screen::resize_pane_with_id` calling
+    /// `Tab::resize_pane_with_id`). The fingerprint alone cannot see this —
+    /// it never compares receivers or bodies — so this must never earn
+    /// EXACT/"consolidate".
+    #[test]
+    fn test_classify_twin_class_refuses_exact_when_receivers_differ() {
+        let loc = |fp: Option<&str>| TwinLocation {
+            file_path: "x.rs".to_string(),
+            line: 1,
+            kind: "function".to_string(),
+            import_count: 0,
+            is_canonical: false,
+            signature_fingerprint: fp.map(|s| s.to_string()),
+        };
+        let locs = vec![
+            loc(Some("PaneId|Result<()>")),
+            loc(Some("PaneId|Result<()>")),
+        ];
+
+        // No receiver info known -> unchanged behavior, still EXACT.
+        assert_eq!(
+            classify_twin_class("resize_pane_with_id", &locs, Some(1.0), false, &[]),
+            TwinClass::Exact
+        );
+
+        // Same identical fingerprints, but the two locations are methods on
+        // different receiver structs. Must never classify as EXACT.
+        let qualifiers = [Some("Screen"), Some("Tab")];
+        let class =
+            classify_twin_class("resize_pane_with_id", &locs, Some(1.0), false, &qualifiers);
+        assert_ne!(
+            class,
+            TwinClass::Exact,
+            "different receivers must never classify as EXACT"
+        );
+        assert_eq!(class, TwinClass::NameCollision);
+        assert!(
+            !twin_action(&ExactTwin {
+                name: "resize_pane_with_id".to_string(),
+                locations: locs,
+                signature_similarity: Some(1.0),
+                classification: TwinClassification::Namesake,
+                class,
+                shape_match: true,
+                single_module_target: false,
+                exclude_from_score: false,
+            })
+            .starts_with("consolidate")
+        );
+    }
+
+    /// F3: Swift/Zig files must be recognized by `detect_language`, not fall
+    /// back to `Other` — real language identity for `same_language`/
+    /// `cross_language` bucketing and for the JSON report's per-location
+    /// `language` field (both derived from this function).
+    ///
+    /// Note (known limit, documented rather than faked): `TwinLocation` has
+    /// no `language` field of its own — `audit_report.rs` and `for_ai.rs`
+    /// construct it directly (outside this module's edit scope for this
+    /// fix), so threading `FileAnalysis::language` onto the struct would
+    /// require touching those call sites too. This test locks in the
+    /// narrower, still-real fix: the extension table itself stops
+    /// collapsing Swift/Zig into "other".
+    #[test]
+    fn detect_language_recognizes_swift_and_zig() {
+        assert_eq!(detect_language("Sources/App/Widget.swift"), Language::Swift);
+        assert_eq!(detect_language("src/main.zig"), Language::Zig);
+        assert_ne!(detect_language("Sources/App/Widget.swift"), Language::Other);
+        assert_ne!(detect_language("src/main.zig"), Language::Other);
     }
 
     #[test]
@@ -2149,5 +2376,104 @@ let package = Package(
         assert_eq!(count_swiftpm_product_targets(src), 1);
         let commented = "// .target(name: \"Ghost\")\n.executableTarget(name: \"App\")\n";
         assert_eq!(count_swiftpm_product_targets(commented), 1);
+    }
+
+    fn page_twin(name: &str, class: TwinClass, locations: usize) -> ExactTwin {
+        ExactTwin {
+            name: name.to_string(),
+            locations: (0..locations)
+                .map(|i| TwinLocation {
+                    file_path: format!("{name}-{i}.rs"),
+                    line: 1,
+                    kind: "function".to_string(),
+                    import_count: 0,
+                    is_canonical: i == 0,
+                    signature_fingerprint: None,
+                })
+                .collect(),
+            signature_similarity: None,
+            classification: TwinClassification::Namesake,
+            class,
+            shape_match: false,
+            single_module_target: false,
+            exclude_from_score: false,
+        }
+    }
+
+    #[test]
+    fn parse_twin_class_filter_accepts_tokens_and_family_aliases() {
+        assert_eq!(
+            parse_twin_class_filter("structural").unwrap(),
+            vec![TwinClass::Exact, TwinClass::ShapeSimilar]
+        );
+        assert_eq!(
+            parse_twin_class_filter("naming").unwrap(),
+            vec![TwinClass::NameCollision, TwinClass::Idiom]
+        );
+        assert_eq!(
+            parse_twin_class_filter("exact, SHAPE_SIMILAR, idiom").unwrap(),
+            vec![TwinClass::Exact, TwinClass::ShapeSimilar, TwinClass::Idiom]
+        );
+        let err = parse_twin_class_filter("NOPE").unwrap_err();
+        assert!(err.contains("unknown twin class"), "{err}");
+    }
+
+    #[test]
+    fn order_twins_for_page_puts_structural_classes_before_naming() {
+        let mut twins = vec![
+            page_twin("body", TwinClass::NameCollision, 20),
+            page_twin("keep_me_visible", TwinClass::Exact, 2),
+            page_twin("from_env", TwinClass::Idiom, 8),
+            page_twin("shape", TwinClass::ShapeSimilar, 3),
+            page_twin("exact_small", TwinClass::Exact, 2),
+        ];
+        order_twins_for_page(&mut twins);
+        let names: Vec<_> = twins.iter().map(|twin| twin.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "keep_me_visible",
+                "exact_small",
+                "shape",
+                "body",
+                "from_env",
+            ]
+        );
+    }
+
+    #[test]
+    fn class_filter_runs_before_the_page_window() {
+        let mut twins = vec![
+            page_twin("body", TwinClass::NameCollision, 20),
+            page_twin("keep_me_visible", TwinClass::Exact, 2),
+            page_twin("shape", TwinClass::ShapeSimilar, 4),
+        ];
+        order_twins_for_page(&mut twins);
+        let classes = parse_twin_class_filter("structural").unwrap();
+        retain_twin_classes(&mut twins, &classes);
+        assert!(
+            twins
+                .iter()
+                .all(|twin| { matches!(twin.class, TwinClass::Exact | TwinClass::ShapeSimilar) })
+        );
+        let windows = page_family_windows(&[twins.len(), 0], 0, Some(1));
+        let page: Vec<_> = twins
+            .into_iter()
+            .skip(windows[0].0)
+            .take(windows[0].1)
+            .collect();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].name, "keep_me_visible");
+        assert!(page_has_more(2, 0, page.len()));
+        // Offset skips the first structural group; the route family then
+        // shares whatever limit remains.
+        assert_eq!(
+            page_family_windows(&[2, 4], 1, Some(3)),
+            vec![(1, 1), (0, 2)]
+        );
+        assert_eq!(
+            page_family_windows(&[5, 4], 0, Some(3)),
+            vec![(0, 3), (0, 0)]
+        );
     }
 }

@@ -12,7 +12,7 @@
 
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { HealthResponse, LoctreeGateway, RiskItem, isSnapshotNotLoaded, lspStateLabel } from './gateway';
+import { HealthResponse, LoctreeGateway, RiskItem, formatHealthScore, isSnapshotNotLoaded, lspStateLabel } from './gateway';
 
 type GroupKind = 'dead' | 'cycles' | 'twins' | 'hotspots';
 
@@ -135,13 +135,12 @@ export class LoctreeFindingsTreeProvider implements vscode.TreeDataProvider<Tree
     public getTreeItem(element: TreeNode): vscode.TreeItem {
         if (element.type === 'health') {
             const health = this.health;
-            const score = health ? health.health_score : undefined;
-            const label = score !== undefined ? `Findings Signal: ${score}/100` : 'Findings Signal: —';
+            const label = `Findings Signal: ${formatHealthScore(health?.health_score ?? null)}`;
             const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
             const status = health?.status ?? 'unknown';
             item.description = health?.snapshot_stale ? `${status} · snapshot stale` : status;
             const colorId =
-                status === 'green' ? 'loctree.teal' : status === 'yellow' ? 'loctree.amber' : 'loctree.danger';
+                status === 'green' ? 'loctree.teal' : status === 'yellow' ? 'loctree.amber' : status === 'red' ? 'loctree.danger' : 'disabledForeground';
             item.iconPath = new vscode.ThemeIcon('pulse', new vscode.ThemeColor(colorId));
             item.contextValue = 'loctreeHealth';
             item.tooltip =

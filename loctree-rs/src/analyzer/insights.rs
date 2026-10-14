@@ -26,11 +26,28 @@ fn find_cross_lang_stem_matches(files: &[FileAnalysis]) -> Vec<(String, Vec<(Str
 
         let path = Path::new(&file.path);
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            // Skip common generic names that would create noise
+            // Skip common generic names that would create noise. H11(b):
+            // "version"/"config"/"cli"/"app"/"settings" are extremely
+            // common, boilerplate module names in EVERY stack — a
+            // `version.py` and a `version.rs` sharing a stem is essentially
+            // never a real cross-language binding pair, just two unrelated
+            // files that both happen to have a version module.
             let lower_stem = stem.to_lowercase();
             if matches!(
                 lower_stem.as_str(),
-                "index" | "mod" | "lib" | "main" | "utils" | "helpers" | "types" | "constants"
+                "index"
+                    | "mod"
+                    | "lib"
+                    | "main"
+                    | "utils"
+                    | "helpers"
+                    | "types"
+                    | "constants"
+                    | "version"
+                    | "config"
+                    | "cli"
+                    | "app"
+                    | "settings"
             ) {
                 continue;
             }
@@ -54,6 +71,32 @@ fn find_cross_lang_stem_matches(files: &[FileAnalysis]) -> Vec<(String, Vec<(Str
     // Sort for deterministic output
     matches.sort_by(|a, b| a.0.cmp(&b.0));
     matches
+}
+
+/// H11(a): does this snapshot look like a JS/TS project with an actual
+/// bundler in play? Requires BOTH JS/TS file presence AND a recognizable
+/// bundler/toolchain config file — either signal alone is too weak (a repo
+/// can have a stray `.ts` fixture with no bundler, or a `package.json` that
+/// only drives non-bundled tooling).
+fn has_js_bundler_stack(files: &[FileAnalysis]) -> bool {
+    let has_js_or_ts = files
+        .iter()
+        .any(|f| matches!(f.language.as_str(), "js" | "ts" | "jsx" | "tsx"));
+    if !has_js_or_ts {
+        return false;
+    }
+    files.iter().any(|f| {
+        let name = Path::new(&f.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        name == "package.json"
+            || name == "tsconfig.json"
+            || name.starts_with("vite.config.")
+            || name.starts_with("webpack.config.")
+            || name.starts_with("rollup.config.")
+            || name.starts_with("esbuild.config.")
+    })
 }
 
 pub fn collect_ai_insights(
@@ -112,7 +155,13 @@ pub fn collect_ai_insights(
         });
     }
 
-    if cascades.len() > 20 {
+    // H11(a): "tree-shaking/bundling" is a JS/TS-toolchain concept. Without
+    // a gate, a pure-Rust (or Python) repo with 20+ re-export cascades — a
+    // perfectly ordinary Rust `pub use` pattern — fired a "this might
+    // affect tree-shaking/bundling" insight that made no sense for that
+    // stack. Mirrors the `has_tauri_stack` gate above: require both JS/TS
+    // file presence AND a recognizable bundler/toolchain config file.
+    if cascades.len() > 20 && has_js_bundler_stack(files) {
         insights.push(AiInsight {
             title: "Many re-export chains".to_string(),
             severity: "low".to_string(),
@@ -124,7 +173,7 @@ pub fn collect_ai_insights(
     }
 
     // Gate Tauri-specific insight on actual Tauri stack presence.
-    // loctree-fail hak 2026-05-18 Screenscribe HAK 2: pure Python/JS
+    // loctree-feedback hak 2026-05-18 Screenscribe HAK 2: pure Python/JS
     // projects with custom JS event dispatch were getting false HIGH
     // severity "Missing Tauri Handlers" because the gap-detector picks
     // up any `invoke('foo')`-like call. Reuse the `has_tauri_stack`
@@ -221,6 +270,77 @@ mod tests {
         assert!(matches.is_empty(), "Should not match same language");
     }
 
+    /// H11(b) RED: `version.py` and `version.rs` are almost never a real
+    /// cross-language binding pair - just two unrelated files that both
+    /// happen to have a version module. Must not surface a stem-pair
+    /// insight.
+    #[test]
+    fn test_cross_lang_stem_matches_ignores_version_config_cli_app_settings() {
+        let files = vec![
+            mock_file("src/version.py", "py", 20),
+            mock_file("src/version.rs", "rs", 20),
+            mock_file("src/config.py", "py", 20),
+            mock_file("src/config.rs", "rs", 20),
+            mock_file("src/cli.py", "py", 20),
+            mock_file("src/cli.rs", "rs", 20),
+            mock_file("src/app.py", "py", 20),
+            mock_file("src/app.rs", "rs", 20),
+            mock_file("src/settings.py", "py", 20),
+            mock_file("src/settings.rs", "rs", 20),
+        ];
+
+        let matches = find_cross_lang_stem_matches(&files);
+        assert!(
+            matches.is_empty(),
+            "generic module names must not surface as cross-language stem pairs, got: {matches:?}"
+        );
+    }
+
+    /// H11(a) RED: a pure-Rust snapshot with 25 re-export cascades must not
+    /// get a "tree-shaking/bundling" insight - that's a JS/TS toolchain
+    /// concept with no bearing on a Rust `pub use` pattern.
+    #[test]
+    fn test_collect_ai_insights_gates_tree_shaking_on_js_bundler_stack() {
+        let files = vec![
+            mock_file("src/lib.rs", "rs", 100),
+            mock_file("src/main.rs", "rs", 50),
+        ];
+        let cascades: Vec<(String, String)> = (0..25)
+            .map(|i| (format!("mod_{i}"), format!("mod_{i}_target")))
+            .collect();
+
+        let insights = collect_ai_insights(&files, &[], &cascades, &[], &[]);
+        let titles: Vec<&str> = insights.iter().map(|i| i.title.as_str()).collect();
+        assert!(
+            !insights
+                .iter()
+                .any(|i| i.title.contains("re-export chains")),
+            "pure-Rust snapshot must not get a tree-shaking/bundling insight, got: {titles:?}"
+        );
+    }
+
+    /// Guard: with a real JS/TS + bundler stack present, the insight still
+    /// fires - the H11(a) fix must not over-fire in the other direction.
+    #[test]
+    fn test_collect_ai_insights_tree_shaking_fires_with_js_bundler_stack() {
+        let files = vec![
+            mock_file("src/index.ts", "ts", 100),
+            mock_file("package.json", "json", 10),
+        ];
+        let cascades: Vec<(String, String)> = (0..25)
+            .map(|i| (format!("mod_{i}"), format!("mod_{i}_target")))
+            .collect();
+
+        let insights = collect_ai_insights(&files, &[], &cascades, &[], &[]);
+        let titles: Vec<&str> = insights.iter().map(|i| i.title.as_str()).collect();
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.title.contains("re-export chains")),
+            "a real JS/TS + bundler stack with 25 cascades should still get the insight, got: {titles:?}"
+        );
+    }
+
     #[test]
     fn test_collect_ai_insights_huge_files() {
         let files = vec![
@@ -266,7 +386,12 @@ mod tests {
 
     #[test]
     fn test_collect_ai_insights_many_cascades() {
-        let files = vec![mock_file("src/a.ts", "ts", 100)];
+        // H11a: the tree-shaking insight requires a real JS bundler stack —
+        // a TS file alone is not enough, so the fixture carries package.json.
+        let files = vec![
+            mock_file("src/a.ts", "ts", 100),
+            mock_file("package.json", "json", 10),
+        ];
 
         let cascades: Vec<(String, String)> = (0..25)
             .map(|i| (format!("from{}.ts", i), format!("to{}.ts", i)))
@@ -318,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_collect_ai_insights_skips_missing_handlers_when_no_tauri_stack() {
-        // loctree-fail hak 2026-05-18 Screenscribe HAK 2 regression
+        // loctree-feedback hak 2026-05-18 Screenscribe HAK 2 regression
         // guard: pure Python/JS repo with custom JS event dispatch
         // produces non-empty `gap_missing`, but no `tauri.conf.json`,
         // no `src-tauri/`, no `@tauri-apps/` imports. The insight must

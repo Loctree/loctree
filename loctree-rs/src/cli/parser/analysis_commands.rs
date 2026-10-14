@@ -18,7 +18,7 @@ pub(super) fn parse_dead_command(args: &[String]) -> Result<Command, String> {
         return Err("loct dead - Detect unused exports / dead code
 
 USAGE:
-    loct dead [OPTIONS] [PATHS...]
+    loct dead [OPTIONS] [PATH]
 
 DESCRIPTION:
     Finds exported symbols that are never imported anywhere in the codebase.
@@ -28,7 +28,8 @@ OPTIONS:
     --confidence <LEVEL>   Filter by confidence: high, medium, low (default: all)
     --top <N>              Limit to top N results (default: 20)
     --full, --all          Show all results (ignore top limit)
-    --path <PATTERN>       Filter to files matching pattern
+    --path <PATTERN>       Filter to files matching pattern (a bare PATH does the same)
+    --root, --project <PATH>  Scan-root override (repeatable for multiple roots)
     --with-tests           Include test files in analysis
     --exclude-tests        Exclude test files (default)
     --with-helpers         Include helper/utility files
@@ -39,6 +40,8 @@ EXAMPLES:
     loct dead                          # All dead exports
     loct dead --confidence high        # Only high-confidence
     loct dead --path src/components/   # Dead exports in components
+    loct dead src/components/          # Same as --path (display filter, not scan root)
+    loct dead --root portal/           # Scan only portal/ as the root
     loct dead --top 50                 # Top 50 dead exports
     loct dead --workspace-closed       # Flag unused pub in lib crates"
             .to_string());
@@ -103,8 +106,36 @@ EXAMPLES:
                 opts.workspace_closed = true;
                 i += 1;
             }
+            "--root" | "--project" => {
+                // Explicit, opt-in scan-root override — matches `find`'s
+                // `--root`/`--project` convention. A bare positional used
+                // to do this silently (see the case below); keeping the
+                // override behind a named flag means an agent asking for
+                // it has to mean it.
+                let flag = arg.as_str();
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{flag} requires a path"))?;
+                opts.roots.push(PathBuf::from(value));
+                i += 2;
+            }
             _ if !arg.starts_with('-') => {
-                opts.roots.push(PathBuf::from(arg));
+                // A bare positional is the `--path` display filter, not a
+                // scan-root override (loctree-feedback: `loct dead <subpath>`
+                // used to push straight into `opts.roots`, silently
+                // narrowing the SCAN root — producing false-dead results
+                // for symbols whose only reference lived outside that
+                // subpath, and forcing a full rescan on the next
+                // wider-root call because the cached snapshot no longer
+                // matched). Multi-root invocation now needs the explicit
+                // `--root`/`--project` flag above.
+                if opts.path_filter.is_some() {
+                    return Err(format!(
+                        "Unexpected extra path '{arg}': 'dead' takes at most one bare path \
+                         (used as --path). For an explicit scan-root override use --root/--project."
+                    ));
+                }
+                opts.path_filter = Some(arg.clone());
                 i += 1;
             }
             _ => {
@@ -196,7 +227,7 @@ EXAMPLES:
 }
 
 /// Build a friendly "unknown option" error for `find`, redirecting the most
-/// common docs/runtime drift mistakes (from loctree-fail.md) to the real syntax
+/// common docs/runtime drift mistakes (from loctree-feedback.md) to the real syntax
 /// instead of the bare generic message.
 fn find_unknown_option_error(arg: &str) -> String {
     let hint = match arg {
@@ -313,7 +344,7 @@ EXAMPLES:
                 i += 2;
             }
             "--file" | "-f" | "--path" => {
-                // `--path` is a natural alias for file-scope filtering (loctree-fail:
+                // `--path` is a natural alias for file-scope filtering (loctree-feedback:
                 // agents type `find --path <dir>` after learning `--path` on dead/routes).
                 let flag = arg.as_str();
                 let value = args
@@ -356,6 +387,7 @@ EXAMPLES:
             }
             "--literal" => {
                 opts.literal = true;
+                opts.literal_explicit = true;
                 i += 1;
             }
             "--discover" => {
@@ -387,7 +419,7 @@ EXAMPLES:
                 i += 1;
             }
             "--mode" => {
-                // Compat alias for `--mode <x>` muscle memory (loctree-fail.md: agents
+                // Compat alias for `--mode <x>` muscle memory (loctree-feedback.md: agents
                 // repeatedly type `loct find --mode where-symbol` / `--mode literal` and
                 // hit `Unknown option '--mode'`). Dispatch cleanly onto the existing mode
                 // flags where the mapping is 1:1; refuse ambiguous/unknown modes with a
@@ -398,7 +430,10 @@ EXAMPLES:
                         .to_string()
                 })?;
                 match value.as_str() {
-                    "literal" => opts.literal = true,
+                    "literal" => {
+                        opts.literal = true;
+                        opts.literal_explicit = true;
+                    }
                     "regex" => opts.regex = true,
                     "where-symbol" | "where_symbol" => opts.where_symbol = true,
                     "who-imports" | "who_imports" => who_imports = true,
@@ -462,7 +497,7 @@ EXAMPLES:
             }
             "--" => {
                 // Support `loct find --literal -- "--config-dir"` and similar for dash-prefixed
-                // literals (REPEAT from loctree-fail.md 2903,2978,2990,3052). The `--` separator
+                // literals (REPEAT from loctree-feedback.md 2903,2978,2990,3052). The `--` separator
                 // ends option parsing; following tokens (even starting with -) are taken as queries.
                 // This also aids --literal queries that look like flags.
                 i += 1;
@@ -578,7 +613,7 @@ EXAMPLES:
             limit: None,
             all: false,
             // Preserve find --root/--project so who-imports does not silently
-            // re-home to cwd (loctree-fail / skeptic: wrong universe).
+            // re-home to cwd (loctree-feedback / skeptic: wrong universe).
             roots: opts.roots.clone(),
         }));
     }
@@ -707,7 +742,7 @@ EXAMPLES:
             }
             "--" => {
                 // Support `loct occurrences -- "--config-dir"` (dash-prefixed literal idents).
-                // Mirrors the find --literal -- <str> fix (loctree-fail.md 2903 et al).
+                // Mirrors the find --literal -- <str> fix (loctree-feedback.md 2903 et al).
                 i += 1;
                 if i < args.len() && opts.ident.is_empty() {
                     opts.ident = args[i].clone();
@@ -1017,8 +1052,10 @@ USAGE:
 
 OPTIONS:
     --path <DIR>       Root directory to analyze (default: current directory)
-    --limit <N>        Maximum findings across all output families
-    --dead-only        Show only dead parrots (exports with 0 imports)
+    --limit <N>        Maximum twin-family groups (exact twins, then route twins)
+    --offset <N>       Twin-family groups to skip after --class, before --limit
+    --class <LIST>     Class filter (EXACT,SHAPE_SIMILAR,NAME_COLLISION,IDIOM; aliases structural, naming)
+    --dead-only        Show only dead parrots (exports with 0 imports; capped at 10)
     --include-tests    Include test files in analysis (excluded by default)
     --help, -h         Show this help message
 
@@ -1040,6 +1077,23 @@ EXAMPLES:
                     .get(i + 1)
                     .ok_or_else(|| "--limit requires a number".to_string())?;
                 opts.limit = Some(value.parse().map_err(|_| "--limit requires a number")?);
+                i += 2;
+            }
+            "--offset" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--offset requires a number".to_string())?;
+                opts.offset = value
+                    .parse()
+                    .map_err(|_| "--offset requires a number".to_string())?;
+                i += 2;
+            }
+            "--class" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--class requires a value".to_string())?;
+                crate::analyzer::twins::parse_twin_class_filter(value)?;
+                opts.class = Some(value.clone());
                 i += 2;
             }
             "--path" => {
@@ -1089,6 +1143,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn twins_class_and_offset_parse() {
+        let result = parse_twins_command(&[
+            "--class".into(),
+            "structural".into(),
+            "--offset".into(),
+            "3".into(),
+            "--limit".into(),
+            "5".into(),
+        ])
+        .unwrap();
+        let Command::Twins(opts) = result else {
+            panic!("expected twins");
+        };
+        assert_eq!(opts.class.as_deref(), Some("structural"));
+        assert_eq!(opts.offset, 3);
+        assert_eq!(opts.limit, Some(5));
+        assert!(!opts.omit_dead_parrots);
+        let err = parse_twins_command(&["--class".into(), "NOPE".into()]).unwrap_err();
+        assert!(err.contains("unknown twin class"), "{err}");
+    }
+
+    #[test]
     fn test_parse_dead_command() {
         let args = vec!["--confidence".into(), "high".into()];
         let result = parse_dead_command(&args).unwrap();
@@ -1108,6 +1184,52 @@ mod tests {
         } else {
             panic!("Expected Dead command");
         }
+    }
+
+    /// F9 RED: `loct dead <subpath>` used to push the bare positional into
+    /// `opts.roots`, silently narrowing the SCAN root (false-dead results +
+    /// forced full rescan on the next wider-root call). It must become the
+    /// `--path` display filter instead, with `roots` staying at the default.
+    #[test]
+    fn w_e6_f9_bare_positional_is_path_filter_not_scan_root() {
+        let result = parse_dead_command(&["portal/src/console".into()]).unwrap();
+        if let Command::Dead(opts) = result {
+            assert_eq!(opts.path_filter, Some("portal/src/console".to_string()));
+            assert_eq!(
+                opts.roots,
+                vec![PathBuf::from(".")],
+                "bare positional must not narrow the scan root"
+            );
+        } else {
+            panic!("Expected Dead command");
+        }
+    }
+
+    /// F9: multi-root invocation stays available, just behind the explicit
+    /// `--root`/`--project` flag (matching `find`'s convention) instead of a
+    /// bare positional.
+    #[test]
+    fn w_e6_f9_explicit_root_flag_still_overrides_scan_root() {
+        let result = parse_dead_command(&["--root".into(), "portal/src/console".into()]).unwrap();
+        if let Command::Dead(opts) = result {
+            assert_eq!(opts.roots, vec![PathBuf::from("portal/src/console")]);
+            assert_eq!(opts.path_filter, None);
+        } else {
+            panic!("Expected Dead command");
+        }
+    }
+
+    #[test]
+    fn w_e6_f9_second_bare_positional_is_a_clear_error_not_silent_root_push() {
+        let err = parse_dead_command(&["portal/src".into(), "other/dir".into()]).unwrap_err();
+        assert!(
+            err.contains("other/dir"),
+            "error must name the rejected extra path: {err}"
+        );
+        assert!(
+            err.contains("--root"),
+            "error must point at the explicit multi-root flag: {err}"
+        );
     }
 
     #[test]
@@ -1177,7 +1299,7 @@ mod tests {
         );
     }
 
-    // --mode <x> compat alias (loctree-fail.md CLI flag drift): agents type
+    // --mode <x> compat alias (loctree-feedback.md CLI flag drift): agents type
     // `loct find --mode where-symbol` / `--mode literal` and used to hit
     // `Unknown option '--mode'`. The alias must dispatch 1:1 onto the mode flags.
     #[test]
@@ -1241,7 +1363,7 @@ mod tests {
         }
     }
 
-    // loctree-fail 2026-07-27 / 2026-08-11: help advertised --root/--compact while
+    // loctree-feedback 2026-07-27 / 2026-08-11: help advertised --root/--compact while
     // the parser rejected them. Keep help ↔ parser on one contract.
     #[test]
     fn test_parse_find_accepts_root_project_path_and_compact() {
@@ -1279,7 +1401,7 @@ mod tests {
         }
     }
 
-    // loctree-fail 2026-08-12: `--project` was healed on find but not on
+    // loctree-feedback 2026-08-12: `--project` was healed on find but not on
     // occurrences, so the same spelling worked on one command and errored on the
     // other. Occurrences is the literal oracle agents cross-check find against —
     // an agent that scoped find to a sibling project and then reached for
@@ -1464,7 +1586,7 @@ mod tests {
     }
 
     // Friendly unknown-option error redirects the common docs-drift flags
-    // (loctree-fail.md: `--format markdown`, `--group-by`, ...) instead of the
+    // (loctree-feedback.md: `--format markdown`, `--group-by`, ...) instead of the
     // bare generic message.
     #[test]
     fn test_parse_find_unknown_format_flag_redirects_to_json() {
@@ -1586,7 +1708,7 @@ mod tests {
     }
 
     // Contract: `loct twins` has no `--strict` flag. The `health` summary footer
-    // must not advertise `loct twins --strict` (loctree-fail 2026-06-14). Pin the
+    // must not advertise `loct twins --strict` (loctree-feedback 2026-06-14). Pin the
     // runtime truth so the hint is never re-added pointing at a rejected option.
     #[test]
     fn test_parse_twins_rejects_strict_flag() {

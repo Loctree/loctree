@@ -20,6 +20,14 @@ class PaginatedDecodeTest {
     private val gson = Gson()
 
     @Test
+    fun nullHealthScoreRemainsUnknownInsteadOfZero() {
+        val health = gson.fromJson("""{"health_score":null,"status":"unknown"}""", HealthResponse::class.java)
+        assertNull(health.healthScore)
+        assertEquals("unknown", health.healthScoreLabel)
+        assertEquals("0/100", HealthResponse(healthScore = 0).healthScoreLabel)
+    }
+
+    @Test
     fun decodesSingleShotEnvelope() {
         val json = """
             {"chunk":0,"total_chunks":1,"next_cursor":null,"data":{"items":[1,2,3]}}

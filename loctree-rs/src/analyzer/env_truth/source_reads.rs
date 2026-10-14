@@ -161,6 +161,24 @@ static JS_ENV_INDEX_READ: Lazy<Regex> = Lazy::new(|| {
         .expect("valid JS process.env index-read regex")
 });
 
+/// Python literal env reads: `os.environ.get("X")`, `os.environ["X"]`,
+/// `os.getenv("X")`. H5a — env-truth's source-read inventory previously
+/// scanned rust/swift/js only, so a Python-heavy repo reported 0 read
+/// sites and every declaration looked orphaned. Dynamic keys
+/// (`environ.get(var)`) stay out of the inventory by design; the semantic
+/// layer records those separately.
+static PY_ENV_READ: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?:os\s*\.\s*)?(?:environ\s*\.\s*get|getenv)\s*\(\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]"#,
+    )
+    .expect("valid Python env-read regex")
+});
+
+static PY_ENV_INDEX_READ: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"os\s*\.\s*environ\s*\[\s*['\"](?P<name>[A-Z][A-Z0-9_]*)['\"]\s*\]"#)
+        .expect("valid Python environ index-read regex")
+});
+
 pub(crate) fn collect_source_env_reads(
     project_root: &Path,
     snapshot: &Snapshot,
@@ -168,6 +186,7 @@ pub(crate) fn collect_source_env_reads(
     let mut inventory = SourceEnvInventory {
         classes: vec![
             "javascript_process_env".to_string(),
+            "python_os_environ".to_string(),
             "rust_env_accessor_wrapper".to_string(),
             "rust_key_registry_const".to_string(),
             "rust_std_env".to_string(),
@@ -181,6 +200,7 @@ pub(crate) fn collect_source_env_reads(
             "rs" | "rust" => "rust",
             "swift" => "swift",
             "js" | "jsx" | "ts" | "tsx" | "javascript" | "typescript" => "javascript",
+            "py" | "python" => "python",
             _ => continue,
         };
         let Some(path) = safe_project_path(project_root, &file.path) else {
@@ -261,6 +281,24 @@ fn collect_file_reads(class: &str, file: &str, source: &str, reads: &mut Vec<Sou
                     file,
                     line_number,
                     |_| Some("process.env[]".to_string()),
+                    reads,
+                );
+            }
+            "python" => {
+                push_captures(
+                    &PY_ENV_READ,
+                    line,
+                    file,
+                    line_number,
+                    |_| Some("os.environ.get()".to_string()),
+                    reads,
+                );
+                push_captures(
+                    &PY_ENV_INDEX_READ,
+                    line,
+                    file,
+                    line_number,
+                    |_| Some("os.environ[]".to_string()),
                     reads,
                 );
             }
@@ -395,6 +433,27 @@ fn push_captures(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn python_literal_env_reads_are_inventoried() {
+        // H5a: a Python-heavy repo previously reported 0 read sites because
+        // the inventory only scanned rust/swift/js.
+        let mut reads = Vec::new();
+        let source = "import os\nv = os.environ.get(\"SCREENSCRIBE_MODEL\")\nw = os.environ[\"API_BASE\"]\nx = os.getenv(\"CACHE_DIR\", None)\ny = os.environ.get(dynamic_key)\n";
+        collect_file_reads("python", "app/config.py", source, &mut reads);
+        let names: Vec<&str> = reads.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"SCREENSCRIBE_MODEL"),
+            "environ.get literal: {names:?}"
+        );
+        assert!(names.contains(&"API_BASE"), "environ[] literal: {names:?}");
+        assert!(names.contains(&"CACHE_DIR"), "getenv literal: {names:?}");
+        assert_eq!(
+            reads.len(),
+            3,
+            "dynamic key must stay out of the inventory: {names:?}"
+        );
+    }
 
     #[test]
     fn extracts_names_from_supported_source_classes_without_values() {

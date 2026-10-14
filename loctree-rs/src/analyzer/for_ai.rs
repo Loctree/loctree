@@ -93,7 +93,7 @@ pub struct ForAiSummary {
     /// the parsed subset and is NOT a verdict on the repo.
     ///
     /// See [`is_semantic_code_language`](super::classify::is_semantic_code_language)
-    /// and the 2026-05-22 loctree-fail hak about `markdown-editor-mac-objc`
+    /// and the 2026-05-22 loctree-feedback hak about `markdown-editor-mac-objc`
     /// returning `health_score: 100` while loctree could not parse a
     /// single `.h`/`.m` file.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -476,7 +476,14 @@ fn compute_summary(
     };
     let dead_exports: usize = dead_candidates.len();
     let duplicate_exports: usize = sections.iter().map(|s| s.ranked_dups.len()).sum();
-    let missing_handlers: usize = sections.iter().map(|s| s.missing_handlers.len()).sum();
+    // N06 (audit): only import-confirmed gaps (confidence None) may drive
+    // the CRITICAL priority; wrapper-spelling smells stay visible in the
+    // sections but never claim "runtime errors at invoke".
+    let missing_handlers: usize = sections
+        .iter()
+        .flat_map(|s| s.missing_handlers.iter())
+        .filter(|gap| gap.confidence.is_none())
+        .count();
     let unregistered_handlers: usize = sections.iter().map(|s| s.unregistered_handlers.len()).sum();
     let unused_handlers: usize = sections.iter().map(|s| s.unused_handlers.len()).sum();
     let unused_high_confidence: usize = sections
@@ -641,7 +648,7 @@ fn compute_summary(
     // subset, not the repo. Cap health at 50 and emit a loud warning so
     // agents do not propagate a false "HEALTHY" verdict.
     //
-    // See loctree-fail.md 2026-05-22 — `markdown-editor-mac-objc`
+    // See loctree-feedback.md 2026-05-22 — `markdown-editor-mac-objc`
     // returned `health_score: 100` while loctree could not parse a
     // single `.h`/`.m` file (36 ObjC files invisible). The repo had
     // command injection in PandocConverter that loctree never surfaced.
@@ -1032,7 +1039,7 @@ fn severity_label(severity: DupSeverity) -> &'static str {
 
 /// Heuristic: detect whether the analyzed project ships a Tauri backend.
 ///
-/// loctree-fail hak 2026-05-18 Screenscribe HAK 2 (`Tauri-pattern false
+/// loctree-feedback hak 2026-05-18 Screenscribe HAK 2 (`Tauri-pattern false
 /// positive na non-Tauri repo`): `loct insights` was emitting
 /// `[HIGH] Missing Tauri Handlers` on Screenscribe — a pure
 /// Python+JS app with no `tauri.conf.json`, no `src-tauri/`, and no
@@ -1641,7 +1648,7 @@ mod tests {
     /// `missing_handlers` / `unregistered_handlers` quick-win path must
     /// supply this in their `analyses` slice, otherwise the post-2026-05-25
     /// non-Tauri gate filters those wins out (see
-    /// `loctree-fail.md` hak 2026-05-18 Screenscribe HAK 2).
+    /// `loctree-feedback.md` hak 2026-05-18 Screenscribe HAK 2).
     fn tauri_stack_marker() -> FileAnalysis {
         FileAnalysis {
             path: "src-tauri/tauri.conf.json".to_string(),
@@ -2102,7 +2109,7 @@ mod tests {
         assert!(wins[0].location.contains("src/app.ts:42"));
     }
 
-    /// loctree-fail hak 2026-05-18 Screenscribe HAK 2 regression: on a
+    /// loctree-feedback hak 2026-05-18 Screenscribe HAK 2 regression: on a
     /// non-Tauri repo the `missing_handlers` and `unregistered_handlers`
     /// quick-wins must be suppressed entirely — they are almost always
     /// false positives caused by custom JS events (`addEventListener` /
@@ -2203,6 +2210,7 @@ mod tests {
                 generic_type: None,
                 payload: None,
                 plugin_name: None,
+                unconfirmed_import: false,
             },
             CommandRef {
                 name: "cmd2".to_string(),
@@ -2211,6 +2219,7 @@ mod tests {
                 generic_type: None,
                 payload: None,
                 plugin_name: None,
+                unconfirmed_import: false,
             },
         ];
 

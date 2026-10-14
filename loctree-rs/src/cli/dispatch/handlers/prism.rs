@@ -12,7 +12,7 @@ use serde::Serialize;
 use super::super::{DispatchResult, GlobalOptions};
 use crate::cli::command::PrismOptions;
 use crate::pack::{
-    AuthoritySlice, ContextOptions, ContextPack, RiskCacheScope,
+    AuthoritySlice, ContextOptions, ContextPack, RiskCacheScope, StructuralImport,
     compose_context_pack as compose_dense_context_pack,
 };
 
@@ -217,7 +217,7 @@ fn summarize_task(task: &str, pack: &ContextPack, limit: usize) -> PrismTaskSumm
         pack.action.verification_gates.len() + pack.action.likely_tests.len(),
     );
     let authority_labels = authority_labels(&pack.authority);
-    let top_files = files.iter().take(limit).cloned().collect();
+    let top_files = rank_top_files_by_fan_in(&files, &pack.structural.imports, limit);
 
     PrismTaskSummary {
         task: task.to_string(),
@@ -247,6 +247,42 @@ fn summarize_task(task: &str, pack: &ContextPack, limit: usize) -> PrismTaskSumm
         dirty_worktree: pack.risk.dirty_worktree,
         file_set: files,
     }
+}
+
+/// H7: `top_files` used to be `files.iter().take(limit)` straight off a
+/// `BTreeSet`, i.e. plain alphabetical order — a file's actual centrality
+/// (how many OTHER files import it) never factored in, so a
+/// lexicographically-early leaf could bump a heavily-depended-on hub out of
+/// the truncated list entirely. Rank by fan-in (in-degree over
+/// `pack.structural.imports`, the edge list this context pack already
+/// carries — no need to reach back into a raw `Snapshot`) before
+/// truncating; ties break alphabetically so output stays deterministic.
+///
+/// Demoting known-dead files is not implemented — `ContextPack` doesn't
+/// carry a cheap per-file "is dead" signal at this call site; flagged for
+/// the integrator.
+fn rank_top_files_by_fan_in(
+    files: &BTreeSet<String>,
+    imports: &[StructuralImport],
+    limit: usize,
+) -> Vec<String> {
+    let mut fan_in: std::collections::HashMap<&str, usize> =
+        files.iter().map(|f| (f.as_str(), 0usize)).collect();
+    for import in imports {
+        if let Some(resolved) = &import.resolved_path
+            && let Some(count) = fan_in.get_mut(resolved.as_str())
+        {
+            *count += 1;
+        }
+    }
+
+    let mut ranked: Vec<&str> = files.iter().map(String::as_str).collect();
+    ranked.sort_by(|a, b| {
+        let fan_in_a = fan_in.get(a).copied().unwrap_or(0);
+        let fan_in_b = fan_in.get(b).copied().unwrap_or(0);
+        fan_in_b.cmp(&fan_in_a).then_with(|| a.cmp(b))
+    });
+    ranked.into_iter().take(limit).map(str::to_string).collect()
 }
 
 fn surface_kinds(
@@ -658,6 +694,55 @@ mod tests {
         assert_eq!(overlap.union_files, 3);
         assert_eq!(overlap.shared_files_all_tasks, 1);
         assert_eq!(overlap.average_pairwise_jaccard, 0.333);
+    }
+
+    fn import_edge(importer: &str, resolved_target: &str) -> StructuralImport {
+        StructuralImport {
+            file: importer.to_string(),
+            source: resolved_target.to_string(),
+            source_raw: resolved_target.to_string(),
+            kind: "static".to_string(),
+            resolution: "local".to_string(),
+            resolved_path: Some(resolved_target.to_string()),
+            line: None,
+            symbols: Vec::new(),
+            is_bare: false,
+            authority: crate::pack::AuthorityLabel::RepoVerified,
+        }
+    }
+
+    /// H7 RED: `a_leaf.rs` sorts before `z_hub.rs` alphabetically, but
+    /// `z_hub.rs` has real fan-in (three importers) and `a_leaf.rs` has
+    /// none - `z_hub.rs` must rank first.
+    #[test]
+    fn top_files_ranked_by_fan_in_not_alphabetical() {
+        let files: BTreeSet<String> = ["a_leaf.rs", "z_hub.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let imports = vec![
+            import_edge("consumer1.rs", "z_hub.rs"),
+            import_edge("consumer2.rs", "z_hub.rs"),
+            import_edge("consumer3.rs", "z_hub.rs"),
+        ];
+
+        let ranked = rank_top_files_by_fan_in(&files, &imports, 2);
+        assert_eq!(
+            ranked.first().map(String::as_str),
+            Some("z_hub.rs"),
+            "the file with higher fan-in must rank first despite sorting later alphabetically, got: {ranked:?}"
+        );
+    }
+
+    /// Guard: with no fan-in signal at all (or a tie), ranking falls back to
+    /// alphabetical order — deterministic output, matching prior behavior
+    /// for the common case (e.g. the golden fixture's synthetic summaries,
+    /// which build `top_files` directly rather than through this ranker).
+    #[test]
+    fn top_files_falls_back_to_alphabetical_on_tie() {
+        let files: BTreeSet<String> = ["b.rs", "a.rs"].iter().map(|s| s.to_string()).collect();
+        let ranked = rank_top_files_by_fan_in(&files, &[], 2);
+        assert_eq!(ranked, vec!["a.rs".to_string(), "b.rs".to_string()]);
     }
 
     #[test]

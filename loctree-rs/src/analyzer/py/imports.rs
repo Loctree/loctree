@@ -34,13 +34,21 @@ pub(super) fn resolve_python_import(
         return (resolved, kind);
     }
 
-    if let Some(resolved) = resolve_python_absolute(module, py_roots, root, extensions) {
-        return (Some(resolved), ImportResolutionKind::Local);
-    }
-
+    // G10.2: check stdlib BEFORE local filesystem resolution. `import os` in
+    // a repo that also happens to have an unrelated `src/os/` directory used
+    // to resolve locally first (resolve_python_absolute ran before this
+    // check), silently misclassifying a stdlib import as a local one just
+    // because a same-named directory existed somewhere under a py_root.
+    // Stdlib top-level names win unconditionally for absolute imports; a
+    // project that genuinely wants to shadow a stdlib name locally still
+    // reaches it via an explicit relative import (`.os`), handled above.
     let head = module.split('.').next().unwrap_or(module).to_lowercase();
     if stdlib.contains(&head) {
         return (None, ImportResolutionKind::Stdlib);
+    }
+
+    if let Some(resolved) = resolve_python_absolute(module, py_roots, root, extensions) {
+        return (Some(resolved), ImportResolutionKind::Local);
     }
 
     (None, ImportResolutionKind::Unknown)
@@ -78,6 +86,32 @@ mod tests {
         );
 
         assert!(resolved.is_none());
+        assert_eq!(kind, ImportResolutionKind::Stdlib);
+    }
+
+    #[test]
+    fn g10_2_resolves_stdlib_over_colliding_local_dir() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        // An unrelated local package that happens to shadow the stdlib
+        // module name — this must NOT win over the stdlib classification.
+        std::fs::create_dir_all(root.join("os")).expect("mkdir");
+        std::fs::write(root.join("os/__init__.py"), "").expect("write __init__");
+        let path = root.join("main.py");
+
+        let (resolved, kind) = resolve_python_import(
+            "os",
+            &path,
+            root,
+            &[root.to_path_buf()],
+            Some(&py_exts()),
+            &stdlib(),
+        );
+
+        assert!(
+            resolved.is_none(),
+            "expected `import os` to resolve to stdlib, not the colliding local os/ dir, got: {resolved:?}"
+        );
         assert_eq!(kind, ImportResolutionKind::Stdlib);
     }
 

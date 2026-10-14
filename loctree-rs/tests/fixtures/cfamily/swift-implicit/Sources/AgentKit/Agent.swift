@@ -1,4 +1,4 @@
-// Implicit-edge regression fixture (loctree-fail.md 2026-07-25, blinksh/blink).
+// Implicit-edge regression fixture (loctree-feedback.md 2026-07-25, blinksh/blink).
 // Top-level type plus a NESTED `enum Error` — the Swift analyzer flattens the
 // nested declaration into file-level exports, which used to turn every file
 // using the stdlib `Error` protocol into an "importer" of this file.

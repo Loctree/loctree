@@ -7,7 +7,7 @@
  */
 
 import * as vscode from 'vscode';
-import { lspStateLabel, type HealthResponse, type LspRuntimeState } from './gateway';
+import { formatHealthScore, lspStateLabel, type HealthResponse, type LspRuntimeState } from './gateway';
 
 export enum StatusBarState {
     Initializing = 'initializing',
@@ -143,7 +143,7 @@ export function updateStatusBarFromHealth(
     const tooltip = new vscode.MarkdownString(undefined, true);
     tooltip.appendMarkdown('**Loctree Context**\n\n');
     tooltip.appendMarkdown('One-shot full repository context for AI agents.\n\n');
-    tooltip.appendMarkdown(`Findings signal: ${health.health_score}/100 (${health.status})\n\n`);
+    tooltip.appendMarkdown(`Findings signal: ${formatHealthScore(health.health_score)} (${health.status})\n\n`);
     if (runtimeState?.serverCommand) {
         tooltip.appendMarkdown(`Runtime: \`${runtimeState.serverCommand}\`\n\n`);
         if (runtimeState.serverVersion) tooltip.appendMarkdown(`Identity: ${runtimeState.serverVersion}\n\n`);

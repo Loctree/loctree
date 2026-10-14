@@ -11,6 +11,8 @@ readme = "README.md"
 keywords = ["leptos", "ssr", "html", "report", "static-site"]
 categories = ["web-programming", "template-engine", "visualization"]
 rust-version = "1.85.0"
+# Publish the renderer and its build inputs, not historical local reports.
+include = ["Cargo.toml", "README.md", "LICENSE", "src/**/*.rs", "src/**/*.js", "examples/**/*.rs", "wasm/src/**", "wasm/Cargo.toml", "wasm/build.sh"]
 
 [package.metadata.docs.rs]
 all-features = true

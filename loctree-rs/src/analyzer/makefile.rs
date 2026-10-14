@@ -43,8 +43,94 @@ pub fn is_makefile_name(filename: &str) -> bool {
 pub fn analyze_makefile(content: &str, relative: String) -> FileAnalysis {
     let mut analysis = FileAnalysis::new(relative);
     analysis.imports = parse_includes(content);
+    analysis.imports.extend(parse_recipe_script_refs(content));
     analysis.exports = parse_targets_and_vars(content);
     analysis
+}
+
+/// Script extensions a recipe line can dispatch to as an explicit path fact.
+/// Deliberately excludes `.mk`/`.make` (those are `include` territory) and
+/// compiled-language sources (a recipe mentions `main.c` to build it, not to
+/// dispatch into it).
+const RECIPE_SCRIPT_EXTS: &[&str] = &[
+    ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl",
+];
+
+/// True when a Makefile import entry's source is a recipe script-dispatch
+/// candidate (vs an `include` directive). The discriminator is textual on
+/// purpose: recipe refs keep `ImportKind::Static`, because `Dynamic` would
+/// put the script — and everything it transitively imports — behind the
+/// dead-code dynamic-reachability fence (React.lazy semantics), silencing
+/// symbol-level dead reporting across whole packages dispatched by `make`.
+pub fn is_recipe_script_source(source: &str) -> bool {
+    RECIPE_SCRIPT_EXTS
+        .iter()
+        .any(|ext| source.len() > ext.len() && source.ends_with(ext))
+}
+
+/// H8 (post-audit): extract explicit script paths from recipe lines.
+///
+/// `focus tools/` used to see the Makefile as a consumer only through the
+/// bare-name call synthesis that audit N02 removed as fabrication. The honest
+/// replacement is textual: a tab-indented recipe line that spells out
+/// `tools/probe.py` names a concrete file. Tokens carrying unexpanded
+/// variables (`$(PY)`, `${DIR}/x.sh`) are skipped — they are not path facts.
+/// Existence is NOT checked here (no filesystem access in this parser);
+/// `root_scan` verifies each candidate against the scanned universe before
+/// granting `Local` resolution and a graph edge (N10 parity).
+fn parse_recipe_script_refs(content: &str) -> Vec<ImportEntry> {
+    let mut refs: Vec<ImportEntry> = Vec::new();
+    for (idx, raw) in content.lines().enumerate() {
+        if !raw.starts_with('\t') {
+            continue;
+        }
+        for token in raw.split_whitespace() {
+            let cleaned =
+                token.trim_matches(|c| matches!(c, '"' | '\'' | '(' | ')' | ';' | '&' | ','));
+            if cleaned.contains('$') || cleaned.contains('#') {
+                continue;
+            }
+            let cleaned = cleaned.strip_prefix("./").unwrap_or(cleaned);
+            if cleaned.is_empty() || cleaned.starts_with('-') || cleaned.starts_with('/') {
+                continue;
+            }
+            if !RECIPE_SCRIPT_EXTS
+                .iter()
+                .any(|ext| cleaned.len() > ext.len() && cleaned.ends_with(ext))
+            {
+                continue;
+            }
+            if refs.iter().any(|i| i.source == cleaned) {
+                continue;
+            }
+            let mut entry = ImportEntry::new(cleaned.to_string(), ImportKind::Static);
+            entry.line = Some(idx + 1);
+            entry.resolution = ImportResolutionKind::Unknown;
+            refs.push(entry);
+        }
+    }
+    refs
+}
+
+/// Join a recipe-relative script path against the Makefile's directory,
+/// resolving `.`/`..` textually. `None` when the path climbs above the repo
+/// root — such a target is outside the scanned universe (N10 parity).
+pub fn join_recipe_path(dir: &str, spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if dir.is_empty() {
+        Vec::new()
+    } else {
+        dir.split(['/', '\\']).filter(|s| !s.is_empty()).collect()
+    };
+    for seg in spec.split(['/', '\\']) {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 fn parse_includes(content: &str) -> Vec<ImportEntry> {
@@ -256,6 +342,52 @@ include a.mk b.mk
         assert!(incs.contains(&"a.mk".to_string()));
         assert!(incs.contains(&"b.mk".to_string()));
         assert!(!incs.contains(&"skipped.mk".to_string()));
+    }
+
+    #[test]
+    fn recipe_script_paths_become_dispatch_candidates() {
+        let src = "PY := python3\n\nprobe:\n\t$(PY) tools/probe_runner.py --json out.json\n\nlint:\n\t./scripts/lint.sh --fix && echo done\n\nvars:\n\tpython3 $(TOOLS)/hidden.py\n\tbash ${DIR}/also_hidden.sh\n";
+        let analysis = analyze_makefile(src, "Makefile".to_string());
+        let recipe_refs: Vec<_> = analysis
+            .imports
+            .iter()
+            .filter(|i| is_recipe_script_source(&i.source))
+            .map(|i| i.source.clone())
+            .collect();
+        assert!(recipe_refs.contains(&"tools/probe_runner.py".to_string()));
+        assert!(recipe_refs.contains(&"scripts/lint.sh".to_string()));
+        // Unexpanded make/shell variables are not path facts.
+        assert!(!recipe_refs.iter().any(|s| s.contains("hidden")));
+        // Flags and non-script tokens never qualify.
+        assert!(!recipe_refs.iter().any(|s| s.starts_with('-')));
+        // Every candidate starts Unknown — root_scan grants Local only after
+        // the existence check against the scanned universe.
+        // Every candidate starts Unknown and STATIC: `Dynamic` would drag the
+        // dispatched script and its whole transitive import closure behind
+        // the dead-code dynamic-reachability fence.
+        assert!(
+            analysis
+                .imports
+                .iter()
+                .filter(|i| is_recipe_script_source(&i.source))
+                .all(|i| i.kind == ImportKind::Static
+                    && i.resolution == ImportResolutionKind::Unknown
+                    && i.resolved_path.is_none())
+        );
+    }
+
+    #[test]
+    fn join_recipe_path_resolves_dots_and_refuses_root_escape() {
+        assert_eq!(
+            join_recipe_path("sub", "tools/x.py"),
+            Some("sub/tools/x.py".to_string())
+        );
+        assert_eq!(
+            join_recipe_path("sub", "../tools/x.py"),
+            Some("tools/x.py".to_string())
+        );
+        assert_eq!(join_recipe_path("", "./x.sh"), Some("x.sh".to_string()));
+        assert_eq!(join_recipe_path("", "../escape.sh"), None);
     }
 
     #[test]
