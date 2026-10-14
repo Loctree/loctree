@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Operator-owned one-time npm bootstrap and repeatable verification path.
+# Signed-release npm publisher: trusted GitHub OIDC or explicit local bootstrap.
 # It stages packages only from checksum-verified immutable suite bundles, never
 # from host-built binaries. Future releases publish the same package graph from
 # publish.yml through trusted OIDC.
@@ -11,6 +11,18 @@ KEYS_DIR="${KEYS:-$HOME/.keys}"
 ASSET_DIR="${ASSET_DIR:-}"
 RELEASE_REPO="${RELEASE_REPO:-Loctree/loctree-release}"
 PUBLISH_CONFIRM="${PUBLISH_CONFIRM:-0}"
+AUTH_MODE="${AUTH_MODE:-token}"
+case "$AUTH_MODE" in
+  token|oidc) ;;
+  *) echo "AUTH_MODE must be token or oidc" >&2; exit 2 ;;
+esac
+if [[ "$PUBLISH_CONFIRM" == "1" && "$AUTH_MODE" == "oidc" ]]; then
+  [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" && -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] || {
+    echo "OIDC publication requires the GitHub Actions trusted-publisher identity" >&2
+    exit 2
+  }
+  unset NODE_AUTH_TOKEN NPM_TOKEN 2>/dev/null || true
+fi
 
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "VERSION=x.y.z is required" >&2
@@ -128,7 +140,7 @@ for platform_dir in "$stage"/platform-packages/*; do
   done
 done
 
-if [[ "$PUBLISH_CONFIRM" == "1" ]]; then
+if [[ "$PUBLISH_CONFIRM" == "1" && "$AUTH_MODE" == "token" ]]; then
   credential="$KEYS_DIR/.npm"
   [[ -s "$credential" ]] || {
     echo "operator npm credential missing at $credential" >&2
@@ -152,8 +164,10 @@ fi
 publish_package() {
   local package_dir="$1"
   if [[ "$PUBLISH_CONFIRM" == "1" ]]; then
+    provenance=false
+    [[ "$AUTH_MODE" != "oidc" ]] || provenance=true
     node distribution/npm/publish-if-missing.mjs \
-      --package-dir "$package_dir" --version "$VERSION" --provenance false
+      --package-dir "$package_dir" --version "$VERSION" --provenance "$provenance"
   else
     (cd "$package_dir" && npm pack --dry-run >/dev/null)
   fi

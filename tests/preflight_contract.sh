@@ -50,14 +50,23 @@ if ! grep -Fq 'sh tools/test.sh || exit 1;' "$ROOT_DIR/Makefile"; then
   exit 1
 fi
 
-# This public source mirror carries no release authority. Publication is owned
-# by the canonical suite; retaining either publisher here is a regression.
-for workflow in publish.yml release-bundles.yml; do
-  if [ -e "$ROOT_DIR/.github/workflows/$workflow" ]; then
-    echo "public source mirror must not carry a publisher: $workflow" >&2
+# Preserve the proven npm trusted-publisher identity, with manual-only hosted
+# execution and signed canonical assets. The suite remains the binary authority.
+workflow="$ROOT_DIR/.github/workflows/publish.yml"
+for expected in 'workflow_dispatch:' 'id-token: write' 'environment: npm-publish' 'runs-on: ubuntu-latest' 'git verify-tag' 'gpg --batch --verify' 'AUTH_MODE: oidc'; do
+  if ! grep -Fq "$expected" "$workflow"; then
+    echo "trusted npm publisher is missing: $expected" >&2
     exit 1
   fi
 done
+if grep -Eq '^  (push|pull_request|release):|self-hosted|secrets.NPM_TOKEN|cargo build' "$workflow"; then
+  echo "npm publisher must remain manual, hosted, token-free and consume released binaries" >&2
+  exit 1
+fi
+if [ -e "$ROOT_DIR/.github/workflows/release-bundles.yml" ]; then
+  echo "binary publication remains owned by the canonical suite" >&2
+  exit 1
+fi
 
 for expected in \
   'cargo fmt --all -- --check' \
