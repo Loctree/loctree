@@ -187,6 +187,7 @@ jetbrains_version() {
     "$ROOT_DIR/editors/jetbrains/gradle.properties"
 }
 
+# An empty default means the installer resolves the public stable registry.
 # Reads the LOCTREE_VERSION default baked into the published web installer.
 installer_version() {
   sed -n 's/^VERSION="${LOCTREE_VERSION:-\([^}]*\)}"$/\1/p' \
@@ -234,7 +235,7 @@ assert_versions_synced() {
   printf "  %-22s ${CYAN}%s${NC}\n" "VS Code package" "$actual_vs"
   printf "  %-22s ${CYAN}%s${NC}\n" "VS Code lock" "$actual_lock"
   printf "  %-22s ${CYAN}%s${NC}\n" "JetBrains plugin" "$actual_jb"
-  printf "  %-22s ${CYAN}%s${NC}\n" "Web installer" "$actual_installer"
+  printf "  %-22s ${CYAN}%s${NC}\n" "Web installer" "${actual_installer:-registry current}"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
   if [[ "$actual_vs" != "$expected" ]]; then
@@ -249,13 +250,17 @@ assert_versions_synced() {
     log_error "JetBrains plugin version drift: $actual_jb != $expected"
     ok=false
   fi
-  if [[ "$actual_installer" != "$expected" ]]; then
+  if [[ -z "$actual_installer" ]] \
+      && grep -Fxq 'VERSION="${LOCTREE_VERSION:-}"' "$ROOT_DIR/public_dist/install.sh" \
+      && grep -q '^resolve_version$' "$ROOT_DIR/public_dist/install.sh"; then
+    log_success "Web installer resolves the published stable registry"
+  elif [[ "$actual_installer" != "$expected" ]]; then
     log_error "Web installer version drift: $actual_installer != $expected"
     ok=false
   fi
 
   $ok || exit 1
-  log_success "Cargo, editors, and web installer are synced at v$expected"
+  log_success "Cargo and editors are synced at v$expected; installer selection is valid"
 }
 
 # Parse arguments

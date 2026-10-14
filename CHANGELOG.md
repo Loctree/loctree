@@ -6,6 +6,28 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-10-14
+
+### Fixed
+
+- Preserve AICX CLI stdout/stderr until the existing invocation deadline; delayed
+  pipe delivery now returns complete semantic data or an explicit timeout, never empty success.
+- Restore the established manual npm trusted publisher using signed released bundles.
+- Wait for public npm registry visibility before publishing dependent wrappers.
+
+## [0.15.0] - 2026-10-14
+
+### Added
+- Question-led structural [Recipes](https://loctree.com/docs/recipes) for ownership,
+  impact, runtime contracts, dependencies and evidence.
+
+### Fixed
+- Literal/regex search coverage and explicit unsupported untracked-discovery modes.
+- Python multiline annotations, consumed default-object members and Zig root containment.
+- MCP startup/shutdown handling and nullable editor health contracts.
+- Registry-selected signed installation and editor clients aligned with 0.15.0 servers.
+
+
 ## [0.14.5] - 2026-09-20
 
 ### Fixed
@@ -246,6 +268,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Test suites no longer read or write the operator's real cache.
 
 ### Security
+
+- npm publication accepts only the pinned GPG primary key and checks out the exact signed tag.
 
 - VS Code extension lockfile: `fast-uri` 3.1.4, `linkify-it` 5.0.2.
 

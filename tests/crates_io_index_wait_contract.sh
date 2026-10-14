@@ -58,7 +58,6 @@ if "$ROOT_DIR/scripts/wait-for-crates-io-version.sh" '../bad' 9.8.7 >/dev/null 2
 	exit 1
 fi
 
-# Publisher ordering belongs to the canonical suite, not this source mirror.
-[[ ! -e "$ROOT_DIR/.github/workflows/publish.yml" ]]
+# Crate publisher ordering belongs to the suite; the mirror publishes npm only.
 
 echo "crates.io index wait contract: PASS"

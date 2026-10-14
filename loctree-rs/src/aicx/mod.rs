@@ -1934,6 +1934,58 @@ done
     }
 
     #[cfg(unix)]
+    const DELAYED_READY_SCRIPT: &str = r#"#!/bin/sh
+(sleep 0.35; printf '%s' '{"oracle_status":{"backend":"content_semantic","loctree_scope_safe":true},"results":1,"items":[{"kind":"decision","summary":"semantic ready","project":"loctree-suite","agent":"codex","date":"2026-10-14","timestamp":"2026-10-14T00:00:00Z","session_id":"fixture","source_chunk":"/tmp/fixture.md"}]}') &
+exit 0
+"#;
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(aicx_env)]
+    fn cli_preserves_delayed_stdout_after_child_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("delayed-aicx.sh");
+        write_script(&script, DELAYED_READY_SCRIPT);
+        clear_aicx_env();
+        enable_aicx_for_test();
+        crate::test_env::set_var(AICX_MODE_ENV, "cli");
+        crate::test_env::set_var(AICX_BINARY_ENV, &script);
+        let client = AicxClient::new("loctree-suite");
+        let rows = client.intents(168, 10);
+        clear_aicx_env();
+        assert_eq!(
+            rows.len(),
+            1,
+            "successful delayed stdout must not disappear"
+        );
+        assert_eq!(
+            rows[0].oracle_status.as_ref().unwrap().readiness(),
+            SemanticReadiness::Ready
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(aicx_env)]
+    fn cli_delayed_stdout_respects_remaining_transport_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("delayed-aicx.sh");
+        write_script(&script, DELAYED_READY_SCRIPT);
+        clear_aicx_env();
+        enable_aicx_for_test();
+        crate::test_env::set_var(AICX_MODE_ENV, "cli");
+        crate::test_env::set_var(AICX_BINARY_ENV, &script);
+        let client = AicxClient::new_budgeted("loctree-suite", Some(Duration::from_millis(50)));
+        let rows = client.intents(168, 10);
+        clear_aicx_env();
+        assert!(rows.is_empty());
+        assert!(
+            client.transport_timed_out(),
+            "incomplete output must report timeout, never fake empty success"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial(aicx_env)]
     fn client_handles_invalid_json_gracefully() {

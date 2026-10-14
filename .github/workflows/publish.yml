@@ -1,0 +1,92 @@
+name: Publish npm from signed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed public release tag (vX.Y.Z)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-trusted-publish
+  cancel-in-progress: false
+
+jobs:
+  publish-npm:
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout publisher control
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: release-control
+      - name: Checkout signed release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          path: release-src
+      - name: Setup trusted-publishing runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+      - name: Pin npm trusted-publishing client
+        run: npm install -g npm@11.17.0
+      - name: Verify signed release and download immutable bundles
+        working-directory: release-src
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "expected a stable release tag" >&2
+            exit 2
+          fi
+          VERSION="${RELEASE_TAG#v}"
+          echo "RELEASE_VERSION=$VERSION" >> "$GITHUB_ENV"
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          curl -fsSL https://loctree.com/loctree-signing.asc -o "$GNUPGHOME/signing.asc"
+          gpg --batch --import "$GNUPGHOME/signing.asc"
+          fingerprint="$(gpg --batch --with-colons --fingerprint | awk -F: '$1=="pub" {primary=1; next} primary && $1=="fpr" {print $10; primary=0}')"
+          if [[ "$fingerprint" != 8868139E8A9A2291D067135FB979B60C7079E4D4 ]]; then
+            echo "release key bundle must contain exactly the pinned primary key" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$(git rev-parse "$RELEASE_TAG^{commit}")" ]]; then
+            echo "release checkout differs from the signed tag" >&2
+            exit 1
+          fi
+          git verify-tag "$RELEASE_TAG" || exit 1
+          RELEASE_ASSET_DIR="$(mktemp -d "$RUNNER_TEMP/loctree-release-assets.XXXXXX")"
+          echo "RELEASE_ASSET_DIR=$RELEASE_ASSET_DIR" >> "$GITHUB_ENV"
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            gh release download "$RELEASE_TAG" --repo Loctree/loctree-release --dir "$RELEASE_ASSET_DIR" \
+              --pattern "loctree-${VERSION}-${target}.tar.gz*"
+          done
+          gh release download "$RELEASE_TAG" --repo Loctree/loctree-release --dir "$RELEASE_ASSET_DIR" \
+            --pattern SHA256SUMS --pattern SHA256SUMS.sig
+          gpg --batch --verify "$RELEASE_ASSET_DIR/SHA256SUMS.sig" "$RELEASE_ASSET_DIR/SHA256SUMS" || exit 1
+          (cd "$RELEASE_ASSET_DIR" && sha256sum --ignore-missing -c SHA256SUMS) || exit 1
+          for archive in "$RELEASE_ASSET_DIR"/*.tar.gz; do
+            gpg --batch --verify "$archive.sig" "$archive" || exit 1
+          done
+          rm -rf "$GNUPGHOME"
+      - name: Publish all seven identities through trusted OIDC
+        working-directory: release-src
+        env:
+          AUTH_MODE: oidc
+          PUBLISH_CONFIRM: "1"
+        run: |
+          set -euo pipefail
+          VERSION="$RELEASE_VERSION" ASSET_DIR="$RELEASE_ASSET_DIR" \
+            bash ../release-control/distribution/npm/publish-release.sh

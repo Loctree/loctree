@@ -236,13 +236,21 @@ pub(super) fn run_aicx_outcome(
         }
     };
 
-    // Child exited → pipes should close within grace period.
-    let stdout_buf = rx_out
-        .recv_timeout(Duration::from_millis(100))
-        .unwrap_or_default();
-    let stderr_buf = rx_err
-        .recv_timeout(Duration::from_millis(100))
-        .unwrap_or_default();
+    // Reaping the child does not mean its reader threads have delivered EOF.
+    // Use the remaining invocation budget instead of silently replacing late
+    // output with an empty buffer after an arbitrary 100 ms grace period.
+    let receive = |rx: &std::sync::mpsc::Receiver<Vec<u8>>, stream: &str| {
+        rx.recv_timeout(timeout.saturating_sub(started.elapsed()))
+            .map_err(|error| {
+                debug_log(format!("{stream} capture failed (args={args:?}): {error}"));
+                match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => AicxRunFailure::Timeout,
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => AicxRunFailure::Failed,
+                }
+            })
+    };
+    let stdout_buf = receive(&rx_out, "stdout")?;
+    let stderr_buf = receive(&rx_err, "stderr")?;
 
     if !exit_status.success() {
         debug_log(format!(
