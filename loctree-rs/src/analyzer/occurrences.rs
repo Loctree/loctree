@@ -5404,9 +5404,8 @@ mod tests {
         // test NEVER chdirs into; only the snapshot's `metadata.roots` knows
         // where the file is. cwd = workspace, project = temp dir.
         let content = "pub fn analyze() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        analyze();\n    }\n}\n";
-        let dir =
-            std::env::temp_dir().join(format!("loctree_n04_a4_{}_{}", std::process::id(), line!()));
-        std::fs::create_dir_all(&dir).expect("create temp fixture dir");
+        let fixture = tempfile::tempdir().expect("create isolated fixture directory");
+        let dir = fixture.path().to_path_buf();
         std::fs::write(dir.join("lib.rs"), content).expect("write temp fixture file");
 
         let mut res = scan_files([("lib.rs", content)], "analyze");
@@ -5427,7 +5426,6 @@ mod tests {
             ScopeClassification::Test,
             "cfg-test ranges must be read via the snapshot root, not the process cwd"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5435,9 +5433,8 @@ mod tests {
         // Audit N04: cwd A, project B. The tracked denominator must be B's,
         // and with no root it must stay unknown instead of counting whatever
         // repo the process happens to sit in.
-        let dir =
-            std::env::temp_dir().join(format!("loctree_n04_h9_{}_{}", std::process::id(), line!()));
-        std::fs::create_dir_all(&dir).expect("create temp repo dir");
+        let fixture = tempfile::tempdir().expect("create isolated fixture directory");
+        let dir = fixture.path().to_path_buf();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .arg("-C")
@@ -5462,7 +5459,6 @@ mod tests {
             without_root.tracked.files, None,
             "no root means an unknown denominator, never the cwd repo's count"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5472,12 +5468,8 @@ mod tests {
         // test-scoped even though `scope_classification` (path-only) reads the
         // whole file as production.
         let content = "pub fn analyze() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        analyze();\n    }\n}\n";
-        let dir = std::env::temp_dir().join(format!(
-            "loctree_recipes_e1_a4_{}_{}",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp fixture dir");
+        let fixture = tempfile::tempdir().expect("create isolated fixture directory");
+        let dir = fixture.path().to_path_buf();
         let file_path = dir.join("lib.rs");
         std::fs::write(&file_path, content).expect("write temp fixture file");
         let path_str = file_path.to_string_lossy().to_string();
@@ -5511,8 +5503,6 @@ mod tests {
             ScopeClassification::Production,
             "the definition outside the test module stays production"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
