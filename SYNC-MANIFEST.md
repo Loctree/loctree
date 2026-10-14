@@ -4,7 +4,7 @@
 - Version: `0.15.0`
 - Target repo: `Loctree/loctree`
 - Source commit: `abbb3d48a840`
-- Generated at: `2026-10-14T18:59:22Z`
+- Generated at: `2026-10-14T19:26:12Z`
 - Push mode: `enabled`
 - Dependency mode: `local workspace snapshot`
 
@@ -15,6 +15,8 @@
 - `loctree-mcp` -> `loctree-mcp`
 - `loctree-lsp` -> `loctree-lsp`
 - `reports` -> `reports`
+- `editors` -> `editors`
+- `loctree-plugin` -> `loctree-plugin`
 - `distribution/npm` -> `distribution/npm`
 - `distribution/macos` -> `distribution/macos`
 

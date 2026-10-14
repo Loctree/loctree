@@ -8,6 +8,7 @@ import {
   type PillGateway,
 } from '../src/contextPill/viewModel';
 import type { FindResponse, HealthResponse, RankedBody } from '../src/gateway';
+import { buildAgentContextMarkdown } from '../src/contextPill/agentContext';
 
 // These fakes return the REAL LSP wire shapes (verified against a live server):
 //  - slice → { core: [{path,...}], deps: { data: [{path,...}] }, consumers, ... }
@@ -94,6 +95,23 @@ const fakeGateway: PillGateway = {
     };
   },
 };
+
+test('empty-snapshot health remains unknown through model and copied agent context', async () => {
+  for (const score of [null, 0]) {
+    const gateway: PillGateway = {
+      ...fakeGateway,
+      async health() {
+        return { ...await fakeGateway.health(true), health_score: score, status: score === null ? 'unknown' : 'red' };
+      },
+    };
+    const model = await assembleViewModel(gateway, { kind: 'file', value: 'tb_core/dispatch.py' });
+    assert.strictEqual(model.health.score, score);
+    assert.strictEqual(model.repoHealth, score);
+    const markdown = buildAgentContextMarkdown(model, '');
+    assert.ok(markdown.includes(`Repo health: ${score === null ? 'unknown' : '0/100'}`));
+    assert.ok(!markdown.includes('null/100'));
+  }
+});
 
 test('file scope maps real slice/impact/health shapes to the view model', async () => {
   const vm = await assembleViewModel(fakeGateway, { kind: 'file', value: 'tb_core/dispatch.py' });
@@ -216,7 +234,7 @@ test('out-of-workspace scope short-circuits with ZERO gateway calls', async () =
   assert.deepStrictEqual(calls, []);
   assert.strictEqual(vm.state, 'out-of-workspace');
   assert.strictEqual(vm.file, '/tmp/elsewhere/notes.md');
-  assert.strictEqual(vm.health.score, 0);
+  assert.strictEqual(vm.health.score, null);
   assert.strictEqual(vm.health.status, 'unknown');
   assert.strictEqual(vm.blastRadius.count, 0);
   assert.deepStrictEqual(vm.blastRadius.direct, []);

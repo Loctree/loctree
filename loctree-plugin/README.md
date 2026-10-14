@@ -7,7 +7,7 @@
 
 > **No edit without orientation. No delete without impact. No create without search.**
 
-`loctree` is a Claude Code plugin that wraps the [loctree](https://github.com/Loctree/loctree-suite) toolchain (`loct` CLI, `loctree-mcp` MCP server, `loctree-lsp` LSP daemon) and turns it into the agent's default perception layer. The model is rust-analyzer for AI agents: live tree-sitter intelligence for JS/TS/TSX, snapshot-based polyglot intelligence for everything else (Rust, Python, Shell, Make, Astro, Svelte, Vue, Zig, …).
+`loctree` is a Claude Code plugin that wraps the [loctree](https://github.com/Loctree/loctree) toolchain (`loct` CLI, `loctree-mcp` MCP server, `loctree-lsp` LSP daemon) and turns it into the agent's default perception layer. The model is rust-analyzer for AI agents: live tree-sitter intelligence for JS/TS/TSX, snapshot-based polyglot intelligence for everything else (Rust, Python, Shell, Make, Astro, Svelte, Vue, Zig, …).
 
 ## Why this exists
 
@@ -138,7 +138,12 @@ The file is committed-by-default-ignored (`.gitignore` has `.claude/*.local.md`)
 
 ## Authoring
 
-This plugin lives at [loctree-suite/loctree-plugin](https://github.com/Loctree/loctree-suite/tree/main/loctree-plugin). Issues and PRs welcome.
+This plugin lives at [loctree/loctree-plugin](https://github.com/Loctree/loctree/tree/main/loctree-plugin). Issues and PRs welcome.
+
+## License
+
+This plugin is MIT-licensed (see [LICENSE](LICENSE)); the Loctree runtime it
+drives (`loct`, `loctree-mcp`, `loctree-lsp`) is licensed under BUSL-1.1.
 
 ## Author
 
@@ -146,4 +151,5 @@ Vetcoders · `agents@vetcoders.io` · https://vetcoders.io
 
 ## Version
 
-0.1.0 — first plugin ship. Current Loctree runtime line is 0.14.2 with the canonical 12-tool MCP surface.
+0.1.0 — first plugin ship. It drives the current stable Loctree runtime (see
+https://loctree.com/releases/index.json) and its canonical 12-tool MCP surface.

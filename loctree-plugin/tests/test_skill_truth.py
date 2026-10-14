@@ -22,8 +22,10 @@ def test_find_skill_carries_real_regression_examples() -> None:
     assert "--where-symbol" in text
 
 
-def test_compatibility_skill_points_at_canonical_truth() -> None:
-    text = (REPO_ROOT / "plugin/skills/loctree/SKILL.md").read_text(encoding="utf-8")
-    assert "loctree-plugin/skills/loctree/SKILL.md" in text
-    assert "loct find Identifier" in text
-    assert "never deletion permission" in text
+def test_compatibility_stub_points_at_canonical_truth() -> None:
+    # 521b42a4 collapsed the legacy ./plugin loader into a deprecation stub;
+    # the stub's only remaining truth is the pointer at the canonical plugin.
+    text = (REPO_ROOT / "plugin/README.md").read_text(encoding="utf-8")
+    assert "DEPRECATED" in text
+    assert "loctree-plugin/" in text
+    assert "one canonical plugin" in text

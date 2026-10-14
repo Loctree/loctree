@@ -25,7 +25,7 @@ import { registerCommands } from './commands';
 import { LoctreeFindingsTreeProvider } from './treeview';
 import { ContextPillViewProvider } from './contextPill/panel';
 import { getChangedFiles } from './contextPill/taskSignal';
-import { LoctreeGateway, isSnapshotNotLoaded, lspStateLabel, type LspRuntimeState } from './gateway';
+import { LoctreeGateway, formatHealthScore, isSnapshotNotLoaded, lspStateLabel, type LspRuntimeState } from './gateway';
 
 let client: LanguageClient | undefined;
 let statusBarItem: vscode.StatusBarItem | undefined;
@@ -166,7 +166,7 @@ async function refreshStatusBarFromHealth(
         const health = await gateway.health(false);
         updateStatusBarFromHealth(statusBarItem, health, lspRuntimeState);
         outputChannel.appendLine(
-            `Status updated (health ${health.health_score}/100 ${health.status}): ` +
+            `Status updated (health ${formatHealthScore(health.health_score)} ${health.status}): ` +
             `${health.dead_exports} dead, ${health.cycles} cycles, ${health.twins} twins, ${health.hotspots} hotspots`
         );
     } catch (error) {

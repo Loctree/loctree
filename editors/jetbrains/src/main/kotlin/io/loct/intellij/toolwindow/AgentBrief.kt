@@ -51,7 +51,7 @@ internal object AgentBrief {
         appendLine("## Loctree · findings signal")
         appendLine()
         if (health != null) {
-            appendLine("Health **${health.healthScore}/100** · ${health.status}")
+            appendLine("Health **${health.healthScoreLabel}** · ${health.status}")
             appendLine(
                 "dead ${health.deadExports} · cycles ${health.cycles} · twins ${health.twins} · hotspots ${health.hotspots}",
             )
@@ -91,7 +91,7 @@ internal object AgentBrief {
     fun fromHealth(health: HealthResponse): String = buildString {
         appendLine("## Loctree · health")
         appendLine()
-        appendLine("**${health.healthScore}/100** · ${health.status}")
+        appendLine("**${health.healthScoreLabel}** · ${health.status}")
         if (health.snapshotStale) appendLine("snapshot: stale (age ${health.snapshotAgeSeconds}s)")
         appendLine(
             "dead ${health.deadExports} · cycles ${health.cycles} · twins ${health.twins} · hotspots ${health.hotspots}",

@@ -48,17 +48,18 @@ internal class HealthRing : JComponent() {
     }
 
     fun update(health: HealthResponse?) {
-        if (health == null) {
+        val measuredScore = health?.healthScore
+        if (health == null || measuredScore == null) {
             score = null
-            status = "—"
+            status = health?.status?.ifBlank { "unknown" } ?: "—"
             accent = LoctreeColors.BONE_MUTE
             toolTipText = LoctreeBundle.message("toolwindow.health.tooltip.empty")
         } else {
-            score = health.healthScore.coerceIn(0, 100)
+            score = measuredScore.coerceIn(0, 100)
             status = health.status.ifBlank { "unknown" }
             accent = when {
-                health.healthScore >= 80 -> LoctreeColors.TEAL
-                health.healthScore >= 50 -> LoctreeColors.AMBER
+                measuredScore >= 80 -> LoctreeColors.TEAL
+                measuredScore >= 50 -> LoctreeColors.AMBER
                 else -> LoctreeColors.DANGER
             }
             toolTipText = LoctreeBundle.message(

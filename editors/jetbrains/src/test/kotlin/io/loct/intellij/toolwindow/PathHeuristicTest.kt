@@ -46,7 +46,7 @@ class PathHeuristicTest {
 
     @Test
     fun normalizesFileUri() {
-        val uri = "file:///Users/me/repo/src/App.swift"
+        val uri = "file:///home/me/repo/src/App.swift"
         assertTrue(PathHeuristic.looksLikeFilePath(uri))
         val norm = PathHeuristic.normalizeFileRef(uri)
         assertTrue(norm.contains("App.swift"))

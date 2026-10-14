@@ -76,8 +76,8 @@ export interface Paginated<T> {
 
 /** `loctree/health` response. The status bar + tree source counts from here. */
 export interface HealthResponse {
-    health_score: number;
-    status: string; // green | yellow | red
+    health_score: number | null;
+    status: string; // green | yellow | red | unknown
     cycles: number;
     dead_exports: number;
     twins: number;
@@ -86,6 +86,10 @@ export interface HealthResponse {
     snapshot_age_seconds: number;
     top_risks: RiskItem[];
     recommended_actions: string[];
+}
+
+export function formatHealthScore(score: number | null): string {
+    return score == null ? 'unknown' : `${score}/100`;
 }
 
 export interface RiskItem {

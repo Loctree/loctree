@@ -1,43 +1,45 @@
 <!-- loctree-advise: v1 -->
-## **LOCTREE + AICX + VIBECRAFTED - MAPA PRZED LUPĄ**
+## **LOCTREE + AICX + VIBECRAFTED - MAP BEFORE MAGNIFIER**
 
-> **Loctree first when it helps. Kto nie używa, ten traci kontekst.**
+> **Loctree first when it helps. Skip the map and you lose the context.**
 
-Loctree jest domyślną mapą strukturalną dla pracy repo, bo obecna jakość
-narzędzia sprawia, że pomijanie go zwykle kosztuje czas: zależności, blast
-radius, symbole, wejścia runtime, martwe powierzchnie, duplikaty i dokładne
-wystąpienia są widoczne szybciej niż w ręcznym szperaniu. AICX daje historię
-intencji, a Vibecrafted domyka to dyscypliną dowodu.
+Loctree is the default structural map for repository work, because at its
+current quality skipping it usually costs time: dependencies, blast radius,
+symbols, runtime entry points, dead surfaces, duplicates and exact
+occurrences are all visible faster than through manual rummaging. AICX adds
+the history of intent, and Vibecrafted closes the loop with proof
+discipline.
 
-**Reguła operacyjna:**
+**Operating rule:**
 
-- Przy pytaniach strukturalnych (kto importuje X, gdzie żyje symbol Y, co
-  pęknie po edycji Z, blast radius, struktura katalogu A) zaczynaj od
-  `loctree-mcp` (`context` / `repo-view` / `focus` / `slice` / `impact` /
-  `find` / `follow`) albo od `loct` CLI, gdy MCP nie jest dostępne.
-- Przed edycją pliku preferuj `slice(file)`. Przed delete/rename/refactor
-  preferuj `impact(file)`. Przed tworzeniem nowego symbolu preferuj
+- For structural questions (who imports X, where does symbol Y live, what
+  breaks after editing Z, blast radius, the layout of directory A) start
+  with `loctree-mcp` (`context` / `repo-view` / `focus` / `slice` /
+  `impact` / `find` / `follow`), or with the `loct` CLI when MCP is not
+  available.
+- Before editing a file prefer `slice(file)`. Before a delete/rename/
+  refactor prefer `impact(file)`. Before creating a new symbol prefer
   `find(name)`.
-- Do prawdy literalnej używaj `find --literal`, `loct occurrences <ident>` i
-  `loct body <symbol>` zanim wejdziesz w szeroki search tekstowy.
-- `rg`, grep, awk, sed, cat i bezpośrednie czytanie plików są OK jako lupa do
-  lokalnego detalu po mapie albo jako fallback, gdy Loctree nie odpowiada
-  czysto na pytanie.
-- Jeśli Loctree pudłuje, jest stale, za wolne, niewygodne, nie widzi języka,
-  nie łapie ważnej powierzchni albo masz pomysł na usprawnienie, dopisz krótką
-  notatkę do centralnego feedback loga.
+- For literal truth use `find --literal`, `loct occurrences <ident>` and
+  `loct body <symbol>` before reaching for a broad text search.
+- `rg`, grep, awk, sed, cat and direct file reads are fine as a magnifier
+  for local detail once the map is in hand, or as a fallback when Loctree
+  does not answer the question cleanly.
+- If Loctree misses, is stale, too slow, awkward, blind to a language,
+  fails to capture an important surface, or you have an improvement idea,
+  append a short note to the central feedback log.
 
-**Centralny feedback log Loctree:**
+**Central Loctree feedback log:**
 
-- Dopisuj na końcu `~/.vibecrafted/loctree/loctree-fail.md`.
-- Nie twórz pliku od nowa i nie nadpisuj go.
-- Wpis może być bugiem, brakującą funkcją, sugestią UX albo opisem miejsca,
-  gdzie agent musiał zejść do fallbacku. Powtórki są sygnałem priorytetu, nie
-  problemem.
+- Append at the end of `~/internal-artifacts/loctree/loctree-feedback.md`.
+- Never create the file from scratch and never overwrite it.
+- An entry can be a bug, a missing feature, a UX suggestion, or a note on
+  the spot where an agent had to drop to a fallback. Repeats are a
+  priority signal, not a problem.
 
-**Dlaczego:** Loctree zmienia pracę agentów z text rummaging w map-first
-engineering. Celem nie jest teatr posłuszeństwa, tylko mniej błędnych edycji,
-lepszy blast radius, szybsze recovery i uczciwsze decyzje runtime.
+**Why:** Loctree turns agent work from text rummaging into map-first
+engineering. The goal is not obedience theatre — it is fewer wrong edits,
+better blast radius, faster recovery and more honest runtime decisions.
 <!-- /loctree-advise -->
 
 # Loctree — Agent Instructions for Codex

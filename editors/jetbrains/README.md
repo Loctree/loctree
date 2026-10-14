@@ -155,7 +155,7 @@ Settings ▸ **Tools ▸ Loctree** (mirrors the VS Code configuration):
 | `showStatusBar`      | `true`     | Show the status bar widget.                         |
 | `autoDownload`       | `true`     | Download `loctree-lsp` when not found locally.      |
 | `downloadBaseUrl`    | `https://github.com/Loctree/loctree-release` | Override the GitHub repo for downloads. |
-| `downloadTag`        | *(empty)*  | Release tag (e.g. `v0.14.5-rc1`). Empty pins to the plugin's own version; `latest` is an explicit opt-in. |
+| `downloadTag`        | *(empty)*  | Release tag (e.g. `v0.15.0-dev`). Empty pins to the plugin's own version; `latest` is an explicit opt-in. |
 | `diagnosticSeverity` | `WARNING`  | Severity for dead-export diagnostics.              |
 
 ## Build & test
@@ -210,4 +210,9 @@ Marketplace secrets. Read
 [docs/release/jetbrains-marketplace.md](../../docs/release/jetbrains-marketplace.md)
 — including its **Blockers** section — before the first real publish.
 
-𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents ⓒ 2025-2026 Vetcoders
+## License
+
+This plugin is MIT-licensed (see [LICENSE](LICENSE)); the Loctree language
+server it installs is licensed under BUSL-1.1.
+
+𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI

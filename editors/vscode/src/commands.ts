@@ -9,7 +9,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { LoctreeGateway, LoctreeNotRunningError, Occurrence, lspStateLabel } from './gateway';
+import { LoctreeGateway, LoctreeNotRunningError, Occurrence, formatHealthScore, lspStateLabel } from './gateway';
 
 interface LocationTarget {
     filePath: string;
@@ -552,7 +552,7 @@ export function registerCommands(
             .join('\n');
         const actions = health.recommended_actions.map((a) => `- ${a}`).join('\n');
         const md = [
-            `# Loctree Health: ${health.health_score}/100 (${health.status})`,
+            `# Loctree Health: ${formatHealthScore(health.health_score)} (${health.status})`,
             '',
             `| Metric | Count |`,
             `|---|---|`,

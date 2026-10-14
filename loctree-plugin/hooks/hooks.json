@@ -1,5 +1,5 @@
 {
-  "description": "Loctree perception layer — auto-injects structural context on session start, after Read, after Edit, after Grep/rg. PreToolUse: zero-fallback guard (blocks repo-mapping grep/rg with a loct find recipe; LOCTREE_FIRST_GUARD=0 disables) plus optional hint mode for Bash. All hooks fail open (skip silently) when loct/jq are missing or repo lacks .loctree/ snapshot.",
+  "description": "Loctree perception layer — auto-injects structural context on session start, after Read, after Edit, after Grep/rg. PreToolUse: advisory guard by default (never blocks, never mutates — attaches a loct recipe as context when a repo-wide grep/rg runs); LOCTREE_FIRST_GUARD=strict switches to zero-fallback enforcement for product machines, =0 disables. Plus optional hint mode for Bash. All hooks fail open (skip silently) when loct/jq are missing or repo lacks .loctree/ snapshot.",
   "hooks": {
     "SessionStart": [
       {
