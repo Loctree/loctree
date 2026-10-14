@@ -7,6 +7,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ## [Unreleased]
 
 ### Fixed
+
+- Preserve AICX CLI stdout/stderr until the existing invocation deadline; delayed
+  pipe delivery now returns complete semantic data or an explicit timeout, never empty success.
 - Restore the established manual npm trusted publisher using signed released bundles.
 - Wait for public npm registry visibility before publishing dependent wrappers.
 
