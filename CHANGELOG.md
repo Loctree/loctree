@@ -264,6 +264,8 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Security
 
+- npm publication accepts only the pinned GPG primary key and checks out the exact signed tag.
+
 - VS Code extension lockfile: `fast-uri` 3.1.4, `linkify-it` 5.0.2.
 
 ## [0.14.0] - 2026-07-15

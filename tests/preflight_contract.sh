@@ -53,6 +53,7 @@ fi
 # Preserve the proven npm trusted-publisher identity, with manual-only hosted
 # execution and signed canonical assets. The suite remains the binary authority.
 workflow="$ROOT_DIR/.github/workflows/publish.yml"
+bash "$ROOT_DIR/tests/npm_publisher_identity_test.sh" "$workflow"
 for expected in 'workflow_dispatch:' 'id-token: write' 'environment: npm-publish' 'runs-on: ubuntu-latest' 'git verify-tag' 'gpg --batch --verify' 'AUTH_MODE: oidc'; do
   if ! grep -Fq "$expected" "$workflow"; then
     echo "trusted npm publisher is missing: $expected" >&2
