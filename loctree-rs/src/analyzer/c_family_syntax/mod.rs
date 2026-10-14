@@ -30,7 +30,7 @@ pub fn analyze_c_family_file(content: &str, relative: String, ext: &str) -> File
         LanguageId::Swift => crate::analyzer::swift::analyze_swift_file(content, relative.clone()),
         _ => {
             let mut base = FileAnalysis::new(relative.clone());
-            base.imports = includes::parse_includes(content);
+            base.imports = includes::parse_includes_resolved(content, &relative);
             base
         }
     };

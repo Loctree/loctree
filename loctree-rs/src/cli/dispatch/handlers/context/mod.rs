@@ -151,7 +151,11 @@ pub fn run(opts: &ContextOptions, global: &GlobalOptions) -> DispatchResult {
 }
 
 fn context_human_status_enabled(opts: &ContextOptions, global: &GlobalOptions) -> bool {
-    std::io::stderr().is_terminal() && !opts.json && !global.json
+    !global.quiet
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
+        && !opts.json
+        && !global.json
 }
 
 fn should_write_context_html_artifacts(opts: &ContextOptions, human_status: bool) -> bool {

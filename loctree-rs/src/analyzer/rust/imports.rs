@@ -25,35 +25,105 @@ fn read_module_file_within_root(allowed_root: &Path, file_path: &Path) -> std::i
     crate::fs_utils::read_to_string_within(allowed_root, file_path)
 }
 
+/// Split a `use {...}` group body on top-level commas, respecting nested
+/// `{}` groups (H4-brace). A naive `.split(',')` cuts nested groups like
+/// `process::{Command, Stdio}` apart at the inner comma too.
+fn split_top_level_commas(raw: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    for (i, ch) in raw.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&raw[start..i]);
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&raw[start..]);
+    parts
+}
+
+/// Split `foo::bar::{Baz, Qux}` into (`foo::bar`, `Baz, Qux`) by matching the
+/// FIRST `{` against its balanced closing `}` — never the last `}` in the
+/// string. `std::{fs, process::{Command, Stdio}}` has two closing braces;
+/// a naive `.trim_end_matches('}')` on the tail after the first `{` eats
+/// both, corrupting the nested group into `{Command` / `Stdio` fragments
+/// (H4-brace). Returns `None` when the group is unbalanced.
+pub(super) fn split_use_prefix_and_braces(source: &str) -> Option<(&str, &str)> {
+    let open = source.find('{')?;
+    let prefix = source[..open].trim().trim_end_matches("::");
+    let mut depth: i32 = 0;
+    for (i, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let close = open + i;
+                    return Some((prefix, &source[open + ch.len_utf8()..close]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Parse brace names from Rust use statements, returning (original, exported) pairs.
 /// For `use foo::{Bar, Baz as Qux}` returns [("Bar", "Bar"), ("Baz", "Qux")]
+///
+/// Handles one level of nesting (`process::{Command, Stdio}` inside an outer
+/// group) by recursing into the nested group and taking its names directly —
+/// this is a name index, not a fully-qualified path table, so the outer
+/// prefix (`process::`) is intentionally dropped, matching the existing
+/// last-segment semantics used for a plain nested path like `models::Visit`.
+/// Any item whose extracted name would still contain `{`/`}` (unbalanced or
+/// otherwise malformed input) is dropped rather than emitted (H4-brace).
 pub(super) fn parse_rust_brace_names(raw: &str) -> Vec<(String, String)> {
-    raw.split(',')
-        .filter_map(|item| {
+    split_top_level_commas(raw)
+        .into_iter()
+        .flat_map(|item| {
             let trimmed = item.trim();
-            if trimmed.is_empty() {
-                return None;
+            if trimmed.is_empty() || trimmed == "self" {
+                return Vec::new();
             }
-            if trimmed == "self" {
-                return None;
+
+            if let Some(open) = trimmed.find('{') {
+                return match trimmed.rfind('}') {
+                    Some(close) if close > open => {
+                        parse_rust_brace_names(&trimmed[open + 1..close])
+                    }
+                    // Unbalanced nested group — never surface a name with a
+                    // stray brace in it.
+                    _ => Vec::new(),
+                };
             }
-            if let Some((original, alias)) = trimmed.split_once(" as ") {
+
+            let pair = if let Some((original, alias)) = trimmed.split_once(" as ") {
                 let original_name = original
                     .trim()
                     .rsplit("::")
                     .next()
                     .unwrap_or(original.trim());
-                Some((original_name.to_string(), alias.trim().to_string()))
+                (original_name.to_string(), alias.trim().to_string())
             } else {
                 // Extract the last segment for nested paths like `models::Visit`
                 let last_segment = trimmed.rsplit("::").next().unwrap_or(trimmed).trim();
                 if last_segment.is_empty() {
-                    None
-                } else {
-                    // No alias - original and exported are the same
-                    Some((last_segment.to_string(), last_segment.to_string()))
+                    return Vec::new();
                 }
+                // No alias - original and exported are the same
+                (last_segment.to_string(), last_segment.to_string())
+            };
+
+            if pair.0.contains(['{', '}']) || pair.1.contains(['{', '}']) {
+                return Vec::new();
             }
+            vec![pair]
         })
         .collect()
 }
@@ -381,5 +451,52 @@ mod tests {
     fn test_parse_brace_names_empty() {
         let result = parse_rust_brace_names("  ,  ,  ");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn h4_brace_nested_group_yields_flat_names_without_braces() {
+        // `use std::{fs, process::{Command, Stdio}};` — the nested group must
+        // expand to its own names, not `{Command` / `Stdio}` fragments.
+        let result = parse_rust_brace_names("fs, process::{Command, Stdio}");
+        let mut names: Vec<&str> = result.iter().map(|(o, _)| o.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["Command", "Stdio", "fs"]);
+        assert!(
+            !result
+                .iter()
+                .any(|(o, e)| o.contains(['{', '}']) || e.contains(['{', '}'])),
+            "no symbol name may contain a brace: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn h4_brace_unbalanced_nested_group_is_dropped_not_corrupted() {
+        // Defensive: even if a caller hands in an already-mangled/truncated
+        // group, no emitted name may contain a stray `{`/`}`.
+        let result = parse_rust_brace_names("fs, process::{Command, Stdio");
+        assert!(
+            !result
+                .iter()
+                .any(|(o, e)| o.contains(['{', '}']) || e.contains(['{', '}'])),
+            "no symbol name may contain a brace even for malformed input: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_split_use_prefix_and_braces_nested() {
+        let (prefix, braces) = split_use_prefix_and_braces("std::{fs, process::{Command, Stdio}}")
+            .expect("balanced nested group must split");
+        assert_eq!(prefix, "std");
+        assert_eq!(braces, "fs, process::{Command, Stdio}");
+    }
+
+    #[test]
+    fn test_split_use_prefix_and_braces_unbalanced_returns_none() {
+        assert_eq!(
+            split_use_prefix_and_braces("std::{fs, process::{Command, Stdio}"),
+            None
+        );
     }
 }

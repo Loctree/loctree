@@ -37,6 +37,19 @@ prefix). `distribution/npm/install-local.sh` is the reusable core; it takes
 `--wrapper` / `--native-bin-dir` / `--platform` / `--legacy-names` and can be
 dropped into other wrapper+platform-packages repos (e.g. AICX) as-is.
 
+On macOS, the target also relaunches an already loaded Loctree HTTP MCP
+LaunchAgent using the installed binary, preserving its bind, authentication
+and other plist settings. It does not create or activate a missing/unloaded
+service. `LOCTREE_SKIP_SERVICE=1` or an explicit `npm_config_prefix` skips this
+step. A reload failure fails the target; a binary installation alone is not
+reported as a successful service refresh.
+
+Development versions (`*-dev`, including prerelease/build suffixes) additionally
+install the Loctree-first guard hooks for detected agents using the existing
+`CLI=all HOOKS=loctree` installer. Other hook packages, including AICX continuity,
+are preserved. An explicit npm prefix skips global agent configuration as well.
+Running agents must resume/restart to load their updated hook registries.
+
 ## Everyday CLI
 
 ```bash

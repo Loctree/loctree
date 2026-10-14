@@ -278,6 +278,8 @@ SCOPES:
 OPTIONS:
     --handler <NAME>        Handler name for trace scope
     --limit <N>             Global result bound across aggregate output families
+    --class <LIST>          Twin class filter for `follow twins` (EXACT,SHAPE_SIMILAR,NAME_COLLISION,IDIOM; aliases structural, naming)
+    --offset <N>            Twin-family groups to skip after --class (`follow twins` only)
     --workspace-closed      Treat pub in library crates as crate-internal (dead)
     --help, -h              Show this help message
 
@@ -322,6 +324,23 @@ EXAMPLES:
                 opts.limit = Some(value.parse().map_err(|_| "--limit requires a number")?);
                 i += 2;
             }
+            "--class" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--class requires a value".to_string())?;
+                crate::analyzer::twins::parse_twin_class_filter(value)?;
+                opts.class = Some(value.clone());
+                i += 2;
+            }
+            "--offset" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--offset requires a number".to_string())?;
+                opts.offset = value
+                    .parse()
+                    .map_err(|_| "--offset requires a number".to_string())?;
+                i += 2;
+            }
             "--workspace-closed" => {
                 opts.workspace_closed = true;
                 i += 1;
@@ -343,6 +362,9 @@ EXAMPLES:
 
     if opts.scope == "trace" && opts.handler.is_none() {
         return Err("follow trace requires --handler <name>".to_string());
+    }
+    if (opts.class.is_some() || opts.offset > 0) && opts.scope != "twins" {
+        return Err("--class and --offset apply only to `follow twins`".to_string());
     }
 
     Ok(Command::Follow(opts))
@@ -863,6 +885,29 @@ mod tests {
         } else {
             panic!("Expected Follow command");
         }
+    }
+
+    #[test]
+    fn follow_twins_accepts_class_and_offset() {
+        let result = parse_follow_command(&[
+            "twins".into(),
+            "--class".into(),
+            "naming".into(),
+            "--offset".into(),
+            "3".into(),
+            "--limit".into(),
+            "5".into(),
+        ])
+        .unwrap();
+        let Command::Follow(opts) = result else {
+            panic!("expected follow");
+        };
+        assert_eq!(opts.class.as_deref(), Some("naming"));
+        assert_eq!(opts.offset, 3);
+        assert_eq!(opts.limit, Some(5));
+        let err =
+            parse_follow_command(&["dead".into(), "--class".into(), "EXACT".into()]).unwrap_err();
+        assert!(err.contains("follow twins"), "{err}");
     }
 
     #[test]

@@ -46,7 +46,7 @@ use crate::types::Options;
 /// linters/checkers — NOT to be confused with `crate::suppressions::SuppressionType`
 /// which models loctree's own finding-suppression file (`.loctree/suppressions.toml`).
 /// Different concepts, similar word — the name collision is documented in
-/// `~/.vibecrafted/loctree/loctree-fail.md` (2026-05-17 entry).
+/// `~/internal-artifacts/loctree/loctree-feedback.md` (2026-05-17 entry).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SilencerKind {

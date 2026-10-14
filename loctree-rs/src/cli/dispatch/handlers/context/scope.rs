@@ -237,7 +237,7 @@ fn capitalize_word(word: &str) -> String {
 }
 
 fn top_hubs_by_importer(snapshot: &Snapshot, limit: usize) -> Vec<HubEntry> {
-    // loctree-fail hak 2026-05-23 #1: test fixtures must not be
+    // loctree-feedback hak 2026-05-23 #1: test fixtures must not be
     // promoted to repo-root hub status. A fixture file with internal
     // edges (`tests/fixtures/tauri_app/src/App.tsx` ↔
     // `tests/fixtures/tauri_app/src/components/...`) was being
@@ -358,7 +358,7 @@ mod tests {
         assert!(parse_branch_hint("feat/").is_none());
     }
 
-    /// loctree-fail hak 2026-05-23 #1 regression: fixture files (under
+    /// loctree-feedback hak 2026-05-23 #1 regression: fixture files (under
     /// `tests/fixtures/`, `__snapshots__/`, etc.) must NOT enter the hub
     /// ranking that drives `loct context` scope selection. A pure-fixture
     /// edge graph must produce an empty top-hubs list.

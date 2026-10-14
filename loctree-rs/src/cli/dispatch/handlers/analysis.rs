@@ -21,7 +21,7 @@ pub fn handle_follow_command(opts: &FollowOptions, global: &GlobalOptions) -> Di
 
     // File paths are scope filters under the enclosing git (or parent) root —
     // never scan roots. Passing a file used to force a refresh with
-    // "Not a directory (os error 20)" (loctree-fail 2026-08-11).
+    // "Not a directory (os error 20)" (loctree-feedback 2026-08-11).
     let default_root = [PathBuf::from(".")];
     let requested = if opts.roots.is_empty() {
         default_root.as_slice()
@@ -48,7 +48,7 @@ pub fn handle_follow_command(opts: &FollowOptions, global: &GlobalOptions) -> Di
             },
             global,
         ),
-        "twins" => handle_twins_follow(&roots, opts.limit, global),
+        "twins" => handle_twins_follow(&roots, opts.limit, opts.class.clone(), opts.offset, global),
         "hotspots" => handle_hotspots_command(
             &HotspotsOptions {
                 root: Some(first_root),
@@ -177,6 +177,8 @@ mod follow_root_tests {
 fn handle_twins_follow(
     roots: &[std::path::PathBuf],
     limit: Option<usize>,
+    class: Option<String>,
+    offset: usize,
     global: &GlobalOptions,
 ) -> DispatchResult {
     let path = roots.first().cloned();
@@ -184,6 +186,9 @@ fn handle_twins_follow(
         &super::super::super::command::TwinsOptions {
             path,
             limit,
+            class,
+            offset,
+            omit_dead_parrots: true,
             ..Default::default()
         },
         global,
@@ -1790,7 +1795,7 @@ pub fn handle_focus_command(opts: &FocusOptions, global: &GlobalOptions) -> Disp
         Some(f) => f,
         None => {
             // Distinguish a genuine wrong path from a correct path that is simply
-            // parked outside the snapshot by .loctignore (loctree-fail.md: example-app
+            // parked outside the snapshot by .loctignore (loctree-feedback.md: example-app
             // docs/). When the latter, lead with the precise cause instead of
             // telling the user to "check the path".
             let ignore_hint = crate::fs_utils::loctignore_exclusion_hint(root, &opts.target);
@@ -1835,9 +1840,63 @@ pub fn handle_focus_command(opts: &FocusOptions, global: &GlobalOptions) -> Disp
     DispatchResult::Exit(0)
 }
 
+/// Distinct-importer degree rows for hotspot detection: `(path, in_degree,
+/// out_degree, loc)`, one row per file that exists in the snapshot.
+///
+/// F8 fixes three quiet bugs in what used to be inlined directly in
+/// `handle_hotspots_command`:
+/// - counts are now DISTINCT `(from, to)` pairs, not raw edges — two `use`
+///   lines from the same file to the same target used to count as two
+///   importers instead of one (data.rs: 122 edges vs 70 distinct importers);
+/// - both edge endpoints must resolve to a real snapshot file — an edge into
+///   a phantom node (an unresolved import target, e.g. a bare `"scripts"`
+///   specifier that never resolved to a file) no longer counts and never
+///   appears as a row;
+/// - `loc` rides along so the JSON surface can report it (additive field).
+fn compute_hotspot_rows(
+    snapshot: &crate::snapshot::Snapshot,
+) -> Vec<(String, usize, usize, usize)> {
+    use std::collections::{HashMap, HashSet};
+
+    let known_files: HashSet<&str> = snapshot.files.iter().map(|f| f.path.as_str()).collect();
+
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+    let mut out_degree: HashMap<String, usize> = HashMap::new();
+    let mut loc_by_path: HashMap<String, usize> = HashMap::new();
+
+    // Initialize all files with 0
+    for file in &snapshot.files {
+        in_degree.insert(file.path.clone(), 0);
+        out_degree.insert(file.path.clone(), 0);
+        loc_by_path.insert(file.path.clone(), file.loc);
+    }
+
+    // Count edges — deduped to distinct (from, to) importer pairs, and only
+    // between edges whose endpoints are real snapshot files.
+    let mut seen_pairs: HashSet<(&str, &str)> = HashSet::new();
+    for edge in &snapshot.edges {
+        if !known_files.contains(edge.from.as_str()) || !known_files.contains(edge.to.as_str()) {
+            continue;
+        }
+        if !seen_pairs.insert((edge.from.as_str(), edge.to.as_str())) {
+            continue;
+        }
+        *in_degree.entry(edge.to.clone()).or_insert(0) += 1;
+        *out_degree.entry(edge.from.clone()).or_insert(0) += 1;
+    }
+
+    in_degree
+        .into_iter()
+        .map(|(path, in_deg)| {
+            let out_deg = out_degree.get(&path).copied().unwrap_or(0);
+            let loc = loc_by_path.get(&path).copied().unwrap_or(0);
+            (path, in_deg, out_deg, loc)
+        })
+        .collect()
+}
+
 /// Handle the hotspots command - show import frequency heatmap
 pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -> DispatchResult {
-    use std::collections::HashMap;
     use std::path::Path;
 
     // Show spinner unless in quiet/json mode
@@ -1862,37 +1921,15 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
         }
     };
 
-    // Calculate in-degree (how many files import this file) and out-degree (how many files this imports)
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    let mut out_degree: HashMap<String, usize> = HashMap::new();
-
-    // Initialize all files with 0
-    for file in &snapshot.files {
-        in_degree.insert(file.path.clone(), 0);
-        out_degree.insert(file.path.clone(), 0);
-    }
-
-    // Count edges
-    for edge in &snapshot.edges {
-        *in_degree.entry(edge.to.clone()).or_insert(0) += 1;
-        *out_degree.entry(edge.from.clone()).or_insert(0) += 1;
-    }
-
-    // Build list of (path, in_degree, out_degree)
-    let mut hotspots: Vec<(String, usize, usize)> = in_degree
-        .iter()
-        .map(|(path, &in_deg)| {
-            let out_deg = out_degree.get(path).copied().unwrap_or(0);
-            (path.clone(), in_deg, out_deg)
-        })
-        .collect();
+    // Build list of (path, in_degree, out_degree, loc)
+    let mut hotspots = compute_hotspot_rows(&snapshot);
 
     // Filter
     let min_imports = opts.min_imports.unwrap_or(0);
     if opts.leaves_only {
-        hotspots.retain(|(_, in_deg, _)| *in_deg == 0);
+        hotspots.retain(|(_, in_deg, _, _)| *in_deg == 0);
     } else if min_imports > 0 {
-        hotspots.retain(|(_, in_deg, _)| *in_deg >= min_imports);
+        hotspots.retain(|(_, in_deg, _, _)| *in_deg >= min_imports);
     }
 
     // Sort by in-degree (descending)
@@ -1912,7 +1949,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
     if global.json {
         let json_output: Vec<serde_json::Value> = hotspots
             .iter()
-            .map(|(path, in_deg, out_deg)| {
+            .map(|(path, in_deg, out_deg, loc)| {
                 let category = match *in_deg {
                     n if n >= 10 => "CORE",
                     n if n >= 3 => "SHARED",
@@ -1923,6 +1960,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
                     "path": path,
                     "in_degree": in_deg,
                     "out_degree": out_deg,
+                    "loc": loc,
                     "category": category
                 })
             })
@@ -1939,24 +1977,24 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
         // Group by category
         let core: Vec<_> = hotspots
             .iter()
-            .filter(|(_, in_deg, _)| *in_deg >= 10)
+            .filter(|(_, in_deg, _, _)| *in_deg >= 10)
             .collect();
         let shared: Vec<_> = hotspots
             .iter()
-            .filter(|(_, in_deg, _)| *in_deg >= 3 && *in_deg < 10)
+            .filter(|(_, in_deg, _, _)| *in_deg >= 3 && *in_deg < 10)
             .collect();
         let peripheral: Vec<_> = hotspots
             .iter()
-            .filter(|(_, in_deg, _)| *in_deg >= 1 && *in_deg < 3)
+            .filter(|(_, in_deg, _, _)| *in_deg >= 1 && *in_deg < 3)
             .collect();
         let leaves: Vec<_> = hotspots
             .iter()
-            .filter(|(_, in_deg, _)| *in_deg == 0)
+            .filter(|(_, in_deg, _, _)| *in_deg == 0)
             .collect();
 
         if !core.is_empty() {
             println!("CORE (10+ importers):");
-            for (path, in_deg, out_deg) in &core {
+            for (path, in_deg, out_deg, _loc) in &core {
                 if opts.coupling {
                     println!("  [in:{:<3} out:{:<3}] {}", in_deg, out_deg, path);
                 } else {
@@ -1968,7 +2006,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
 
         if !shared.is_empty() {
             println!("SHARED (3-9 importers):");
-            for (path, in_deg, out_deg) in &shared {
+            for (path, in_deg, out_deg, _loc) in &shared {
                 if opts.coupling {
                     println!("  [in:{:<3} out:{:<3}] {}", in_deg, out_deg, path);
                 } else {
@@ -1980,7 +2018,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
 
         if !peripheral.is_empty() {
             println!("PERIPHERAL (1-2 importers):");
-            for (path, in_deg, out_deg) in &peripheral {
+            for (path, in_deg, out_deg, _loc) in &peripheral {
                 if opts.coupling {
                     println!("  [in:{:<3} out:{:<3}] {}", in_deg, out_deg, path);
                 } else {
@@ -1992,7 +2030,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
 
         if !leaves.is_empty() {
             println!("LEAF (0 importers):");
-            for (path, _, out_deg) in &leaves {
+            for (path, _, out_deg, _loc) in &leaves {
                 if opts.coupling {
                     println!("  [in:0   out:{:<3}] {}", out_deg, path);
                 } else {
@@ -2190,7 +2228,8 @@ fn print_layoutmap_human(findings: &[crate::layoutmap::LayoutFinding], opts: &La
 /// Handle the zombie command - find all zombie code
 pub fn handle_zombie_command(opts: &ZombieOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::dead_parrots::DeadFilterConfig;
-    use crate::analyzer::twins::{build_symbol_registry, detect_exact_twins};
+    use crate::analyzer::health_inputs::canonical_exact_twins;
+    use crate::analyzer::twins::build_symbol_registry;
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -2287,7 +2326,11 @@ pub fn handle_zombie_command(opts: &ZombieOptions, global: &GlobalOptions) -> Di
     orphan_files.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     // 3. Find shadow exports (same symbol exported by multiple files where some have 0 imports)
-    let twins = detect_exact_twins(&snapshot.files, opts.include_tests);
+    let twins = canonical_exact_twins(
+        &snapshot.files,
+        snapshot.semantic_facts.as_ref(),
+        opts.include_tests,
+    );
     let registry = build_symbol_registry(&snapshot.files, opts.include_tests);
 
     // Shadow exports: twins where at least one location has 0 imports but not all
@@ -2456,7 +2499,7 @@ fn is_entry_point(path: &str) -> bool {
 pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
     use crate::analyzer::dead_parrots::DeadFilterConfig;
-    use crate::analyzer::twins::detect_exact_twins;
+    use crate::analyzer::health_inputs::canonical_exact_twins;
     use crate::colors::Painter;
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
@@ -2552,7 +2595,11 @@ pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> Di
         .collect();
 
     // 3. Twins analysis
-    let twins = detect_exact_twins(&snapshot.files, opts.include_tests);
+    let twins = canonical_exact_twins(
+        &snapshot.files,
+        snapshot.semantic_facts.as_ref(),
+        opts.include_tests,
+    );
     let twin_count = twins.len();
     let mut twin_examples: Vec<(String, usize)> = twins
         .iter()
@@ -2579,7 +2626,7 @@ pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> Di
 
     // Output results
     if global.json {
-        // loctree-fail hak 2026-05-18 Screenscribe #1: `loct health` must
+        // loctree-feedback hak 2026-05-18 Screenscribe #1: `loct health` must
         // not return silent `OK` while `loct findings`, `loct insights`,
         // and broad `loct twins` (barrel chaos + missing index.ts +
         // inconsistent paths) report real issues in the same snapshot.
@@ -2660,7 +2707,7 @@ pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> Di
         }
 
         println!();
-        // loctree-fail hak 2026-05-18 Screenscribe #1: `health` must
+        // loctree-feedback hak 2026-05-18 Screenscribe #1: `health` must
         // tell the operator what it did NOT check, so a green narrow-OK
         // never reads as a green broad-OK. Footer enumerates the broader
         // surfaces explicitly.
@@ -2904,7 +2951,7 @@ pub fn handle_audit_command(opts: &AuditOptions, global: &GlobalOptions) -> Disp
 pub fn handle_doctor_command(opts: &DoctorOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
     use crate::analyzer::dead_parrots::DeadFilterConfig;
-    use crate::analyzer::twins::detect_exact_twins;
+    use crate::analyzer::health_inputs::canonical_exact_twins;
     use crate::colors::Painter;
     use std::path::Path;
 
@@ -2981,7 +3028,11 @@ pub fn handle_doctor_command(opts: &DoctorOptions, global: &GlobalOptions) -> Di
         .collect();
 
     // 3. Twins analysis
-    let twins = detect_exact_twins(&snapshot.files, opts.include_tests);
+    let twins = canonical_exact_twins(
+        &snapshot.files,
+        snapshot.semantic_facts.as_ref(),
+        opts.include_tests,
+    );
 
     // 4. Categorize findings
     let mut auto_fixable = high_confidence_dead.len();
@@ -3420,8 +3471,85 @@ pub fn handle_plan_command(opts: &PlanOptions, global: &GlobalOptions) -> Dispat
 #[cfg(test)]
 mod tests {
     use super::build_audit_json;
+    use super::compute_hotspot_rows;
     use crate::analyzer::audit_report::AuditFindings;
     use crate::analyzer::dead_parrots::DeadExport;
+    use crate::snapshot::{GraphEdge, Snapshot};
+    use crate::types::FileAnalysis;
+
+    /// F8 — two `use` lines from the same file to the same target must
+    /// count as one importer, not two. `data.rs` had 122 raw edges vs 70
+    /// distinct importers before this dedup.
+    #[test]
+    fn compute_hotspot_rows_dedups_repeated_importer_edges() {
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.files.push(FileAnalysis::new("a.rs".to_string()));
+        snapshot.files.push(FileAnalysis::new("b.rs".to_string()));
+        // A imports B via two separate `use` lines.
+        snapshot.edges.push(GraphEdge {
+            from: "a.rs".to_string(),
+            to: "b.rs".to_string(),
+            label: "import".to_string(),
+        });
+        snapshot.edges.push(GraphEdge {
+            from: "a.rs".to_string(),
+            to: "b.rs".to_string(),
+            label: "import".to_string(),
+        });
+
+        let rows = compute_hotspot_rows(&snapshot);
+        let (_, b_in_degree, _, _) = rows
+            .iter()
+            .find(|(path, ..)| path.as_str() == "b.rs")
+            .expect("b.rs must appear as a row");
+        assert_eq!(*b_in_degree, 1);
+    }
+
+    /// F8 — an edge endpoint that never resolved to a real snapshot file (a
+    /// phantom node, e.g. a bare `"scripts"` specifier) must never appear as
+    /// a hotspot row and must never inflate a real file's degree.
+    #[test]
+    fn compute_hotspot_rows_ignores_phantom_endpoints() {
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.files.push(FileAnalysis::new("a.rs".to_string()));
+        // "scripts" is not in snapshot.files — an unresolved import target.
+        snapshot.edges.push(GraphEdge {
+            from: "a.rs".to_string(),
+            to: "scripts".to_string(),
+            label: "import".to_string(),
+        });
+
+        let rows = compute_hotspot_rows(&snapshot);
+        assert!(
+            !rows.iter().any(|(path, ..)| path.as_str() == "scripts"),
+            "a phantom node must never appear as a hotspot row"
+        );
+        let (_, a_in_degree, a_out_degree, _) = rows
+            .iter()
+            .find(|(path, ..)| path.as_str() == "a.rs")
+            .expect("a.rs must appear as a row");
+        assert_eq!(*a_in_degree, 0);
+        assert_eq!(
+            *a_out_degree, 0,
+            "an edge into a phantom node must not count toward out-degree either"
+        );
+    }
+
+    /// F8 — `loc` rides along as an additive field on every row.
+    #[test]
+    fn compute_hotspot_rows_carries_loc() {
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        let mut a = FileAnalysis::new("a.rs".to_string());
+        a.loc = 42;
+        snapshot.files.push(a);
+
+        let rows = compute_hotspot_rows(&snapshot);
+        let (_, _, _, loc) = rows
+            .iter()
+            .find(|(path, ..)| path.as_str() == "a.rs")
+            .expect("a.rs must appear as a row");
+        assert_eq!(*loc, 42);
+    }
 
     fn dead_export(symbol: &str, line: usize) -> DeadExport {
         DeadExport {

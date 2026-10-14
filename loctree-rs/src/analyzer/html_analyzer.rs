@@ -51,7 +51,16 @@ pub fn extract_script_blocks(html: &str) -> Vec<ScriptBlock> {
 
                     // Find the closing </script> tag
                     let after_tag = &html[idx + tag_end_idx..];
-                    if let Some(close_idx) = after_tag.find("</script>") {
+                    // Bytes to skip past the ENTIRE script element (opening tag +
+                    // body + closing tag), so the outer char iterator below never
+                    // re-walks characters already accounted for here. Previously
+                    // only the opening tag was skipped (see old `skip` below),
+                    // so the main loop's `if ch == '\n' { current_line += 1; }`
+                    // re-counted every newline inside the script body a second
+                    // time, on top of the explicit count that used to live here
+                    // — a drift that compounds across every script block in the
+                    // file (observed +1351 lines on real repos).
+                    let consumed_len = if let Some(close_idx) = after_tag.find("</script>") {
                         let content = &after_tag[..close_idx];
 
                         // Only extract inline scripts (no src attribute)
@@ -63,12 +72,27 @@ pub fn extract_script_blocks(html: &str) -> Vec<ScriptBlock> {
                             });
                         }
 
-                        // Count newlines in the script content
-                        current_line += content.chars().filter(|&c| c == '\n').count();
-                    }
+                        tag_end_idx + close_idx + "</script>".len()
+                    } else {
+                        // No closing tag found (malformed HTML) - only the
+                        // opening tag was consumed, matching prior behavior.
+                        tag_end_idx
+                    };
 
-                    // Skip past the opening tag
-                    let skip = tag_end_idx.saturating_sub(1);
+                    // Skip past the entire consumed span (opening tag + body +
+                    // closing tag when present). This loop is now the SINGLE
+                    // place that advances `current_line` for characters inside
+                    // the script element - nothing else double-counts them.
+                    //
+                    // `consumed_len` is a BYTE length, but `chars` below yields
+                    // one Unicode scalar per iteration - skipping byte-many
+                    // chars overshoots on any non-ASCII script body and can
+                    // swallow the markup (even the next <script>) that follows
+                    // the element. Convert the span to a character count first,
+                    // excluding the `<` the outer loop already consumed.
+                    let skip = html[idx + '<'.len_utf8()..idx + consumed_len]
+                        .chars()
+                        .count();
                     for _ in 0..skip {
                         if let Some((_, ch)) = chars.next()
                             && ch == '\n'
@@ -344,5 +368,70 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         // Script starts on line 4 (after <!DOCTYPE>, <html>, <head>, <script>)
         assert_eq!(blocks[0].line_offset, 4);
+    }
+
+    /// H3(c) RED: a second script block's line_offset must not be inflated
+    /// by newlines inside an earlier block's content getting counted twice
+    /// (once explicitly, once again when the outer char loop re-walked
+    /// content it had not actually skipped past).
+    #[test]
+    fn test_multiple_script_blocks_no_double_counted_lines() {
+        let html = "<!DOCTYPE html>\n\
+<html>\n\
+<head>\n\
+<script>\n\
+line1\n\
+line2\n\
+line3\n\
+</script>\n\
+</head>\n\
+<body>\n\
+<script>\n\
+console.log('second');\n\
+</script>\n\
+</body>\n\
+</html>";
+
+        let blocks = extract_script_blocks(html);
+        assert_eq!(blocks.len(), 2);
+        // First <script> opens on line 4.
+        assert_eq!(blocks[0].line_offset, 4);
+        // Second <script> opens on line 11 by plain manual line counting.
+        // The pre-fix code drifted this forward by the newline count of the
+        // first block's content (here +4, landing on 15).
+        assert_eq!(
+            blocks[1].line_offset, 11,
+            "second script block's line_offset must not be inflated by \
+             double-counted newlines from an earlier block's content"
+        );
+    }
+
+    /// A non-ASCII script body must not make the skip loop overshoot: the
+    /// consumed span is measured in bytes, the outer loop walks chars, and
+    /// skipping byte-many chars used to eat the markup after the element -
+    /// including a following <script>, which then silently disappeared.
+    #[test]
+    fn test_non_ascii_script_body_does_not_swallow_next_script() {
+        let html = "<html>\n\
+<head>\n\
+<script>\n\
+const powitanie = 'zażółć gęślą jaźń — 🚀🚀🚀';\n\
+</script>\n\
+<script>\n\
+console.log('survivor');\n\
+</script>\n\
+</head>\n\
+</html>";
+
+        let blocks = extract_script_blocks(html);
+        assert_eq!(
+            blocks.len(),
+            2,
+            "the script after a non-ASCII body must still be extracted"
+        );
+        assert!(blocks[0].content.contains("zażółć"));
+        assert!(blocks[1].content.contains("survivor"));
+        assert_eq!(blocks[0].line_offset, 3);
+        assert_eq!(blocks[1].line_offset, 6);
     }
 }

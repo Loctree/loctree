@@ -193,7 +193,7 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     } else {
         match input.scope.branch_hint.as_deref() {
             Some(hint) if !hint.is_empty() => format!(
-                "**What this is.** `{}` repository — current focus: _{}_.",
+                "**What this is.** `{}` repository — branch-name hint: _{}_ (SemanticGuess; not a task mandate).",
                 input.project_name, hint
             ),
             _ => format!(
@@ -251,10 +251,10 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     if let Some(overlay) = &input.pack.memory.overlay {
         match overlay.stale_marker() {
             Some(marker) => lines.push(format!(
-                "**Intent layer.** {marker} — karta `03-intent-map.md`. (StaleOrUnknown)"
+                "**Intent layer.** {marker} — card `03-intent-map.md`. (StaleOrUnknown)"
             )),
             None => lines.push(format!(
-                "**Intent layer.** {} decyzje/intencje formujące z aicx overlay — karta `03-intent-map.md`. (LoctreeDerived)",
+                "**Intent layer.** {} shaping decisions/intents from the aicx overlay — card `03-intent-map.md`. (LoctreeDerived)",
                 overlay.theses.len()
             )),
         }
@@ -311,6 +311,11 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
             auth = m.authority_total,
         ));
     }
+    lines.push(format!(
+        "**Coverage.** selected targets {} / indexed files {}; returned neighborhood files {}, symbols {}, imports {}; selection truncated: {}. Zero returned does not prove absence. Runtime execution and verification results: not measured.",
+        input.pack.coverage.selected, input.pack.coverage.total, input.pack.structural.files.len(),
+        input.pack.structural.symbols.len(), input.pack.structural.imports.len(), input.pack.coverage.truncated
+    ));
     lines.push(String::new());
 
     // What's stale
@@ -360,7 +365,10 @@ fn top_three_warnings(input: &PillInput<'_>, m: &Metrics) -> Vec<String> {
             "Hub `{}` has {} importers — touching it = wide blast radius (of {} ranked hubs). (LoctreeDerived)",
             top_hub.file, top_hub.importers, m.hub_count
         ));
-    } else if let Some(top_hub) = input.scope.top_hubs.first() {
+    } else if input.pack.scope.is_none()
+        && input.pack.task.is_none()
+        && let Some(top_hub) = input.scope.top_hubs.first()
+    {
         out.push(format!(
             "Hub `{}` has {} importers — touching it = wide blast radius (of {} ranked hubs). (LoctreeDerived)",
             top_hub.file, top_hub.importers, m.hub_count
@@ -413,7 +421,7 @@ fn top_three_warnings(input: &PillInput<'_>, m: &Metrics) -> Vec<String> {
         None
     };
     out.push(risk_message.unwrap_or_else(|| {
-        "_no significant risk spike detected in snapshot scope._ (LoctreeDerived)".to_string()
+        "Risk is not fully measured: cycles, dead exports, and twins require separate probes. (StaleOrUnknown)".to_string()
     }));
 
     if let Some(intent) = top_summarized_aicx_intent(&input.pack.memory) {
@@ -545,8 +553,13 @@ fn render_where_you_are(input: &PillInput<'_>) -> Section {
     buf.push_str("## Where You Are\n\n");
 
     // Hubs
-    buf.push_str("### Hubs — touch = blast radius\n\n");
-    let hub_lines = render_hub_table(&input.pack.risk, &input.scope.top_hubs);
+    buf.push_str("### Neighborhood hubs — selected targets, dependencies and consumers\n\n");
+    let fallback_hubs = if input.pack.scope.is_some() || input.pack.task.is_some() {
+        &[][..]
+    } else {
+        &input.scope.top_hubs
+    };
+    let hub_lines = render_hub_table(&input.pack.risk, fallback_hubs);
     let hubs_capped = truncate_with_tail(hub_lines, hubs_budget());
     buf.push_str(&render_lines(&hubs_capped));
     buf.push('\n');
@@ -1053,7 +1066,18 @@ fn render_action(input: &PillInput<'_>) -> Section {
 
     if !input.pack.action.power_path.is_empty() {
         buf.push_str("### Power Path (suggested next steps)\n\n");
-        for sug in &input.pack.action.power_path {
+        // File context has four useful steps: slice, impact, body, follow.
+        // Keep the body visible without dropping the structural follow-up.
+        for sug in input.pack.action.power_path.iter().take(3).chain(
+            input
+                .pack
+                .action
+                .power_path
+                .iter()
+                .skip(3)
+                .filter(|step| step.command == "loct follow")
+                .take(1),
+        ) {
             buf.push_str(&format!("- `{}`: {}\n", sug.command, sug.reason));
         }
         buf.push('\n');
@@ -1071,9 +1095,13 @@ fn render_action(input: &PillInput<'_>) -> Section {
         buf.push_str("```\n\n");
     }
 
-    buf.push_str("### Verification gates (run before any commit)\n\n");
+    buf.push_str(
+        "### Candidate verification gates (check repository role/runtime contract first)\n\n",
+    );
     if input.pack.action.verification_gates.is_empty() {
-        buf.push_str("- `cargo check -p loctree` (SemanticGuess)\n\n");
+        buf.push_str(
+            "- _no gate inferred; read the repository verification contract._ (StaleOrUnknown)\n\n",
+        );
     } else {
         for gate in input.pack.action.verification_gates.iter().take(8) {
             buf.push_str(&format!("- `{gate}` (SemanticGuess)\n"));
@@ -1083,7 +1111,9 @@ fn render_action(input: &PillInput<'_>) -> Section {
 
     buf.push_str("### Likely tests for current scope\n\n");
     if input.pack.action.likely_tests.is_empty() {
-        buf.push_str("- _no tests directly cover the current scope._ (LoctreeDerived)\n\n");
+        buf.push_str(
+            "- _no likely test candidates returned; coverage is unknown._ (StaleOrUnknown)\n\n",
+        );
     } else {
         for test in input.pack.action.likely_tests.iter().take(10) {
             buf.push_str(&format!("- `{test}` (LoctreeDerived)\n"));
@@ -1202,12 +1232,16 @@ fn collect_metrics(
     memory_section: &Section,
 ) -> Metrics {
     Metrics {
-        hub_count: input
-            .pack
-            .risk
-            .hotspots
-            .len()
-            .max(input.scope.top_hubs.len()),
+        hub_count: if input.pack.scope.is_some() || input.pack.task.is_some() {
+            input.pack.risk.hotspots.len()
+        } else {
+            input
+                .pack
+                .risk
+                .hotspots
+                .len()
+                .max(input.scope.top_hubs.len())
+        },
         cycles_status: derive_cycles_status(),
         dead_exports: DeadExportsStatus::default(),
         twins_status: MeasurementStatus::NotMeasured(
@@ -1491,7 +1525,7 @@ mod tests {
         let input = input_with(&pack, &scope, AicxRenderStatus::Disabled);
         let md = render_pill(input);
         assert!(md.contains("1. _no high-leverage hub detected"));
-        assert!(md.contains("2. _no significant risk spike detected"));
+        assert!(md.contains("2. Risk is not fully measured"));
         // Zero-filler contract: the fixture scope carries commit hints, so
         // slot 3 must quote real git activity instead of pretending there
         // is "no significant recent activity" next to fresh commits.
@@ -1775,14 +1809,14 @@ mod tests {
         assert!(md.contains("AicxOperator"));
     }
 
-    /// Regression for loctree-fail hak 2026-05-23 #2: aicx-store absolute
+    /// Regression for loctree-feedback hak 2026-05-23 #2: aicx-store absolute
     /// paths must never leak into rendered context output, including the
     /// per-entry chunk hint and the Source-chunk-pointers footer.
     #[test]
     fn pill_aicx_memory_does_not_leak_absolute_aicx_store_paths() {
         let mut pack = fixture_pack();
         let leaky_path =
-            "/Users/tester/.aicx/store/Loctree/loctree-suite/2026_0525/conversations/claude/s1.md";
+            "/home/tester/.aicx/store/Loctree/loctree-suite/2026_0525/conversations/claude/s1.md";
         pack.memory = MemorySlice {
             entries: vec![MemoryEntry {
                 kind: "decision".to_string(),
@@ -1827,15 +1861,15 @@ mod tests {
 
     #[test]
     fn chunk_ref_is_stable_short_hash() {
-        let a = chunk_ref("/Users/op/.aicx/store/proj/2026/01/01/sess.md");
-        let b = chunk_ref("/Users/op/.aicx/store/proj/2026/01/01/sess.md");
+        let a = chunk_ref("/home/op/.aicx/store/proj/2026/01/01/sess.md");
+        let b = chunk_ref("/home/op/.aicx/store/proj/2026/01/01/sess.md");
         assert_eq!(a, b, "same path must hash to same chunk ref");
         assert!(
             a.starts_with("chunk:") && a.len() == "chunk:".len() + 8,
             "chunk ref must be 8-char hex prefix: {a}"
         );
         assert_eq!(chunk_ref(""), "chunk:none");
-        let c = chunk_ref("/Users/op/.aicx/store/proj/2026/01/02/sess.md");
+        let c = chunk_ref("/home/op/.aicx/store/proj/2026/01/02/sess.md");
         assert_ne!(a, c, "different paths must hash to different refs");
     }
 
@@ -1951,7 +1985,7 @@ mod tests {
         let tldr = &md[..tldr_end];
         assert!(
             tldr.contains(
-                "**Intent layer.** 3 decyzje/intencje formujące z aicx overlay — karta `03-intent-map.md`."
+                "**Intent layer.** 3 shaping decisions/intents from the aicx overlay — card `03-intent-map.md`."
             ),
             "fresh overlay must earn one intent line in the TL;DR: {tldr}"
         );
@@ -1973,7 +2007,7 @@ mod tests {
         let tldr = &md[..tldr_end];
         assert!(
             tldr.contains("**Intent layer.** intent layer stale (")
-                && tldr.contains("karta `03-intent-map.md`"),
+                && tldr.contains("card `03-intent-map.md`"),
             "degraded overlay must surface the stale marker in the TL;DR: {tldr}"
         );
     }
@@ -2048,5 +2082,39 @@ mod tests {
             ),
             "pill must not stamp RepoVerified on unknown git identity:\n{md}"
         );
+    }
+    #[test]
+    fn entry_has_coverage_and_never_claims_unmeasured_risk_is_green() {
+        let mut pack = fixture_pack();
+        pack.risk = RiskSlice::default();
+        pack.coverage = crate::pack::PackCoverage {
+            selected: 3,
+            total: 920,
+            truncated: true,
+        };
+        let scope = AutoScope::default();
+        let md = render_pill(input_with(&pack, &scope, AicxRenderStatus::Disabled));
+        assert!(md.contains("selected targets 3 / indexed files 920"));
+        assert!(md.contains("Runtime execution and verification results: not measured"));
+        assert!(md.contains("Risk is not fully measured"));
+        assert!(!md.contains("no significant risk spike"));
+        assert!(count_lines(&md) <= 250);
+    }
+    #[test]
+    fn task_pill_does_not_label_unrelated_global_hubs_as_scoped_evidence() {
+        let mut pack = fixture_pack();
+        pack.risk.hotspots.clear();
+        pack.task = Some(crate::context_scope::TaskReport {
+            text: "Max startup".into(),
+            mode: "ranker".into(),
+            authority: "semantic_guess".into(),
+        });
+        let mut scope = AutoScope::default();
+        scope.top_hubs.push(HubEntry {
+            file: "global_unrelated.rs".into(),
+            importers: 94,
+        });
+        let md = render_pill(input_with(&pack, &scope, AicxRenderStatus::Disabled));
+        assert!(!md.contains("global_unrelated.rs"));
     }
 }

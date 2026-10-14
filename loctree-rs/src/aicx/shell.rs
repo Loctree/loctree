@@ -511,7 +511,7 @@ mod tests {
                 "timestamp": "2026-04-28T00:00:00Z",
                 "session_id": "abc123",
                 "count": null,
-                "source_chunk": "/Users/x/.aicx/store/foo.md"
+                "source_chunk": "/home/x/.aicx/store/foo.md"
             }
         ]"#;
         let parsed = parse_intents(payload);
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(intent.kind, "intent");
         assert_eq!(intent.text, "ship cut5");
         assert_eq!(intent.session_id, "abc123");
-        assert_eq!(intent.source_chunk_path, "/Users/x/.aicx/store/foo.md");
+        assert_eq!(intent.source_chunk_path, "/home/x/.aicx/store/foo.md");
         assert_eq!(intent.timestamp.as_deref(), Some("2026-04-28T00:00:00Z"));
         assert!(intent.frame_kind.is_none());
     }
@@ -532,7 +532,7 @@ mod tests {
                 "backend": "filesystem_fuzzy",
                 "index_kind": "none",
                 "fallback_reason": "fallback_filesystem_fuzzy: content index unavailable",
-                "store_root": "/Users/x/.aicx",
+                "store_root": "/home/x/.aicx",
                 "indexed_count": 0,
                 "scanned_count": 1,
                 "candidate_count": 1,
@@ -550,7 +550,7 @@ mod tests {
                     "date": "2026-05-04",
                     "timestamp": "2026-05-04T12:00:00Z",
                     "session_id": "oracle-1",
-                    "source_chunk": "/Users/x/.aicx/store/oracle.md",
+                    "source_chunk": "/home/x/.aicx/store/oracle.md",
                     "frame_kind": "assistant"
                 }
             ]
@@ -589,7 +589,7 @@ mod tests {
                     "session": "df9d7e52",
                     "cwd": "/tmp",
                     "matches": ["snippet a", "snippet b"],
-                    "path": "/Users/x/.aicx/foo.md"
+                    "path": "/home/x/.aicx/foo.md"
                 }
             ]
         }"#;
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(row.label.as_deref(), Some("HIGH"));
         assert_eq!(row.frame_kind.as_deref(), Some("tool_call"));
         assert_eq!(row.matches.len(), 2);
-        assert_eq!(row.path, "/Users/x/.aicx/foo.md");
+        assert_eq!(row.path, "/home/x/.aicx/foo.md");
     }
 
     #[test]
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn parse_steer_handles_three_line_blocks() {
-        let payload = "Loctree/loctree-suite | claude | 2026-04-19 | conversations\n  run_id: -  prompt_id: -  model: -\n  /Users/tester/.aicx/store/foo.md\n\nLoctree/loctree-suite | codex | 2026-04-25 | reports\n  run_id: mrbl-001  prompt_id: cut3-task  model: opus-4.7\n  /Users/tester/.aicx/store/bar.md\n";
+        let payload = "Loctree/loctree-suite | claude | 2026-04-19 | conversations\n  run_id: -  prompt_id: -  model: -\n  /home/tester/.aicx/store/foo.md\n\nLoctree/loctree-suite | codex | 2026-04-25 | reports\n  run_id: mrbl-001  prompt_id: cut3-task  model: opus-4.7\n  /home/tester/.aicx/store/bar.md\n";
         let parsed = parse_steer(payload);
         assert_eq!(parsed.len(), 2);
 
@@ -628,7 +628,7 @@ mod tests {
         assert_eq!(parsed[1].model.as_deref(), Some("opus-4.7"));
         assert_eq!(
             parsed[1].source_chunk_path,
-            "/Users/tester/.aicx/store/bar.md"
+            "/home/tester/.aicx/store/bar.md"
         );
     }
 
@@ -665,7 +665,7 @@ mod tests {
                 "index_kind": "none",
                 "fallback_reason": "fallback_filesystem_fuzzy: content index unavailable",
                 "derived_view": "none_filesystem_scan",
-                "store_root": "/Users/x/.aicx",
+                "store_root": "/home/x/.aicx",
                 "indexed_count": 0,
                 "scanned_count": 127,
                 "candidate_count": 1,
@@ -724,7 +724,7 @@ mod tests {
                 "index_kind": "content_chunks",
                 "fallback_reason": null,
                 "derived_view": "embedded_semantic_top_k",
-                "store_root": "/Users/x/.aicx",
+                "store_root": "/home/x/.aicx",
                 "indexed_count": 5000,
                 "scanned_count": 5000,
                 "candidate_count": 5,
@@ -772,7 +772,7 @@ mod tests {
                 "backend": "canonical_corpus",
                 "index_kind": "canonical_chunks",
                 "derived_view": "canonical_chunk_scan_no_semantic_index",
-                "store_root": "/Users/x/.aicx",
+                "store_root": "/home/x/.aicx",
                 "indexed_count": 0,
                 "scanned_count": 200,
                 "candidate_count": 2,

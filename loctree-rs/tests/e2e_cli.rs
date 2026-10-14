@@ -86,6 +86,62 @@ fn loct() -> Command {
 // Basic CLI Tests
 // ============================================
 
+mod file_discovery {
+    use super::*;
+
+    #[test]
+    fn standalone_file_search_matches_paths_without_needing_symbol_or_content_hits() {
+        let temp = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("src")).unwrap();
+        std::fs::write(temp.path().join("src/a_helper.rs"), "").unwrap();
+        std::fs::write(
+            temp.path().join("src/b_helper.rs"),
+            "pub fn unrelated() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src/other.rs"),
+            "// helper is only in content\n",
+        )
+        .unwrap();
+        let output = loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args([
+                "find", "--file", "helper", "--json", "--limit", "1", "--offset", "1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["mode"], "files");
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["files"], serde_json::json!(["src/b_helper.rs"]));
+        assert_eq!(result["has_more"], false);
+        loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["find", "--file", "helper", "--all"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("src/a_helper.rs"))
+            .stdout(predicate::str::contains("src/b_helper.rs"))
+            .stdout(predicate::str::contains("src/other.rs").not());
+        loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["find", "--file", "["])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("invalid file pattern"));
+    }
+}
+
 mod cli_basics {
     use super::*;
 
@@ -2251,6 +2307,164 @@ mod auto_scan {
     }
 
     #[test]
+    fn context_exports_are_quiet_without_losing_unresolved_shell_imports() {
+        let temp = create_git_repo();
+        let cache = TempDir::new().unwrap();
+        for directory in ["a", "b"] {
+            std::fs::create_dir_all(temp.path().join(directory)).unwrap();
+            std::fs::write(
+                temp.path().join(directory).join("common.sh"),
+                "helper() { :; }\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(temp.path().join("local.sh"), "local_helper() { :; }\n").unwrap();
+        std::fs::write(
+            temp.path().join("main.sh"),
+            "#!/bin/sh\nsource \"$module_file\"\nsource \"$SCRIPT_DIR/common.sh\"\nsource ./local.sh\n",
+        ).unwrap();
+        commit_all(temp.path(), "shell resolution fixture");
+
+        // Initial, cached and explicit fresh exports must all stay silent.
+        for args in [
+            vec!["context", "--full", "--markdown", "--no-aicx"],
+            vec!["context", "--full", "--markdown", "--no-aicx"],
+            vec!["--fresh", "context", "--json", "--no-aicx"],
+            vec![
+                "--verbose",
+                "--quiet",
+                "--fresh",
+                "context",
+                "--json",
+                "--no-aicx",
+            ],
+        ] {
+            let output = loct()
+                .current_dir(temp.path())
+                .env("LOCT_CACHE_DIR", cache.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!output.stdout.is_empty());
+        }
+
+        let snapshot = snapshot_from_cache(cache.path());
+        let main = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "main.sh")
+            .unwrap();
+        for source in ["$module_file", "$SCRIPT_DIR/common.sh"] {
+            let import = main
+                .imports
+                .iter()
+                .find(|import| import.source == source)
+                .unwrap();
+            assert!(
+                import.resolved_path.is_none(),
+                "no invented edge for {source}"
+            );
+            assert_eq!(
+                import.resolution,
+                loctree::types::ImportResolutionKind::Dynamic
+            );
+        }
+        assert!(
+            main.imports
+                .iter()
+                .any(|import| import.source == "./local.sh"
+                    && import.resolved_path.as_deref() == Some("local.sh"))
+        );
+
+        // Progress remains explicitly available and fatal errors still report.
+        let verbose = loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args([
+                "--verbose",
+                "--fresh",
+                "context",
+                "--full",
+                "--markdown",
+                "--no-aicx",
+            ])
+            .output()
+            .unwrap();
+        assert!(verbose.status.success());
+        assert!(String::from_utf8_lossy(&verbose.stderr).contains("scan completed in"));
+        commit_all(temp.path(), "stale snapshot");
+        let refused = loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["--quiet", "--fail-stale", "context", "--json", "--no-aicx"])
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(3));
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("--fail-stale"));
+    }
+
+    #[test]
+    fn context_rebuilds_incompatible_cache_and_respects_no_scan_modes() {
+        let temp = create_git_repo();
+        let cache = TempDir::new().unwrap();
+        scan_repo(temp.path(), &cache);
+        let path = latest_snapshot_path(&cache);
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["symbol_graph"] = serde_json::json!({"symbols": [{"language": "python"}]});
+        let incompatible = serde_json::to_vec(&value).unwrap();
+        for flag in ["--no-scan", "--fail-stale"] {
+            std::fs::write(&path, &incompatible).unwrap();
+            loct()
+                .current_dir(temp.path())
+                .env("LOCT_CACHE_DIR", cache.path())
+                .args([flag, "context", "--full", "--markdown", "--no-aicx"])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("loct scan --fresh"));
+            assert_eq!(std::fs::read(&path).unwrap(), incompatible);
+        }
+        let output = loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args([
+                "context",
+                "--file",
+                "src/lib.rs",
+                "--full",
+                "--markdown",
+                "--no-aicx",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("initial_marker"));
+        assert!(snapshot_from_cache(cache.path()).files.iter().any(|file| {
+            file.exports
+                .iter()
+                .any(|symbol| symbol.name == "initial_marker")
+        }));
+    }
+
+    #[test]
     fn auto_scans_on_missing_snapshot() {
         let temp = create_git_repo();
         let cache = TempDir::new().unwrap();
@@ -2258,7 +2472,7 @@ mod auto_scan {
         let output = loct()
             .current_dir(temp.path())
             .env("LOCT_CACHE_DIR", cache.path())
-            .args(["context"])
+            .args(["--verbose", "context"])
             .output()
             .unwrap();
 
@@ -2292,7 +2506,7 @@ mod auto_scan {
         let output = loct()
             .current_dir(temp.path())
             .env("LOCT_CACHE_DIR", cache.path())
-            .args(["context", "src/new.rs", "--json"])
+            .args(["--verbose", "context", "src/new.rs", "--json"])
             .output()
             .unwrap();
 
@@ -2535,7 +2749,7 @@ mod auto_scan {
         let output = loct()
             .current_dir(temp.path())
             .env("LOCT_CACHE_DIR", cache.path())
-            .args(["context", "src/lib.rs", "--json"])
+            .args(["--verbose", "context", "src/lib.rs", "--json"])
             .output()
             .unwrap();
 
@@ -2576,7 +2790,7 @@ mod auto_scan {
             .env("LOCT_CACHE_DIR", cache.path())
             .env("LOCT_CACHE_MAX_AGE", "12h")
             .env("LOCT_NO_GITIGNORE", "1")
-            .args(["context", "src/lib.rs", "--json"])
+            .args(["--verbose", "context", "src/lib.rs", "--json"])
             .output()
             .unwrap();
 
@@ -3333,7 +3547,7 @@ mod analysis_commands {
 
     #[test]
     fn follow_all_json_emits_single_aggregated_object() {
-        // loctree-fail.md (2026-06-19): `loct --help` advertised `follow all`
+        // loctree-feedback.md (2026-06-19): `loct --help` advertised `follow all`
         // and global `--json`, but `loct follow all --json` errored
         // ("not available yet"). It must now emit ONE valid JSON object with
         // per-scope machine-readable counts.
@@ -4467,7 +4681,7 @@ mod management_commands {
             .stdout(predicate::str::starts_with("{").or(predicate::str::starts_with("[")));
     }
 
-    // CLI flag drift (loctree-fail.md): `loct find --mode <x>` used to fail with
+    // CLI flag drift (loctree-feedback.md): `loct find --mode <x>` used to fail with
     // `Unknown option '--mode'`. It now aliases 1:1 onto the mode flags.
     #[test]
     fn find_mode_alias_where_symbol_does_not_error() {
@@ -6518,7 +6732,7 @@ mod occurrences_cli {
         );
     }
 
-    // loctree-fail 2026-08-11: the find JSON envelope key changed with the mode
+    // loctree-feedback 2026-08-11: the find JSON envelope key changed with the mode
     // (`literal_matches` vs `regex_matches`) and nothing announced it. A parser
     // written against one key reads the other mode as zero occurrences with
     // `coverage: None` — i.e. "not found" instead of "wrong key", which is the
@@ -6596,6 +6810,159 @@ mod occurrences_cli {
                 .unwrap_or_else(|| panic!("{label}: matches.occurrences must be a list"));
             assert!(!hits.is_empty(), "{label}: alias must carry real hits");
         }
+    }
+
+    #[test]
+    fn twins_class_partition_offset_and_follow_skips_dead_parrots() {
+        let temp = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+
+        // The signature fingerprint is built from CUSTOM types in the
+        // signature (signature_uses); a primitive-only signature carries no
+        // fingerprint and can never classify EXACT.
+        std::fs::write(
+            src.join("payload.rs"),
+            "pub struct TwinPayload {\n    pub v: i32,\n}\n",
+        )
+        .unwrap();
+        let twin = "use crate::payload::TwinPayload;\n\npub fn keep_me_visible(p: &TwinPayload, extra: i32) -> TwinPayload {\n    let a = p.v + extra;\n    let b = a * 2;\n    TwinPayload { v: b }\n}\n";
+        std::fs::write(src.join("twin_a.rs"), twin).unwrap();
+        std::fs::write(src.join("twin_b.rs"), twin).unwrap();
+
+        // Same name, three signatures: a length-3 group that outranks the
+        // 2-location structural twin under a pure location-count sort.
+        let signatures = [
+            "pub fn probe_collide() {}\n",
+            "pub fn probe_collide(x: i32) -> i32 { x }\n",
+            "pub fn probe_collide(x: i32, y: &str) -> i32 { x }\n",
+        ];
+        let mut mods = vec![
+            "payload".to_string(),
+            "twin_a".to_string(),
+            "twin_b".to_string(),
+        ];
+        for (i, signature) in signatures.iter().enumerate() {
+            let name = format!("col_{i}");
+            std::fs::write(
+                src.join(format!("{name}.rs")),
+                format!("{signature}pub fn never_called_{i}() {{}}\n"),
+            )
+            .unwrap();
+            mods.push(name);
+        }
+        for i in 0..12 {
+            let name = format!("dead_{i:02}");
+            std::fs::write(
+                src.join(format!("{name}.rs")),
+                format!("pub fn never_called_extra_{i}() {{}}\n"),
+            )
+            .unwrap();
+            mods.push(name);
+        }
+        std::fs::write(
+            src.join("lib.rs"),
+            mods.iter()
+                .map(|module| format!("pub mod {module};\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("Cargo.toml"),
+            "[package]\nname = \"n3_twins\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        run_git(temp.path(), &["init"]);
+        run_git(temp.path(), &["config", "user.email", "n3@example.invalid"]);
+        run_git(temp.path(), &["config", "user.name", "N3"]);
+        run_git(temp.path(), &["add", "."]);
+        run_git(temp.path(), &["commit", "-m", "init"]);
+
+        loctree()
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["scan"])
+            .current_dir(temp.path())
+            .assert()
+            .success();
+
+        let run = |args: &[&str]| {
+            let out = loct()
+                .env("LOCT_CACHE_DIR", cache.path())
+                .args(args)
+                .current_dir(temp.path())
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone();
+            serde_json::from_slice::<serde_json::Value>(&out).expect("twins JSON")
+        };
+
+        let follow = run(&["follow", "twins", "--limit", "10", "--json"]);
+        assert!(
+            follow["dead_parrots"].as_array().unwrap().is_empty(),
+            "follow twins must not emit dead parrots: {follow}"
+        );
+        let follow_names: Vec<_> = follow["exact_twins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|group| group["name"].as_str())
+            .collect();
+        assert!(
+            follow_names.contains(&"keep_me_visible"),
+            "structural twin must survive a dead-parrot flood: {follow_names:?}"
+        );
+
+        let structural = run(&["twins", "--class", "structural", "--limit", "10", "--json"]);
+        let structural_classes: Vec<_> = structural["exact_twins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group["class"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            structural_classes
+                .iter()
+                .all(|class| class == "EXACT" || class == "SHAPE_SIMILAR"),
+            "{structural_classes:?}"
+        );
+        assert!(
+            structural["exact_twins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|group| group["name"] == "keep_me_visible")
+        );
+        assert_eq!(structural["page"]["offset"], 0);
+        assert_eq!(structural["page"]["semantics"], "global");
+
+        let naming = run(&[
+            "twins", "--class", "naming", "--offset", "0", "--limit", "5", "--json",
+        ]);
+        assert!(
+            naming["exact_twins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|group| group["name"] != "keep_me_visible")
+        );
+        assert_eq!(naming["page"]["offset"], 0);
+
+        loct()
+            .args(["twins", "--class", "NOPE"])
+            .current_dir(temp.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unknown twin class"));
+        loct()
+            .args(["follow", "dead", "--class", "EXACT"])
+            .current_dir(temp.path())
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("follow twins"));
     }
 
     #[test]
@@ -8552,7 +8919,7 @@ mod dead_truth {
         }
     }
 
-    /// Regression for W5.1 (loctree-fail.md 2903,2978,2990,3052): dash-prefixed
+    /// Regression for W5.1 (loctree-feedback.md 2903,2978,2990,3052): dash-prefixed
     /// literals must not be parsed as CLI options. `find --literal -- <str>`
     /// and `occurrences -- <str>` must work (or the lenient post-literal path).
     /// The bug is not closed until a test would catch regression on the parser.
@@ -8582,6 +8949,106 @@ mod dead_truth {
             !stdout2.contains("Unknown option") && !stdout2.contains("unknown option"),
             "occurrences -- <dashed> must not treat dash as option: {}",
             stdout2
+        );
+    }
+
+    /// Astro pages are runtime routes. F2a keeps the row on `loct dead --full`
+    /// with `entrypoint: true` and confidence below high, and `--confidence high`
+    /// drops it. A component outside `pages/` stays a high-confidence dead export.
+    #[test]
+    fn astro_pages_are_fenced_entrypoints_and_orphan_components_stay_dead() {
+        let (fixture, cache) = dead_truth_fixture("astro_app");
+        let dead = dead_json(fixture.path(), cache.path());
+
+        let row = |symbol: &str, file: &str| {
+            dead.iter()
+                .find(|candidate| {
+                    candidate["symbol"].as_str() == Some(symbol)
+                        && candidate["file"].as_str() == Some(file)
+                })
+                .unwrap_or_else(|| panic!("missing {symbol} in {file}: {dead:?}"))
+        };
+
+        for (symbol, file) in [
+            ("terms", "src/pages/terms.astro"),
+            ("lab", "src/pages/voice/lab.astro"),
+        ] {
+            let candidate = row(symbol, file);
+            assert_eq!(
+                candidate["entrypoint"].as_bool(),
+                Some(true),
+                "astro page must stay visible and fenced: {candidate:?}"
+            );
+            assert_ne!(
+                candidate["confidence"].as_str(),
+                Some("high"),
+                "fenced page must not be high confidence: {candidate:?}"
+            );
+        }
+
+        let orphan = row("Orphan", "src/components/Orphan.astro");
+        assert_eq!(
+            orphan["entrypoint"].as_bool(),
+            Some(false),
+            "component outside pages/ is not a route: {orphan:?}"
+        );
+        assert!(
+            matches!(
+                orphan["confidence"].as_str(),
+                Some("high") | Some("very-high")
+            ),
+            "unfenced component stays on the high-confidence surface: {orphan:?}"
+        );
+
+        let high_output = loct_at(fixture.path(), cache.path())
+            .args(["dead", "--confidence", "high", "--json", "--full"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let high: Vec<Value> = serde_json::from_slice::<Value>(&high_output.stdout)
+            .expect("high-confidence dead JSON")
+            .as_array()
+            .expect("high-confidence dead JSON array")
+            .clone();
+        assert!(
+            high.iter().all(|candidate| {
+                !matches!(
+                    (candidate["symbol"].as_str(), candidate["file"].as_str()),
+                    (Some("terms"), Some("src/pages/terms.astro"))
+                        | (Some("lab"), Some("src/pages/voice/lab.astro"))
+                )
+            }),
+            "high-confidence mode must drop fenced astro pages: {high:?}"
+        );
+        assert!(
+            high.iter().any(|candidate| {
+                candidate["symbol"].as_str() == Some("Orphan")
+                    && candidate["file"].as_str() == Some("src/components/Orphan.astro")
+                    && candidate["entrypoint"].as_bool() == Some(false)
+                    && matches!(
+                        candidate["confidence"].as_str(),
+                        Some("high") | Some("very-high")
+                    )
+            }),
+            "orphan component must remain on the high-confidence surface: {high:?}"
+        );
+
+        let health_output = loct_at(fixture.path(), cache.path())
+            .args(["health", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        let health: Value = serde_json::from_slice(&health_output.stdout).expect("health JSON");
+        let expected_high = dead
+            .iter()
+            .filter(|candidate| candidate["confidence"].as_str() == Some("high"))
+            .count() as u64;
+        assert_eq!(
+            health["dead_exports"]["high_confidence"].as_u64(),
+            Some(expected_high),
+            "entrypoint pages must not add to the high-confidence defect count: {health:?}"
         );
     }
 }

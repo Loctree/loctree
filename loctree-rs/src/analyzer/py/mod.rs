@@ -38,9 +38,10 @@ use usages::{
 
 // External imports
 use super::regexes::{regex_py_dynamic_dunder, regex_py_dynamic_importlib};
+use super::resolvers::resolve_python_candidate;
 use crate::types::{
-    ExportSymbol, FileAnalysis, ImportEntry, ImportKind, ImportSymbol, LocalSymbol, LogLevel,
-    LogMessage, ParamInfo, ReexportEntry, ReexportKind, SymbolUsage,
+    ExportSymbol, FileAnalysis, ImportEntry, ImportKind, ImportResolutionKind, ImportSymbol,
+    LocalSymbol, LogLevel, LogMessage, ParamInfo, ReexportEntry, ReexportKind, SymbolUsage,
 };
 use regex::Regex;
 use std::collections::HashSet;
@@ -264,7 +265,7 @@ struct FromImportContext<'a> {
 /// that `resolve_python_relative` counts. A naive `trim_end_matches('.')`
 /// reduced a pure-dots module (`.`, `..`) to "" and dropped the whole import
 /// edge, so `from . import (CONST, ...)` recorded nothing and intra-package
-/// symbols looked dead (loctree-fail.md, 2026-06-16). Only a stray trailing dot
+/// symbols looked dead (loctree-feedback.md, 2026-06-16). Only a stray trailing dot
 /// on the NON-dot remainder is trimmed (e.g. `pkg.` → `pkg`).
 fn normalize_relative_import_module(raw: &str) -> &str {
     let raw = raw.trim();
@@ -295,6 +296,28 @@ fn process_from_import(ctx: &FromImportContext<'_>, analysis: &mut FileAnalysis)
         ctx.extensions,
         ctx.stdlib,
     );
+    // G5: `from pkg import submodule` almost always means "submodule" is a
+    // real file (pkg/submodule.py or pkg/submodule/__init__.py), not
+    // necessarily a name pkg/__init__.py re-exports. Prefer that submodule
+    // file as the edge target when it exists on disk — otherwise every
+    // `from pkg import submodule` edge landed on the package facade and the
+    // real consumer edge (main.py -> pkg/submodule.py) was invisible.
+    let submodule_targets = resolve_from_import_submodules(&resolved, ctx);
+    let first_name = ctx.names_clean.split(',').next().map(|sym| {
+        sym.trim()
+            .split(" as ")
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    });
+    let (resolved, resolution) = match first_name
+        .as_deref()
+        .and_then(|first| submodule_targets.iter().find(|(name, _)| name == first))
+    {
+        Some((_, path)) => (Some(path.clone()), ImportResolutionKind::Local),
+        None => (resolved, resolution),
+    };
     entry.resolution = resolution;
     entry.resolved_path = resolved.clone();
     entry.is_type_checking = ctx.is_type_checking;
@@ -320,6 +343,28 @@ fn process_from_import(ctx: &FromImportContext<'_>, analysis: &mut FileAnalysis)
         }
     }
     analysis.imports.push(entry);
+
+    // N09: every OTHER imported name that is a real submodule gets its own
+    // import entry, so `from pkg import a, b` reaches both a.py and b.py and
+    // swapping the order changes nothing but the labels.
+    for (name, path) in &submodule_targets {
+        if resolved.as_deref() == Some(path.as_str()) {
+            continue;
+        }
+        let mut child = ImportEntry::new(format!("{module}.{name}"), ImportKind::Static);
+        child.line = Some(ctx.line_num);
+        child.resolution = ImportResolutionKind::Local;
+        child.resolved_path = Some(path.clone());
+        child.is_type_checking = ctx.is_type_checking;
+        child.is_lazy = ctx.is_lazy;
+        child.source_raw = format!("from {} import {}", module, ctx.names_clean);
+        child.symbols.push(ImportSymbol {
+            name: name.clone(),
+            alias: None,
+            is_default: false,
+        });
+        analysis.imports.push(child);
+    }
 
     // Python package API re-export pattern:
     // __init__.py often re-exports names via `from .mod import Foo as Bar`.
@@ -376,6 +421,53 @@ fn process_from_import(ctx: &FromImportContext<'_>, analysis: &mut FileAnalysis)
         }
         analysis.reexports.push(entry);
     }
+}
+
+/// G5/N09: for `from <module> import name1, name2, ...`, resolve EVERY
+/// imported name that is itself a real submodule file living directly under
+/// the resolved package's directory (module/name.py or module/name/__init__.py).
+///
+/// Only fires when `resolved_module` is an `__init__.py`/`__init__.pyi`
+/// (a real package — a plain module has no submodules to prefer). The old
+/// pass inspected only the FIRST name, so `from pkg import a, b` made b.py
+/// invisible and swapping the name order changed the graph (audit N09).
+fn resolve_from_import_submodules(
+    resolved_module: &Option<String>,
+    ctx: &FromImportContext<'_>,
+) -> Vec<(String, String)> {
+    if ctx.names_clean == "*" {
+        return Vec::new();
+    }
+    let Some(resolved_module) = resolved_module.as_ref() else {
+        return Vec::new();
+    };
+    if !(resolved_module.ends_with("__init__.py") || resolved_module.ends_with("__init__.pyi")) {
+        return Vec::new();
+    }
+    let Some(module_dir) = ctx
+        .root
+        .join(resolved_module)
+        .parent()
+        .map(|p| p.to_path_buf())
+    else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for sym in ctx.names_clean.split(',') {
+        let sym = sym.trim();
+        let name = sym.split(" as ").next().unwrap_or(sym).trim();
+        if name.is_empty() || !is_valid_python_identifier(name) {
+            continue;
+        }
+        let candidate = module_dir.join(name);
+        if let Some(submodule_resolved) =
+            resolve_python_candidate(candidate, ctx.root, ctx.py_roots, ctx.extensions)
+        {
+            out.push((name.to_string(), submodule_resolved));
+        }
+    }
+    out
 }
 
 fn py_logging_call_regex() -> &'static Regex {
@@ -1371,7 +1463,7 @@ import sys
 
     #[test]
     fn python_module_level_const_assignments_are_local_symbols() {
-        // Hak (loctree-fail.md, 2026-06-15): `loct body FRAMEWORK_LAUNCHER_MARKERS`
+        // Hak (loctree-feedback.md, 2026-06-15): `loct body FRAMEWORK_LAUNCHER_MARKERS`
         // returned "(no source body found)" because module-level tuple/const
         // assignments were never recorded as symbols, so where-symbol/body found
         // nothing. They must land in local_symbols (NOT exports, to avoid new
@@ -1488,7 +1580,7 @@ import sys
 
     #[test]
     fn tracks_bare_dot_relative_import_edge() {
-        // loctree-fail.md (2026-06-16): `from . import (CONST, ...)` (bare-dot
+        // loctree-feedback.md (2026-06-16): `from . import (CONST, ...)` (bare-dot
         // relative import of package __init__ symbols) recorded NO import edge,
         // so intra-package consts were false dead. Root cause was
         // trim_end_matches('.') reducing module "." to "" → early return.
@@ -1660,7 +1752,15 @@ import sys
     }
 
     #[test]
-    fn dynamic_imports_and_local_over_stdlib() {
+    fn dynamic_imports_and_stdlib_wins_over_colliding_local_file() {
+        // G10.2: `resolve_python_import` now checks stdlib BEFORE local
+        // filesystem resolution for absolute imports. This test used to be
+        // named `dynamic_imports_and_local_over_stdlib` and asserted the
+        // OPPOSITE — a local `json.py` silently winning over the stdlib
+        // `json` module — which was exactly the misclassification bug G10.2
+        // fixes (see py/imports.rs). A project that genuinely wants to
+        // shadow a stdlib name locally still reaches it via an explicit
+        // relative import (`from . import json`), which is untouched here.
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::write(root.join("json.py"), "LOCAL = True").expect("write json.py");
@@ -1684,14 +1784,8 @@ dyn = __import__("x.y")
             .iter()
             .find(|i| i.source == "json")
             .expect("json import");
-        assert_eq!(json_imp.resolution, ImportResolutionKind::Local);
-        assert!(
-            json_imp
-                .resolved_path
-                .as_deref()
-                .unwrap_or("")
-                .ends_with("json.py")
-        );
+        assert_eq!(json_imp.resolution, ImportResolutionKind::Stdlib);
+        assert!(json_imp.resolved_path.is_none());
 
         assert_eq!(analysis.dynamic_imports.len(), 2);
         assert!(analysis.dynamic_imports.iter().any(|s| s.contains("pkg.")));
@@ -1983,6 +2077,69 @@ def test_something(sample_fixture):
         );
 
         assert!(!analysis.is_namespace_package);
+    }
+
+    #[test]
+    fn g5_from_import_resolves_to_submodule_file_not_package_init() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write __init__");
+        std::fs::write(root.join("pkg/submodule.py"), "VALUE = 1").expect("write submodule");
+
+        let content = "from pkg import submodule\n";
+        let analysis = analyze_py_file(
+            content,
+            &root.join("main.py"),
+            root,
+            Some(&py_exts()),
+            "main.py".to_string(),
+            &[root.to_path_buf()],
+            &HashSet::new(),
+        );
+
+        let imp = analysis
+            .imports
+            .iter()
+            .find(|i| i.source == "pkg")
+            .expect("pkg import recorded");
+        assert_eq!(
+            imp.resolved_path.as_deref(),
+            Some("pkg/submodule.py"),
+            "expected edge to pkg/submodule.py, got: {:?}",
+            imp.resolved_path
+        );
+        assert_eq!(imp.resolution, ImportResolutionKind::Local);
+    }
+
+    #[test]
+    fn g5_from_import_star_still_resolves_to_package_init() {
+        // Sanity check: `from pkg import *` has no single name to prefer as a
+        // submodule, so it must keep resolving to the package facade
+        // (needed for read_all_from_resolved to find `__all__`).
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write __init__");
+        std::fs::write(root.join("pkg/submodule.py"), "VALUE = 1").expect("write submodule");
+
+        let content = "from pkg import *\n";
+        let analysis = analyze_py_file(
+            content,
+            &root.join("main.py"),
+            root,
+            Some(&py_exts()),
+            "main.py".to_string(),
+            &[root.to_path_buf()],
+            &HashSet::new(),
+        );
+
+        let imp = analysis
+            .imports
+            .iter()
+            .find(|i| i.source == "pkg")
+            .expect("pkg import recorded");
+        assert_eq!(imp.resolved_path.as_deref(), Some("pkg/__init__.py"));
     }
 
     #[test]
@@ -3096,5 +3253,41 @@ def genuinely_dead():
             "genuinely_dead should be dead, got: {:?}",
             dead
         );
+    }
+    /// N09 (audit): `from pkg import a, b` must reach BOTH a.py and b.py,
+    /// and swapping the name order must not change the resolved target set.
+    #[test]
+    fn n09_multi_name_from_import_resolves_every_submodule() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("pkg")).expect("mkdir");
+        std::fs::write(root.join("pkg/__init__.py"), "").expect("write __init__");
+        std::fs::write(root.join("pkg/a.py"), "A = 1").expect("write a");
+        std::fs::write(root.join("pkg/b.py"), "B = 1").expect("write b");
+
+        let targets = |content: &str| -> std::collections::BTreeSet<String> {
+            let analysis = analyze_py_file(
+                content,
+                &root.join("main.py"),
+                root,
+                Some(&py_exts()),
+                "main.py".to_string(),
+                &[root.to_path_buf()],
+                &HashSet::new(),
+            );
+            analysis
+                .imports
+                .iter()
+                .filter_map(|i| i.resolved_path.clone())
+                .collect()
+        };
+
+        let ab = targets("from pkg import a, b\n");
+        assert!(
+            ab.contains("pkg/a.py") && ab.contains("pkg/b.py"),
+            "both submodules must resolve, got: {ab:?}"
+        );
+        let ba = targets("from pkg import b, a\n");
+        assert_eq!(ab, ba, "name order must not change the resolved target set");
     }
 }

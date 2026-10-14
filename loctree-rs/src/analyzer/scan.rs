@@ -283,7 +283,7 @@ fn is_scan_only_resource_extension(ext: &str) -> bool {
 /// faithful to the parser strategy promise (opt-in, parity not yet 100%).
 ///
 /// The parity contract is documented in
-/// `.vibecrafted/reports/lsp/19-cross-lang-stage-1.md`.
+/// `internal-artifacts/reports/lsp/19-cross-lang-stage-1.md`.
 pub fn ts_dispatch_js(content: &str, path: &Path, relative: String) -> FileAnalysis {
     use crate::types::{
         ExportSymbol as LExport, ImportEntry as LImport, ImportKind, ImportResolutionKind,
@@ -440,6 +440,17 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
         }
         Err(e) => return Err(e),
     };
+    analyze_source(canonical, &content, ctx)
+}
+
+/// Analyze exactly the supplied bytes. Body queries use this same scanner
+/// so definition coordinates and extracted text cannot come from different
+/// revisions of a file. The caller owns path validation and source reading.
+pub(crate) fn analyze_source(
+    canonical: PathBuf,
+    content: &str,
+    ctx: &AnalyzeContext,
+) -> io::Result<FileAnalysis> {
     let relative = canonical
         .strip_prefix(ctx.root_canon)
         .unwrap_or(&canonical)
@@ -461,7 +472,7 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
         .unwrap_or_default();
     let is_makefile = is_makefile_name(filename);
     let is_loctree_config = crate::fs_utils::is_loctree_config_filename(filename);
-    let is_extensionless_shell = ext.is_empty() && has_shell_shebang(&content);
+    let is_extensionless_shell = ext.is_empty() && has_shell_shebang(content);
     let shebang_ext = if ext.is_empty() {
         content
             .lines()
@@ -481,24 +492,24 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
     {
         FileAnalysis::new(relative)
     } else if is_makefile || dispatch_ext == "mk" || dispatch_ext == "make" {
-        analyze_makefile(&content, relative)
+        analyze_makefile(content, relative)
     } else if dispatch_ext == "sh"
         || dispatch_ext == "bash"
         || dispatch_ext == "zsh"
         || dispatch_ext == "fish"
         || is_extensionless_shell
     {
-        analyze_shell_file(&content, relative)
+        analyze_shell_file(content, relative)
     } else if dispatch_ext == "zig" || dispatch_ext == "zon" {
-        analyze_zig_file(&content, relative)
+        analyze_zig_file(content, relative)
     } else if dispatch_ext == "rb" {
         FileAnalysis::new(relative)
     } else {
         match dispatch_ext {
-            "rs" => analyze_rust_file(&content, relative, ctx.custom_command_macros),
-            "css" => analyze_css_file(&content, relative),
+            "rs" => analyze_rust_file(content, relative, ctx.custom_command_macros),
+            "css" => analyze_css_file(content, relative),
             "py" => analyze_py_file(
-                &content,
+                content,
                 &canonical,
                 ctx.root_canon,
                 ctx.extensions,
@@ -506,18 +517,18 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
                 ctx.py_roots,
                 ctx.py_stdlib,
             ),
-            "go" => crate::analyzer::go::analyze_go_file(&content, relative),
+            "go" => crate::analyzer::go::analyze_go_file(content, relative),
             "swift" | "m" | "mm" | "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" => {
                 crate::analyzer::c_family_syntax::analyze_c_family_file(
-                    &content,
+                    content,
                     relative,
                     dispatch_ext,
                 )
             }
-            "dart" => analyze_dart_file(&content, relative),
+            "dart" => analyze_dart_file(content, relative),
             "kt" | "kts" => FileAnalysis::new(relative),
             "html" | "htm" => analyze_html_file(
-                &content,
+                content,
                 &canonical,
                 ctx.root_canon,
                 ctx.extensions,
@@ -532,10 +543,10 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
                         "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "cts" | "mts"
                     )
                 {
-                    ts_dispatch_js(&content, &canonical, relative)
+                    ts_dispatch_js(content, &canonical, relative)
                 } else {
                     analyze_js_file(
-                        &content,
+                        content,
                         &canonical,
                         ctx.root_canon,
                         ctx.extensions,
@@ -627,6 +638,14 @@ pub(crate) fn analyze_file(path: &Path, ctx: &AnalyzeContext) -> io::Result<File
         // Shell/make/zig: try filesystem-relative resolution regardless of
         // leading dot. These never recurse into node_modules or stdlib trees.
         if is_makefile || ext == "mk" || ext == "make" {
+            // Recipe script refs (H8) stay unresolved here: root_scan
+            // verifies them against the scanned universe and keeps the path
+            // repo-relative. Resolving them via the filesystem would hand
+            // the edge builder a canonical ABSOLUTE target — a phantom node
+            // the graph cannot join back to the indexed file.
+            if crate::analyzer::makefile::is_recipe_script_source(&imp.source) {
+                continue;
+            }
             imp.resolved_path = resolve_makefile_include(&imp.source, &canonical, ctx.root_canon);
             if imp.resolved_path.is_some() {
                 imp.resolution = crate::types::ImportResolutionKind::Local;
@@ -898,6 +917,7 @@ name = "api"
                 awaited: false,
                 payload: None,
                 is_dynamic: false,
+                receiver: None,
             }],
             event_consts: consts,
             ..Default::default()
@@ -950,6 +970,7 @@ name = "api"
                     awaited: false,
                     payload: None,
                     is_dynamic: false,
+                    receiver: None,
                 }],
                 ..Default::default()
             },
@@ -981,6 +1002,7 @@ name = "api"
                     awaited: false,
                     payload: None,
                     is_dynamic: false,
+                    receiver: None,
                 }],
                 ..Default::default()
             },
@@ -1001,6 +1023,7 @@ name = "api"
                 awaited: false,
                 payload: None,
                 is_dynamic: false,
+                receiver: None,
             }],
             ..Default::default()
         }];
@@ -1052,6 +1075,7 @@ name = "api"
                     awaited: false,
                     payload: None,
                     is_dynamic: false,
+                    receiver: None,
                 }],
                 ..Default::default()
             },

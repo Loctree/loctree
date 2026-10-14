@@ -361,6 +361,7 @@ mod tests {
             generic_type: None,
             payload: None,
             plugin_name: None,
+            unconfirmed_import: false,
         }
     }
 
@@ -452,6 +453,7 @@ mod tests {
             awaited: false,
             payload: None,
             is_dynamic: false,
+            receiver: None,
         });
 
         let mut listener = file("src/listener.ts", "typescript");
@@ -463,6 +465,7 @@ mod tests {
             awaited: false,
             payload: None,
             is_dynamic: false,
+            receiver: None,
         });
 
         let registry = IdiomRegistry::load_defaults().expect("defaults");

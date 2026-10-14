@@ -1330,7 +1330,7 @@ mod tests {
             entries: vec![
                 CacheEntry {
                     project_id: "abc123def4567890".to_string(),
-                    canonical_root: Some("/Users/foo/bar".to_string()),
+                    canonical_root: Some("/home/foo/bar".to_string()),
                     last_scan_branch: Some("develop".to_string()),
                     last_scan_commit: Some("9d563ff".to_string()),
                     last_scan_mtime: Some("2026-04-25T11:00:00Z".to_string()),
@@ -1340,16 +1340,16 @@ mod tests {
                 },
                 CacheEntry {
                     project_id: "ffff111122223333".to_string(),
-                    canonical_root: Some("/Users/foo/baz".to_string()),
+                    canonical_root: Some("/home/foo/baz".to_string()),
                     last_scan_branch: None,
                     last_scan_commit: None,
                     last_scan_mtime: None,
                     cache_size_bytes: Some(5_000_000_001),
                     scope_state: Some(ScopeState::ScopeMismatch {
-                        expected: vec!["/Users/foo/baz".to_string()],
-                        actual: vec!["/Users/foo/baz/sub".to_string()],
+                        expected: vec!["/home/foo/baz".to_string()],
+                        actual: vec!["/home/foo/baz/sub".to_string()],
                     }),
-                    fix_command: Some("loct doctor --fix --project /Users/foo/baz".to_string()),
+                    fix_command: Some("loct doctor --fix --project /home/foo/baz".to_string()),
                 },
             ],
         };
@@ -1367,14 +1367,14 @@ mod tests {
         assert_eq!(back.entries[0].scope_state, Some(ScopeState::Fresh));
         match &back.entries[1].scope_state {
             Some(ScopeState::ScopeMismatch { expected, actual }) => {
-                assert_eq!(expected, &vec!["/Users/foo/baz".to_string()]);
-                assert_eq!(actual, &vec!["/Users/foo/baz/sub".to_string()]);
+                assert_eq!(expected, &vec!["/home/foo/baz".to_string()]);
+                assert_eq!(actual, &vec!["/home/foo/baz/sub".to_string()]);
             }
             other => panic!("expected ScopeMismatch, got {other:?}"),
         }
         assert_eq!(
             back.entries[1].fix_command.as_deref(),
-            Some("loct doctor --fix --project /Users/foo/baz")
+            Some("loct doctor --fix --project /home/foo/baz")
         );
     }
 
@@ -1386,7 +1386,7 @@ mod tests {
             enumeration: None,
             entries: vec![CacheEntry {
                 project_id: "abc123def4567890".to_string(),
-                canonical_root: Some("/Users/foo/bar".to_string()),
+                canonical_root: Some("/home/foo/bar".to_string()),
                 last_scan_branch: None,
                 last_scan_commit: None,
                 last_scan_mtime: None,

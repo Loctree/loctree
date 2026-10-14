@@ -670,6 +670,15 @@ fn scan_single_root(
                     ts_resolver
                         .as_ref()
                         .and_then(|r| r.resolve(spec, options.extensions.as_ref()))
+                } else if ext == "rs" {
+                    // G4.2: this match had no "rs" arm, so Rust `pub use
+                    // crate::a::Foo;` reexports (`re.resolved` is already
+                    // `None` from the parser — see rust/mod.rs) fell straight
+                    // through to `None` forever. Reuse the same Rust import
+                    // resolver the import loop below already calls; it
+                    // already strips trailing item/brace segments down to the
+                    // owning module file (G4.3/G4.4).
+                    resolve_rust_import(spec, &file, root_path, root_path)
                 } else {
                     None
                 };
@@ -869,6 +878,93 @@ fn scan_single_root(
 
     resolve_event_constants_across_files(&mut analyses);
 
+    // N10 (audit): a C-family quote-include is `Local` only when its
+    // lexically joined target actually exists in the scanned universe.
+    // parse_includes_resolved has no root to probe, so the existence check
+    // happens here, against the indexed file set: a missing header (or a
+    // path assembled from stray `..` segments) downgrades to `Unknown`, and
+    // its already-pushed edge is dropped rather than pointing at a phantom
+    // node.
+    {
+        const C_FAMILY_EXTS: &[&str] = &[
+            ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hxx", ".hh", ".m", ".mm",
+        ];
+        let is_c_family = |path: &str| C_FAMILY_EXTS.iter().any(|ext| path.ends_with(ext));
+        let indexed: HashSet<String> = analyses.iter().map(|a| a.path.clone()).collect();
+        let mut phantom_edges: HashSet<(String, String)> = HashSet::new();
+        for analysis in &mut analyses {
+            if !is_c_family(&analysis.path) {
+                continue;
+            }
+            for import in &mut analysis.imports {
+                if import.resolution == crate::types::ImportResolutionKind::Local
+                    && let Some(path) = import.resolved_path.clone()
+                    && !indexed.contains(&path)
+                {
+                    import.resolution = crate::types::ImportResolutionKind::Unknown;
+                    import.resolved_path = None;
+                    phantom_edges.insert((analysis.path.clone(), path));
+                }
+            }
+        }
+        if !phantom_edges.is_empty() {
+            graph_edges
+                .retain(|(from, to, _)| !phantom_edges.contains(&(from.clone(), to.clone())));
+        }
+    }
+
+    // H8 (post-audit): a Makefile recipe line naming an explicit script path
+    // (`$(PY) tools/probe.py`) is a dispatch fact — the honest replacement
+    // for the bare-name call synthesis N02 removed as fabrication. The
+    // parser records candidates as `Dynamic`+`Unknown`; here each one is
+    // verified against the scanned universe (N10 parity) before it earns a
+    // `Local` resolution and a `call` edge.
+    {
+        let indexed: HashSet<String> = analyses.iter().map(|a| a.path.clone()).collect();
+        let collect_edges = cfg.collect_edges
+            || (cfg.parsed.graph && options.report_path.is_some())
+            || options.impact.is_some();
+        let mut edge_pairs: HashSet<(String, String)> = graph_edges
+            .iter()
+            .map(|(from, to, _)| (from.clone(), to.clone()))
+            .collect();
+        let mut dispatch_edges: Vec<(String, String, String)> = Vec::new();
+        for analysis in &mut analyses {
+            let file_name = std::path::Path::new(&analysis.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if !crate::analyzer::makefile::is_makefile_name(file_name) {
+                continue;
+            }
+            let dir = std::path::Path::new(&analysis.path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            for import in &mut analysis.imports {
+                if import.resolved_path.is_some()
+                    || !crate::analyzer::makefile::is_recipe_script_source(&import.source)
+                {
+                    continue;
+                }
+                let Some(target) =
+                    crate::analyzer::makefile::join_recipe_path(&dir, &import.source)
+                else {
+                    continue;
+                };
+                if target == analysis.path || !indexed.contains(&target) {
+                    continue;
+                }
+                import.resolution = crate::types::ImportResolutionKind::Local;
+                import.resolved_path = Some(target.clone());
+                if collect_edges && edge_pairs.insert((analysis.path.clone(), target.clone())) {
+                    dispatch_edges.push((analysis.path.clone(), target, "call".to_string()));
+                }
+            }
+        }
+        graph_edges.extend(dispatch_edges);
+    }
+
     // Establish implicit graph edges for languages like Swift that rely on global namespace symbols.
     if cfg.collect_edges
         || (cfg.parsed.graph && options.report_path.is_some())
@@ -884,14 +980,32 @@ fn scan_single_root(
                     .map(|export| (export.name.clone(), analysis.path.clone()))
             })
             .collect();
+        // G8: path -> language lookup so a bare-name usage can only ever
+        // resolve to a same-language exporter. Without this, a Swift bare
+        // `Foundation` usage could match a same-named `class Foundation`
+        // that happens to live in a Python file elsewhere in the repo (probe
+        // evidence: vetcoders_install.py gained 26 unrelated Swift
+        // "consumers"). Both the exporter-count guard below and the final
+        // per-target check use this so cross-language name collisions can
+        // neither inflate the "unambiguous" count nor slip through as a
+        // target.
+        let path_language: HashMap<&str, &str> = analyses
+            .iter()
+            .map(|analysis| (analysis.path.as_str(), analysis.language.as_str()))
+            .collect();
         // A bare-name usage is only trustworthy when exactly one file exports
-        // that type name. With two or more exporters (nested `enum Error` in
-        // several files, same type name across Xcode targets) the edge target
-        // is a guess, and guessing wrong floods fan-in with module-sized
-        // clusters (loctree-fail.md 2026-07-25, blinksh/blink).
-        let mut implicit_exporter_count: HashMap<&str, usize> = HashMap::new();
-        for (name, _) in &implicit_symbol_exports {
-            *implicit_exporter_count.entry(name.as_str()).or_default() += 1;
+        // that type name *in the using file's own language*. With two or
+        // more same-language exporters (nested `enum Error` in several files,
+        // same type name across Xcode targets) the edge target is a guess,
+        // and guessing wrong floods fan-in with module-sized clusters
+        // (loctree-feedback.md 2026-07-25, blinksh/blink).
+        let mut implicit_exporter_count: HashMap<(&str, &str), usize> = HashMap::new();
+        for (name, path) in &implicit_symbol_exports {
+            if let Some(lang) = path_language.get(path.as_str()) {
+                *implicit_exporter_count
+                    .entry((name.as_str(), *lang))
+                    .or_default() += 1;
+            }
         }
         let mut implicit_edges = HashSet::new();
         for analysis in &analyses {
@@ -904,7 +1018,7 @@ fn scan_single_root(
                         continue;
                     }
                     if implicit_exporter_count
-                        .get(usage.name.as_str())
+                        .get(&(usage.name.as_str(), analysis.language.as_str()))
                         .copied()
                         .unwrap_or(0)
                         != 1
@@ -914,6 +1028,8 @@ fn scan_single_root(
                     if let Some(target_files) = export_index.get(&usage.name) {
                         for target in target_files {
                             if target != &analysis.path
+                                && path_language.get(target.as_str())
+                                    == Some(&analysis.language.as_str())
                                 && implicit_symbol_exports
                                     .contains(&(usage.name.clone(), target.clone()))
                                 && implicit_edges.insert((analysis.path.clone(), target.clone()))
@@ -925,6 +1041,88 @@ fn scan_single_root(
                                 ));
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // G1: Rust path-qualified calls (`crate::foo::bar()`, `Type::method()`)
+    // never go through a `use` statement, so they never land in
+    // `analysis.imports` — only the leaf identifiers ("foo", "bar") land in
+    // `local_uses`/`symbol_usages` (rust/usages.rs::extract_path_qualified_calls).
+    // Without a `use`, the import-edge loop above never sees these callers,
+    // so `impact`/`slice` on the defining file miss them entirely. Turn
+    // unambiguous usages into `call` edges, mirroring the Swift
+    // implicit_symbol guard above: only fires when exactly one file in the
+    // whole scan exports that name (a common name with several exporters is
+    // a guess, not a fact — the same G8-class noise this file already fixed
+    // once for Swift).
+    if cfg.collect_edges
+        || (cfg.parsed.graph && options.report_path.is_some())
+        || options.impact.is_some()
+    {
+        // Owned (not borrowed) pairs: `graph_edges` is mutated further down in
+        // this same block, so this snapshot must not keep it borrowed.
+        let existing_edge_pairs: HashSet<(String, String)> = graph_edges
+            .iter()
+            .map(|(from, to, _)| (from.clone(), to.clone()))
+            .collect();
+        // Only a Rust file can be the target of a Rust path-qualified call:
+        // counting exporters across every language let a lone Python `def
+        // widget()` claim a Rust caller (audit 2026-09-27, N02/P0).
+        let rust_paths: HashSet<&str> = analyses
+            .iter()
+            .filter(|a| a.language == "rs")
+            .map(|a| a.path.as_str())
+            .collect();
+        let mut rust_call_edges: HashSet<(String, String)> = HashSet::new();
+        for analysis in &analyses {
+            if analysis.language != "rs" {
+                continue;
+            }
+            for usage in &analysis.symbol_usages {
+                // `symbol_usages` holds every identifier mention, local
+                // variables included. Only a usage whose context shows the
+                // name as a `::` path segment is a path-qualified-call fact;
+                // anything else is a bare-name guess (audit N02).
+                if !path_qualified_in_context(&usage.context, &usage.name) {
+                    continue;
+                }
+                let Some(target_files) = export_index.get(&usage.name) else {
+                    continue;
+                };
+                let rust_targets: Vec<&String> = target_files
+                    .iter()
+                    .filter(|t| rust_paths.contains(t.as_str()))
+                    .collect();
+                let unambiguous = rust_targets.len() == 1;
+                for target in rust_targets {
+                    if target.as_str() == analysis.path {
+                        continue;
+                    }
+                    // Several same-language exporters: the qualifier right
+                    // before the leaf decides which file the call names —
+                    // `crate::diff::analyze()` is diff.rs even when perf.rs
+                    // also exports `analyze`. No matching qualifier, no fact.
+                    if !unambiguous {
+                        let Some(qualifier) = path_qualifier_before(&usage.context, &usage.name)
+                        else {
+                            continue;
+                        };
+                        if !module_path_matches(target, qualifier) {
+                            continue;
+                        }
+                    }
+                    if existing_edge_pairs.contains(&(analysis.path.clone(), target.clone())) {
+                        continue;
+                    }
+                    if rust_call_edges.insert((analysis.path.clone(), target.clone())) {
+                        graph_edges.push((
+                            analysis.path.clone(),
+                            target.clone(),
+                            "call".to_string(),
+                        ));
                     }
                 }
             }
@@ -2043,6 +2241,83 @@ pub(crate) fn build_py_roots(root_canon: &Path, extra_roots: &[PathBuf]) -> Vec<
 }
 
 /// Build cascades (re-export chains) from analyses
+/// True when `name` appears in `context` as a segment of a `::` path
+/// (`name::…` or `…::name`), on identifier boundaries. This is the G1
+/// call-shape gate: a bare mention of the name never counts (audit N02).
+fn path_qualified_in_context(context: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let bytes = context.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = context[from..].find(name) {
+        let begin = from + pos;
+        let end = begin + name.len();
+        let before_boundary =
+            begin == 0 || !(bytes[begin - 1].is_ascii_alphanumeric() || bytes[begin - 1] == b'_');
+        let after_boundary =
+            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if before_boundary && after_boundary {
+            let qualified_left = begin >= 2 && bytes[begin - 1] == b':' && bytes[begin - 2] == b':';
+            let qualified_right =
+                end + 1 < bytes.len() && bytes[end] == b':' && bytes[end + 1] == b':';
+            if qualified_left || qualified_right {
+                return true;
+            }
+        }
+        from = begin + 1;
+    }
+    false
+}
+
+/// For `X::name` in `context`, return `X` — the path segment immediately
+/// qualifying `name`. Used to resolve same-language homonym exporters.
+fn path_qualifier_before<'a>(context: &'a str, name: &str) -> Option<&'a str> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = context.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = context[from..].find(name) {
+        let begin = from + pos;
+        let end = begin + name.len();
+        let after_boundary =
+            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+        if after_boundary && begin >= 2 && bytes[begin - 1] == b':' && bytes[begin - 2] == b':' {
+            let qualifier_end = begin - 2;
+            let mut qualifier_start = qualifier_end;
+            while qualifier_start > 0
+                && (bytes[qualifier_start - 1].is_ascii_alphanumeric()
+                    || bytes[qualifier_start - 1] == b'_')
+            {
+                qualifier_start -= 1;
+            }
+            if qualifier_start < qualifier_end {
+                return Some(&context[qualifier_start..qualifier_end]);
+            }
+        }
+        from = begin + 1;
+    }
+    None
+}
+
+/// Does `target` (a root-relative file path) define the module named
+/// `qualifier`? `diff.rs` and `diff/mod.rs` both answer to `diff`.
+fn module_path_matches(target: &str, qualifier: &str) -> bool {
+    let path = std::path::Path::new(target);
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    match stem {
+        Some("mod") | Some("lib") | Some("main") => {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                == Some(qualifier)
+        }
+        Some(stem) => stem == qualifier,
+        None => false,
+    }
+}
+
 fn build_cascades(analyses: &[FileAnalysis]) -> Vec<(String, String)> {
     let mut cascades = Vec::new();
     for analysis in analyses {
@@ -2058,6 +2333,35 @@ fn build_cascades(analyses: &[FileAnalysis]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_qualified_gate_accepts_segments_and_rejects_bare_names() {
+        assert!(path_qualified_in_context(
+            "crate::diff::analyze(ctx)",
+            "analyze"
+        ));
+        assert!(path_qualified_in_context(
+            "crate::diff::analyze(ctx)",
+            "diff"
+        ));
+        assert!(!path_qualified_in_context("let widget = 1;", "widget"));
+        assert!(!path_qualified_in_context(
+            "crate::diff::analyzer(ctx)",
+            "analyze"
+        ));
+    }
+
+    #[test]
+    fn qualifier_before_returns_the_segment_naming_the_module() {
+        assert_eq!(
+            path_qualifier_before("crate::diff::analyze(ctx)", "analyze"),
+            Some("diff")
+        );
+        assert_eq!(path_qualifier_before("analyze(ctx)", "analyze"), None);
+        assert!(module_path_matches("app/diff.rs", "diff"));
+        assert!(module_path_matches("app/diff/mod.rs", "diff"));
+        assert!(!module_path_matches("app/perf.rs", "diff"));
+    }
     use tempfile::tempdir;
 
     #[test]

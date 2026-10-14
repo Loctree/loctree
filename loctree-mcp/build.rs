@@ -7,7 +7,7 @@
 //! otherwise indistinguishable, so an agent talking to a STALE MCP server reads
 //! the same `serverInfo.version` as a fresh one and never notices the binary
 //! lags source HEAD. Stamping the commit into the `initialize` handshake makes
-//! that gap loud — see `loctree-fail.md` ("live binary predates the committed
+//! that gap loud — see `loctree-feedback.md` ("live binary predates the committed
 //! fix").
 //!
 //! Robustness: every git call is best-effort. Outside a git checkout (crates.io

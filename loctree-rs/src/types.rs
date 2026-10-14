@@ -623,6 +623,12 @@ pub struct CommandRef {
     /// Plugin name for Tauri plugin commands (e.g., "window" from `invoke('plugin:window|set_icon')`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_name: Option<String>,
+    /// True when this call was detected only by its wrapper-shaped NAME
+    /// (`*Command*` heuristic) in a file with no Tauri import in sight.
+    /// Downstream gap analysis treats such evidence as a smell, never as a
+    /// CRITICAL missing handler (audit N06).
+    #[serde(default)]
+    pub unconfirmed_import: bool,
 }
 
 /// Casing inconsistency in command payload keys.
@@ -707,6 +713,11 @@ pub struct EventRef {
     /// True if this event uses a dynamic pattern (format!/template literal).
     #[serde(default)]
     pub is_dynamic: bool,
+    /// Receiver of a member-expression call (`server` in `server.listen(..)`),
+    /// recorded so spelling alone cannot promote a foreign API to a Tauri
+    /// event (audit N06). `None` for bare calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
 }
 
 /// Python concurrency race indicator

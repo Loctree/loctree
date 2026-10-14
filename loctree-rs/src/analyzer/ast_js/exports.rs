@@ -245,6 +245,36 @@ impl<'a> JsVisitor<'a> {
                 ));
                 // Interfaces don't have executable code bodies (calls), so no need to traverse deep for commands
             }
+            ExportDefaultDeclarationKind::ObjectExpression(obj) => {
+                // `export default { findByRunId, getJob() {...} }` — keep
+                // pushing the opaque "default" marker (so `import X from
+                // './f'` resolution keeps working) but ALSO walk every
+                // object-literal member into its own ExportSymbol. Before
+                // this, every member vanished behind the single "default"
+                // export: `loct dead` reported 0 dead candidates for a file
+                // where every member was actually unimported (false
+                // negative). `kind: "default_object_member"` marks these as
+                // not a normal named export.
+                self.analysis.exports.push(ExportSymbol::new(
+                    "default".to_string(),
+                    "default",
+                    "default",
+                    Some(line),
+                ));
+                for prop in &obj.properties {
+                    if let ObjectPropertyKind::ObjectProperty(op) = prop
+                        && let Some(name) = default_object_member_name(&op.key)
+                    {
+                        let member_line = self.get_line(op.span);
+                        self.analysis.exports.push(ExportSymbol::new(
+                            name,
+                            "default_object_member",
+                            "default",
+                            Some(member_line),
+                        ));
+                    }
+                }
+            }
             _ => {
                 self.analysis.exports.push(ExportSymbol::new(
                     "default".to_string(),
@@ -265,5 +295,18 @@ impl<'a> JsVisitor<'a> {
             kind: ReexportKind::Star,
             resolved,
         });
+    }
+}
+
+/// Best-effort static name for a default-exported object-literal member
+/// (`export default { findByRunId, getJob() {} }`). Handles the two shapes
+/// that carry a name statically: a plain/shorthand identifier key and a
+/// string-literal key. Computed keys (`{ [dynamicKey]: fn }`) have no
+/// statically-known name and are skipped rather than guessed at.
+fn default_object_member_name(key: &PropertyKey<'_>) -> Option<String> {
+    match key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.to_string()),
+        PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+        _ => None,
     }
 }

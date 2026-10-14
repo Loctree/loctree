@@ -511,6 +511,14 @@ pub(crate) fn git_untracked_source_paths(root: &Path) -> Option<Vec<String>> {
 ///   `loct context` / auto-artifact write is what needs the entry,
 /// - asks `git check-ignore` (honors global excludes and nested ignore
 ///   files) instead of re-implementing gitignore semantics,
+/// - H10: only touches `.gitignore` when it is safe to touch — untracked or
+///   absent. A `.gitignore` already tracked/committed in a foreign repo is
+///   someone else's file under version control; appending to it out from
+///   under the operator without asking is the wrong default (flipped from
+///   the previous "append unless LOCT_NO_GITIGNORE" polarity). The hard
+///   suppress (`LOCT_NO_GITIGNORE`) and an explicit force opt-in
+///   (`LOCT_FORCE_GITIGNORE_MUTATION`) both still work, for compatibility
+///   and for the operator who really does want it touched,
 /// - on any git uncertainty it keeps its hands off the user's file.
 ///
 /// Returns `Ok(true)` when the entry was appended. The caller owns the loud
@@ -536,6 +544,10 @@ fn ensure_loctree_gitignore_entry(root: &Path) -> io::Result<bool> {
     }
 
     let path = root.join(".gitignore");
+    if path.exists() && gitignore_is_tracked(root) && !gitignore_force_mutation_enabled() {
+        return Ok(false);
+    }
+
     let mut body = match fs::read_to_string(&path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
@@ -547,6 +559,28 @@ fn ensure_loctree_gitignore_entry(root: &Path) -> io::Result<bool> {
     body.push_str("# Loctree artifacts (added by loct scan)\n.loctree/\n");
     write_atomic(&path, body)?;
     Ok(true)
+}
+
+/// True when `.gitignore` at `root` is tracked by git
+/// (`git ls-files --error-unmatch`). Best-effort: any git uncertainty
+/// (command failure, no git on PATH) is treated as "not tracked" so a
+/// fresh/absent file still gets the existing safe-append behavior — this
+/// only needs to positively identify the "tracked in a foreign repo" case,
+/// never to prove the negative.
+fn gitignore_is_tracked(root: &Path) -> bool {
+    Command::new("git")
+        .args(["ls-files", "--error-unmatch", ".gitignore"])
+        .current_dir(root)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Explicit opt-in override for H10's polarity flip: forces the gitignore
+/// append even when `.gitignore` is tracked by git. Off by default.
+fn gitignore_force_mutation_enabled() -> bool {
+    std::env::var_os("LOCT_FORCE_GITIGNORE_MUTATION")
+        .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// True when `LOCT_NO_GITIGNORE` opts out of the first-scan gitignore append.
@@ -929,6 +963,60 @@ fn resolve_declared_path(root: &Path, raw: &str) -> Option<(String, bool)> {
     Some((normalize_snapshot_path(&rel.to_string_lossy()), exists))
 }
 
+/// F2a fallback: search under `root` (the manifest's own directory) for a
+/// file matching `{mod_rel}.py` or `{mod_rel}/__init__.py` at any depth,
+/// bounded to that subtree. Used only after the four fixed monorepo-agnostic
+/// shapes in `collect_declared_entrypoints` have already missed. Returns the
+/// shallowest match (fewest path components) so an ordinary layout wins over
+/// a coincidental deeper duplicate; skips common noise directories that
+/// would otherwise make this slow or match the wrong copy.
+fn find_python_module_under_root(root: &Path, mod_rel: &str) -> Option<String> {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        "target",
+        ".loctree",
+    ];
+    let suffix_py = format!("{}.py", mod_rel);
+    let suffix_init = format!("{}/__init__.py", mod_rel);
+
+    let mut best: Option<(usize, PathBuf)> = None;
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !(e.file_type().is_dir() && SKIP_DIRS.iter().any(|d| name == *d))
+        })
+    {
+        let Ok(entry) = entry else { continue };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+        let rel_str = normalize_snapshot_path(&rel.to_string_lossy());
+        if rel_str.ends_with(&suffix_py) || rel_str.ends_with(&suffix_init) {
+            let depth = rel.components().count();
+            if best
+                .as_ref()
+                .is_none_or(|(best_depth, _)| depth < *best_depth)
+            {
+                best = Some((depth, entry.path().to_path_buf()));
+            }
+        }
+    }
+    best.map(|(_, path)| {
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        normalize_snapshot_path(&rel.to_string_lossy())
+    })
+}
+
 fn note_for_declared_path(path: &str, source: &str) -> Option<String> {
     let lowered = path.to_lowercase();
     if source.contains("types") || lowered.ends_with(".d.ts") {
@@ -1142,6 +1230,17 @@ pub(crate) fn collect_declared_entrypoints(summary: &ManifestSummary) -> Vec<Dec
                     resolved_path = Some(cand);
                     break;
                 }
+            }
+
+            // F2a: monorepo/hatch layouts nest the package deeper than the
+            // four fixed shapes above (e.g. `apps/api/pkg/wrappers.py` for a
+            // `pkg.wrappers:main` script), so every one of those entrypoints
+            // was reported `resolved: false` even though the module exists.
+            // Bounded to the manifest's own subtree (never a full-disk
+            // search); prefers the shallowest match so an ordinary layout
+            // still wins over a coincidental nested duplicate.
+            if resolved_path.is_none() {
+                resolved_path = find_python_module_under_root(&root, &mod_rel);
             }
 
             if let Some(path) = resolved_path {
@@ -1612,6 +1711,12 @@ pub struct Snapshot {
     /// every existing consumer of this struct sees the same wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_graph: Option<crate::symbols::SymbolGraph>,
+    /// N4 (round-2): which paths the gather walk excluded, with reasons and a
+    /// capped path sample. `None` for snapshots produced before scan
+    /// diagnostics existed. Optional + `skip_serializing_if` keeps the wire
+    /// shape byte-compatible, so no schema version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_diagnostics: Option<crate::fs_utils::GatherDiagnostics>,
 }
 
 /// Stable content fingerprint for a snapshot.
@@ -1708,6 +1813,7 @@ impl Snapshot {
             barrels: Vec::new(),
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         }
     }
 
@@ -2486,8 +2592,8 @@ impl Snapshot {
     /// Git is a hard project boundary. Once we reach a directory that has
     /// `.git` (directory *or* worktree file) we stop — even if no cache exists
     /// yet. Walking further would pick up a parent monorepo's snapshot
-    /// (loctree-fail 2026-08-10/11: linked Codescribe worktrees nested under
-    /// `~/.vibecrafted` were served the parent atlas while the identity header
+    /// (loctree-feedback 2026-08-10/11: linked Codescribe worktrees nested under
+    /// `~/internal-artifacts` were served the parent atlas while the identity header
     /// still named the worktree).
     pub fn find_loctree_root(start: &Path) -> Option<PathBuf> {
         let mut current = start.canonicalize().ok()?;
@@ -2576,8 +2682,8 @@ impl Snapshot {
     ///
     /// # Examples
     /// ```ignore
-    /// // Given snapshot with root "/Users/foo/project"
-    /// snapshot.normalize_path("/Users/foo/project/src/main.rs") // => "src/main.rs"
+    /// // Given snapshot with root "/home/foo/project"
+    /// snapshot.normalize_path("/home/foo/project/src/main.rs") // => "src/main.rs"
     /// snapshot.normalize_path("./src/main.rs") // => "src/main.rs"
     /// snapshot.normalize_path("src\\main.rs") // => "src/main.rs"
     /// ```
@@ -3280,6 +3386,7 @@ pub fn acquire_snapshot(
 ) -> io::Result<Snapshot> {
     let snapshot_root = resolve_snapshot_root_with_strategy(roots, opts.strategy);
     let requested_roots = normalize_requested_roots_for_scope_compare(roots);
+    let mut rebuild_invalid_cache = false;
 
     // `--include-ignored`: build an ephemeral, non-persisted superset that also
     // contains `.loctignore`-excluded files (marked `ignored=true`). The cached
@@ -3423,7 +3530,27 @@ pub fn acquire_snapshot(
                     eprintln!("[loct] No snapshot found, running initial scan...");
                 }
             }
-            Err(e) => return Err(e), // Other errors (corruption, etc.) - fail
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                // A cache from another binary can carry enum variants this
+                // version cannot deserialize. It is derived data: rebuild it
+                // through the normal scan authority, never relax the schema
+                // or silently drop facts. Explicit read-only modes still fail.
+                if opts.no_scan || opts.fail_stale {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "Snapshot cache is incompatible or invalid: {e}. Automatic rebuild is disabled; run 'loct scan --fresh' to refresh."
+                        ),
+                    ));
+                }
+                rebuild_invalid_cache = true;
+                if !opts.quiet {
+                    eprintln!(
+                        "[loct] Snapshot cache is incompatible or invalid ({e}); rebuilding from source..."
+                    );
+                }
+            }
+            Err(e) => return Err(e), // Permission/I/O errors must not trigger a rebuild.
         }
     } else {
         // --fresh: force rescan
@@ -3443,7 +3570,7 @@ pub fn acquire_snapshot(
         .cloned()
         .unwrap_or_else(|| snapshot_root.clone());
     let mut parsed = unified_scan_args(&universe_root, opts.verbose);
-    parsed.full_scan = opts.full_scan;
+    parsed.full_scan = opts.full_scan || rebuild_invalid_cache;
     parsed.force_non_git = opts.force_non_git;
     parsed.output = if opts.json {
         OutputMode::Json
@@ -3684,6 +3811,22 @@ pub(crate) fn build_snapshot_for_strategy(
 
     // Build the snapshot from scan results
     let mut snapshot = Snapshot::new(root_list.iter().map(|p| p.display().to_string()).collect());
+
+    // N4 (round-2): drain the gather walk's exclusion diagnostics for each
+    // scanned root so universe accounting can name excluded paths instead of
+    // a bare `outside_snapshot` boundary. Diagnostics are recorded by
+    // `fs_utils::gather_files` during `scan_roots` above.
+    {
+        let mut scan_diagnostics = crate::fs_utils::GatherDiagnostics::default();
+        for root in root_list {
+            if let Some(diag) = crate::fs_utils::take_gather_diagnostics(root) {
+                scan_diagnostics.merge(diag);
+            }
+        }
+        if !scan_diagnostics.is_empty() {
+            snapshot.scan_diagnostics = Some(scan_diagnostics);
+        }
+    }
 
     // Populate files from all contexts
     for ctx in &scan_results.contexts {
@@ -4111,7 +4254,7 @@ pub(crate) fn build_snapshot_for_strategy(
             }
             Err(err) => {
                 artifacts_spinner.finish_error("Failed to generate artifacts");
-                eprintln!("[loctree][warn] failed to write auto artifacts: {}", err);
+                auto_artifacts_failure(&snapshot_root, err)?;
             }
         }
     }
@@ -4134,6 +4277,31 @@ pub(crate) fn build_snapshot_for_strategy(
 /// (prints summary). For internal scans that should be quiet, use `run_init_with_options` directly.
 pub fn run_init(root_list: &[PathBuf], parsed: &ParsedArgs) -> io::Result<()> {
     run_init_with_options(root_list, parsed, false)
+}
+
+/// Decide what a failed auto-artifact write means for the run.
+///
+/// Artifacts are best effort: a failed HTML render must not fail a scan whose
+/// snapshot is already saved, so that stays a warning. But when the snapshot
+/// directory itself is gone — the cache was cleaned under a running scan —
+/// the snapshot saved earlier in this run is gone with it, and the run has
+/// nothing to show. Warning and exiting 0 would report a success that does
+/// not exist; fail instead, so the operator re-runs.
+pub(crate) fn auto_artifacts_failure(snapshot_root: &Path, err: io::Error) -> io::Result<()> {
+    let artifacts_dir = Snapshot::artifacts_dir(snapshot_root);
+    let snapshot_file = Snapshot::snapshot_path(snapshot_root);
+    if !artifacts_dir.is_dir() || !snapshot_file.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "snapshot cache for this scan disappeared while artifacts were being written ({}); \
+                 the snapshot saved earlier in this run is gone too — re-run `loct` (underlying error: {err})",
+                artifacts_dir.display()
+            ),
+        ));
+    }
+    eprintln!("[loctree][warn] failed to write auto artifacts: {err}");
+    Ok(())
 }
 
 /// In auto mode, generate the full set of analysis artifacts in the artifact directory.
@@ -4466,6 +4634,7 @@ pub(crate) fn write_auto_artifacts(
             snapshot_root,
         )),
         symbol_graph: None,
+        scan_diagnostics: None,
     };
 
     let sarif_content = generate_sarif_string(SarifInputs {
@@ -5008,7 +5177,7 @@ mod tests {
     #[test]
     #[serial]
     fn perception_scan_does_not_mutate_gitignore() {
-        // loctree-fail 2026-07-26 / 2026-08-02: impact/slice first-touch used to
+        // loctree-feedback 2026-07-26 / 2026-08-02: impact/slice first-touch used to
         // append `.loctree/` to `.gitignore`. Perception auto-scan must leave
         // the checkout alone; only explicit scan/auto/watch set the mutation bit.
         let (_cache_dir, _cache_env) = test_env::isolated_cache();
@@ -5225,6 +5394,88 @@ mod tests {
         .expect("strict no-scan acquire must reuse the fresh dirty snapshot");
 
         assert_eq!(acquired.fingerprint(), snapshot.fingerprint());
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_rebuilds_incompatible_cache_without_losing_source_symbols() {
+        let (_cache_dir, _cache_env) = test_env::isolated_cache();
+        let tmp = TempDir::new().expect("temp project");
+        let root = tmp.path();
+        std::fs::write(root.join("lib.rs"), "pub fn current_symbol() {}\n").expect("write source");
+        init_git_repo(root);
+        let snapshot = Snapshot::new(vec![root.display().to_string()]);
+        snapshot.save(root).expect("save cache");
+        let path = Snapshot::snapshot_path(root);
+        // A syntactically valid cache with an unknown enum variant, as seen
+        // when switching binaries with different symbol-language support.
+        let mut value = serde_json::to_value(&snapshot).expect("serialize cache");
+        value["symbol_graph"] = serde_json::json!({
+            "symbols": [{"language": "future_language"}]
+        });
+        std::fs::write(&path, value.to_string()).expect("write incompatible cache");
+        assert_eq!(
+            Snapshot::load(root).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let acquired = acquire_snapshot(
+            &[root.to_path_buf()],
+            SnapshotReusePolicy::ReuseFence,
+            &AcquireOptions {
+                quiet: true,
+                strategy: SnapshotRootStrategy::Exact,
+                ..Default::default()
+            },
+        )
+        .expect("automatically rebuild derived cache");
+        assert!(acquired.files.iter().any(|file| {
+            file.exports
+                .iter()
+                .any(|symbol| symbol.name == "current_symbol")
+        }));
+        assert_eq!(
+            Snapshot::load(root)
+                .expect("persisted replacement")
+                .fingerprint(),
+            acquired.fingerprint()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_invalid_cache_respects_no_scan_and_fail_stale() {
+        let (_cache_dir, _cache_env) = test_env::isolated_cache();
+        let tmp = TempDir::new().expect("temp project");
+        let root = tmp.path();
+        std::fs::write(root.join("lib.rs"), "pub fn source() {}\n").expect("write source");
+        init_git_repo(root);
+        Snapshot::new(vec![root.display().to_string()])
+            .save(root)
+            .expect("save cache");
+        let path = Snapshot::snapshot_path(root);
+        let invalid = "{ invalid cached json";
+        std::fs::write(&path, invalid).expect("write invalid cache");
+        for (no_scan, fail_stale) in [(true, false), (false, true)] {
+            let error = acquire_snapshot(
+                &[root.to_path_buf()],
+                SnapshotReusePolicy::TrustExisting,
+                &AcquireOptions {
+                    no_scan,
+                    fail_stale,
+                    quiet: true,
+                    strategy: SnapshotRootStrategy::Exact,
+                    ..Default::default()
+                },
+            )
+            .expect_err("explicit read-only policy must refuse rebuild");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("loct scan --fresh"));
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("cache retained"),
+                invalid
+            );
+        }
     }
 
     fn init_git_repo(root: &Path) {
@@ -5576,7 +5827,7 @@ mod tests {
     #[test]
     #[serial]
     fn find_loctree_root_stops_at_linked_worktree_not_parent_cache() {
-        // loctree-fail 2026-08-10/11: linked worktree nested under a larger
+        // loctree-feedback 2026-08-10/11: linked worktree nested under a larger
         // git-controlled infrastructure root must not inherit the parent's
         // cache when the worktree itself is a distinct git checkout (.git file).
         let (_cache_dir, _cache_env) = test_env::isolated_cache();
@@ -6105,6 +6356,168 @@ mod tests {
         let expected = expected.canonicalize().unwrap_or(expected);
         assert_eq!(found, expected);
     }
+
+    #[test]
+    fn f2a_pyproject_script_resolves_two_levels_deeper_than_fixed_shapes() {
+        // Monorepo/hatch layout: the module lives at
+        // `apps/api/pkg/wrappers.py`, two directories deeper than any of the
+        // four fixed shapes `collect_declared_entrypoints` used to probe
+        // (`pkg/wrappers.py`, `pkg/wrappers/__init__.py`,
+        // `src/pkg/wrappers.py`, `src/pkg/wrappers/__init__.py`).
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("apps/api/pkg")).expect("mkdir nested pkg");
+        std::fs::write(
+            root.join("apps/api/pkg/wrappers.py"),
+            "def main():\n    pass\n",
+        )
+        .expect("write wrappers.py");
+
+        let summary = ManifestSummary {
+            root: root.display().to_string(),
+            package_json: None,
+            cargo_toml: None,
+            pyproject_toml: Some(PyProjectSummary {
+                script_entries: vec![ManifestEntry {
+                    key: "mytool".to_string(),
+                    path: "pkg.wrappers:main".to_string(),
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let declared = collect_declared_entrypoints(&summary);
+        let entry = declared
+            .iter()
+            .find(|d| d.source == "pyproject.toml:scripts:mytool")
+            .expect("script entrypoint present");
+        assert!(
+            entry.resolved,
+            "nested monorepo module must resolve: {entry:?}"
+        );
+        assert!(entry.exists, "resolved path must exist on disk: {entry:?}");
+        assert_eq!(entry.path, "apps/api/pkg/wrappers.py");
+    }
+
+    #[test]
+    fn f2a_pyproject_script_still_prefers_the_four_fixed_shapes_first() {
+        // When a fixed shape (`{mod}.py`) already resolves, the walk
+        // fallback must not run/override it — same-name deeper duplicates
+        // elsewhere in the tree must not win over the canonical layout.
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path();
+        std::fs::write(root.join("wrappers.py"), "def main():\n    pass\n")
+            .expect("write canonical wrappers.py");
+        std::fs::create_dir_all(root.join("deep/nested")).expect("mkdir deep/nested");
+        std::fs::write(
+            root.join("deep/nested/wrappers.py"),
+            "def main():\n    pass\n",
+        )
+        .expect("write decoy wrappers.py");
+
+        let summary = ManifestSummary {
+            root: root.display().to_string(),
+            package_json: None,
+            cargo_toml: None,
+            pyproject_toml: Some(PyProjectSummary {
+                script_entries: vec![ManifestEntry {
+                    key: "mytool".to_string(),
+                    path: "wrappers:main".to_string(),
+                }],
+                ..Default::default()
+            }),
+        };
+
+        let declared = collect_declared_entrypoints(&summary);
+        let entry = declared
+            .iter()
+            .find(|d| d.source == "pyproject.toml:scripts:mytool")
+            .expect("script entrypoint present");
+        assert_eq!(entry.path, "wrappers.py", "fixed shape must win: {entry:?}");
+    }
+
+    #[test]
+    fn h10_gitignore_append_skipped_when_gitignore_is_tracked() {
+        // H10 polarity flip: a `.gitignore` already tracked/committed in a
+        // foreign repo must never be silently mutated by a scan. Only an
+        // untracked (or absent) `.gitignore` is safe to touch.
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path();
+        run_git(root, &["init"]);
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("seed gitignore");
+        run_git(root, &["add", ".gitignore"]);
+        run_git(root, &["commit", "-m", "commit gitignore"]);
+
+        let appended = ensure_loctree_gitignore_entry(root).expect("call succeeds");
+        assert!(
+            !appended,
+            "must not append to a .gitignore that is tracked by git"
+        );
+        let body = std::fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
+        assert_eq!(
+            body, "target/\n",
+            "tracked .gitignore must be left byte-for-byte as-is"
+        );
+    }
+
+    #[test]
+    fn h10_gitignore_append_still_works_on_untracked_gitignore() {
+        // Regression guard: the existing "safe to touch" path (untracked or
+        // absent .gitignore) must keep working after the polarity flip.
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path();
+        run_git(root, &["init"]);
+        // Present on disk but never `git add`-ed: untracked.
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("seed gitignore");
+
+        let appended = ensure_loctree_gitignore_entry(root).expect("call succeeds");
+        assert!(appended, "untracked .gitignore is safe to append to");
+        let body = std::fs::read_to_string(root.join(".gitignore")).expect("read gitignore");
+        assert!(body.lines().any(|line| line.trim() == ".loctree/"));
+    }
+
+    #[test]
+    fn h10_reuse_fence_hash_unchanged_by_loctree_content() {
+        // H10 (part 2, regression lock): `.loctree/` is never part of the
+        // indexed file universe (hidden-dir filter), so `compute_reuse_fence`
+        // — which only ever hashes `self.files` — must be totally blind to
+        // whatever lives inside `.loctree/` on disk. Writing/mutating
+        // `.loctree/` content between two computations must not change the
+        // fence, or a checked-in `.loctree/` dir could cause an endless
+        // [DRIFT] rescan loop.
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path();
+        std::fs::write(root.join("main.rs"), "fn main() {}\n").expect("seed source");
+
+        let mut snapshot = Snapshot::new(vec![root.display().to_string()]);
+        snapshot
+            .files
+            .push(FileAnalysis::new("main.rs".to_string()));
+
+        let fence_before = snapshot.compute_reuse_fence(root).expect("fence 1");
+
+        std::fs::create_dir_all(root.join(".loctree/context-atlas")).expect("mkdir .loctree");
+        std::fs::write(
+            root.join(".loctree/context-atlas/x.json"),
+            "{\"anything\":true}",
+        )
+        .expect("write loctree artifact");
+
+        let fence_after = snapshot.compute_reuse_fence(root).expect("fence 2");
+        assert_eq!(
+            fence_before, fence_after,
+            ".loctree/ content must never affect the reuse fence"
+        );
+
+        // Mutate the artifact again — still must not move the fence.
+        std::fs::write(
+            root.join(".loctree/context-atlas/x.json"),
+            "{\"anything\":false,\"more\":123}",
+        )
+        .expect("mutate loctree artifact");
+        let fence_after_mutation = snapshot.compute_reuse_fence(root).expect("fence 3");
+        assert_eq!(fence_before, fence_after_mutation);
+    }
 }
 
 #[cfg(test)]
@@ -6212,6 +6625,43 @@ mod cache_tests {
         assert!(
             message.contains("LOCT_CACHE_DIR"),
             "ENOSPC hint should teach alternate cache location: {message}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn auto_artifacts_failure_is_fatal_only_when_the_cache_vanished() {
+        let tmp = TempDir::new().expect("create temp dir");
+        let custom = tmp.path().join("custom-cache");
+        let _guard = EnvVarGuard::set_path(CACHE_ENV, &custom);
+        let root = tmp.path().join("project");
+        fs::create_dir_all(&root).expect("project root");
+
+        let artifacts_dir = Snapshot::artifacts_dir(&root);
+        let snapshot_file = Snapshot::snapshot_path(&root);
+        fs::create_dir_all(&artifacts_dir).expect("artifacts dir");
+        fs::write(&snapshot_file, "{}").expect("snapshot file");
+
+        // Snapshot in place: a best-effort artifact failure stays a warning.
+        auto_artifacts_failure(&root, io::Error::other("html render failed"))
+            .expect("render failure must not fail a scan whose snapshot is saved");
+
+        // Snapshot file gone (directory still there): the run lost its product.
+        fs::remove_file(&snapshot_file).expect("drop snapshot file");
+        let err = auto_artifacts_failure(&root, io::Error::other("tmp dir missing"))
+            .expect_err("missing snapshot must fail the run");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // Whole cache directory removed under the run — the case seen on
+        // oh-my-pi when the cache was cleaned mid-scan.
+        fs::remove_dir_all(&artifacts_dir).expect("drop cache dir");
+        let err = auto_artifacts_failure(&root, io::Error::from_raw_os_error(2))
+            .expect_err("vanished cache dir must fail the run");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let message = err.to_string();
+        assert!(
+            message.contains("disappeared") && message.contains("re-run `loct`"),
+            "error must name the cause and the remedy: {message}"
         );
     }
 

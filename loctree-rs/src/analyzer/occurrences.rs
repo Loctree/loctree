@@ -30,6 +30,11 @@ use summary::{
     suggested_next,
 };
 
+/// C: entity-first grouping for the default (non-`--literal`) CLI summary.
+/// Re-exported here because `summary` is a private submodule of this one;
+/// `cli::dispatch::handlers::occurrences` reaches these through this path.
+pub use summary::{GroupedEntity, group_by_entity};
+
 /// Local, single-line classification of what an occurrence *looks like*.
 ///
 /// This is **not** dataflow and never claims to be. It reads only the one line
@@ -324,8 +329,25 @@ pub struct NearMatch {
 pub struct RoleSummary {
     /// True symbol-definition sites.
     pub definitions: usize,
-    /// Reference / mutation / field-emission / local-binding sites.
+    /// Reference / mutation / field-emission / local-binding sites, summed.
+    /// Kept as the historical total; `references` / `mutations` /
+    /// `field_emissions` / `local_bindings` below are the same count split by
+    /// occurrence kind so a kwarg/struct-field-shorthand hit or a local
+    /// binding is never mistaken for an actual call site.
     pub callsites: usize,
+    /// `MatchRole::Reference` sites — the actual read/call sites.
+    #[serde(default)]
+    pub references: usize,
+    /// `MatchRole::Mutation` sites (`x = …`, `x += …`, …).
+    #[serde(default)]
+    pub mutations: usize,
+    /// `MatchRole::FieldEmission` sites (struct-literal field shorthand) — not
+    /// a call, even though the prior undifferentiated bucket counted it as one.
+    #[serde(default)]
+    pub field_emissions: usize,
+    /// `MatchRole::LocalBinding` sites — a local `let` rebinding, not a call.
+    #[serde(default)]
+    pub local_bindings: usize,
     /// Import / `use` binding sites.
     pub imports: usize,
     /// Comment / string-literal / data-attribute sites (text, not live code).
@@ -384,13 +406,21 @@ pub struct SymbolAnchor {
 /// rather than filled with `SemanticGuess` filler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnclosingFacts {
-    /// Number of snapshot import edges pointing at the hit's file (fan-in).
+    /// Number of snapshot import edges pointing at the hit's FILE (file-level
+    /// fan-in). This is a file fact, not a symbol fact: a 4-importer file can
+    /// still export a symbol nobody calls — see `symbol_usages` for that.
     pub fan_in: usize,
     /// True when the enclosing symbol is a snapshot export (not merely local).
     pub exported: bool,
     /// Kind of the enclosing symbol when known (`func`, `var`, `class`, …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol_kind: Option<String>,
+    /// Number of occurrences in the CURRENT hit set (this query's scan) that
+    /// resolve to the same `resolved_definition.symbol_id` as this occurrence,
+    /// excluding the definition site itself. This is the symbol-scoped usage
+    /// count `fan_in` is not: a file can have fan-in 4 while the specific
+    /// exported symbol has zero callers.
+    pub symbol_usages: usize,
     /// Authority of these facts. Edge fan-in is `repo_verified`; export membership
     /// is `loctree_derived` from the analyzer symbol table.
     pub authority: &'static str,
@@ -417,6 +447,24 @@ pub struct HitShape {
     /// One-line agent-facing note when the shape is informative.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// Verdict that this query's name resolves to more than one distinct,
+/// unconnected definition — i.e. these are different entities that happen to
+/// share a name, not one symbol the resolver failed to pin down.
+///
+/// `None` (the field is omitted from [`OccurrenceResults`]) whenever fewer
+/// than two distinct files define the name, or whenever every candidate file
+/// is connected to another by a snapshot import edge — that shape reads more
+/// like a re-export chain than unrelated namesakes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamesakesVerdict {
+    /// Total number of distinct definition sites sharing this name.
+    pub distinct_definitions: usize,
+    /// Files that define the name, sorted and deduplicated.
+    pub files: Vec<String>,
+    /// Fixed, honest framing — never a per-instance guess at *why* they diverged.
+    pub note: &'static str,
 }
 
 /// 1-based point in a literal occurrence range.
@@ -487,6 +535,15 @@ pub struct LiteralOccurrence {
     /// snapshot enrichment; `false` on default (clean-universe) reads.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignored: bool,
+    /// Short, snapshot-proven label joined from an existing `FileAnalysis`
+    /// record whose line matches this occurrence (a route decorator, a log
+    /// call's level, an event emit/listen, a Tauri command invocation) or a
+    /// coarse file-level fact (test file, dynamic-import target) when no
+    /// line-exact record applies. `None` when enrichment did not run or no
+    /// record joined. Additive — never a guess, always read verbatim off the
+    /// snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_label: Option<String>,
 }
 
 /// A per-file occurrence count, emitted by the `group_by_file` rollup.
@@ -543,6 +600,11 @@ pub struct UniverseExclusion {
     pub kind: String,
     pub files: Option<usize>,
     pub reason: String,
+    /// N4 (round-2): capped sample of excluded paths (scan-root-relative).
+    /// Truncated by construction - when `files` exceeds `sample.len()` the
+    /// sample is only the first N paths; `reason` says so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample: Vec<String>,
 }
 
 /// Machine-readable declaration of the file universe behind a result.
@@ -563,6 +625,24 @@ pub struct IndexedUniverse {
     pub exclusions: Vec<UniverseExclusion>,
 }
 
+/// H9: count `git ls-files` at `root`, or `None` for a non-git directory or
+/// any git failure — never a guessed zero. Kept as a thin, separately callable
+/// wrapper around `git` specifically so [`IndexedUniverse::from_analyses`] can
+/// inject the count in tests instead of spawning a process.
+fn git_tracked_file_count(root: &std::path::Path) -> Option<usize> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("ls-files")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(text.lines().filter(|line| !line.is_empty()).count())
+}
+
 impl Default for IndexedUniverse {
     fn default() -> Self {
         Self::from_counts(
@@ -581,17 +661,60 @@ impl IndexedUniverse {
         stats: crate::analyzer::classify::ArtifactFenceStats,
         ignored_files: usize,
     ) -> Self {
+        Self::from_counts_with_diagnostics(indexed_files, scanned_files, stats, ignored_files, None)
+    }
+
+    /// N4 (round-2): when the gather walk recorded scan diagnostics, the
+    /// permanent `outside_snapshot` boundary gets a real count and each
+    /// exclusion reason becomes a named exclusion with a capped path sample -
+    /// instead of `files: None` for a class the scan actually counted.
+    fn from_counts_with_diagnostics(
+        indexed_files: usize,
+        scanned_files: usize,
+        stats: crate::analyzer::classify::ArtifactFenceStats,
+        ignored_files: usize,
+        scan_diagnostics: Option<&crate::fs_utils::GatherDiagnostics>,
+    ) -> Self {
         let unreadable = indexed_files.saturating_sub(scanned_files);
-        let mut exclusions = vec![UniverseExclusion {
-            kind: "outside_snapshot".to_string(),
-            files: None,
-            reason: "ignored, unsupported, heavy build, or otherwise unindexed paths are outside this result; the snapshot does not retain their count".to_string(),
-        }];
+        let mut exclusions = match scan_diagnostics {
+            Some(diag) if !diag.is_empty() => {
+                let mut exclusions = vec![UniverseExclusion {
+                    kind: "outside_snapshot".to_string(),
+                    files: Some(diag.total()),
+                    reason: "paths excluded during the scan walk; per-reason counts and path samples are listed in sibling exclusions".to_string(),
+                    sample: Vec::new(),
+                }];
+                for bucket in &diag.buckets {
+                    let mut reason = bucket.reason.describe().to_string();
+                    if bucket.count > bucket.sample.len() {
+                        reason.push_str(&format!(
+                            "; sample truncated to first {} of {} paths",
+                            bucket.sample.len(),
+                            bucket.count
+                        ));
+                    }
+                    exclusions.push(UniverseExclusion {
+                        kind: bucket.reason.as_str().to_string(),
+                        files: Some(bucket.count),
+                        reason,
+                        sample: bucket.sample.clone(),
+                    });
+                }
+                exclusions
+            }
+            _ => vec![UniverseExclusion {
+                kind: "outside_snapshot".to_string(),
+                files: None,
+                reason: "ignored, unsupported, heavy build, or otherwise unindexed paths are outside this result; the snapshot does not retain their count".to_string(),
+                sample: Vec::new(),
+            }],
+        };
         if unreadable > 0 {
             exclusions.push(UniverseExclusion {
                 kind: "unreadable_or_non_utf8".to_string(),
                 files: Some(unreadable),
                 reason: "indexed paths whose bytes could not be scanned as UTF-8 text".to_string(),
+                sample: Vec::new(),
             });
         }
 
@@ -662,11 +785,12 @@ impl IndexedUniverse {
                 stats.record(class);
             }
         }
-        Self::from_counts(
+        Self::from_counts_with_diagnostics(
             indexed_files,
             scanned_files.min(indexed_files),
             stats,
             ignored_files,
+            snapshot.scan_diagnostics.as_ref(),
         )
     }
 
@@ -676,7 +800,32 @@ impl IndexedUniverse {
     /// every row is both indexed and scanned. Git tracked/untracked origin is
     /// still intentionally unknown; [`Self::from_counts`] preserves that
     /// distinction instead of inventing zeros.
-    pub fn from_analyses(analyses: &[FileAnalysis]) -> Self {
+    pub fn from_analyses(analyses: &[FileAnalysis], root: Option<&std::path::Path>) -> Self {
+        // The tracked-file denominator must come from the SELECTED project's
+        // root, never the process cwd: an MCP server or a `--root` CLI call
+        // runs with a foreign cwd, and counting that repo's files poisons the
+        // coverage ratio (audit N04). No root, no denominator — `None` keeps
+        // the honest "unknown" instead of a confidently wrong number.
+        let tracked = root.and_then(git_tracked_file_count);
+        Self::from_analyses_with_tracked(analyses, tracked)
+    }
+
+    /// H9: testable core of [`Self::from_analyses`].
+    ///
+    /// `indexed_files`/`scanned_files` were both `analyses.len()`, making the
+    /// coverage ratio tautologically 100% and hiding any dot-dir or otherwise
+    /// silently-excluded file from the accounting entirely. `tracked` (when
+    /// known) makes that gap visible: when it exceeds the scanned count, the
+    /// accounting stops claiming full coverage instead of asserting it by
+    /// construction.
+    ///
+    /// `tracked` is an injected parameter rather than a `git` call made here
+    /// so this can be unit tested without spawning a process — see
+    /// [`Self::from_analyses`] for the real (git-backed) caller.
+    pub(crate) fn from_analyses_with_tracked(
+        analyses: &[FileAnalysis],
+        tracked: Option<usize>,
+    ) -> Self {
         let mut stats = crate::analyzer::classify::ArtifactFenceStats::default();
         let mut ignored_files = 0;
         for file in analyses {
@@ -690,14 +839,47 @@ impl IndexedUniverse {
                 stats.record(class);
             }
         }
-        Self::from_counts(analyses.len(), analyses.len(), stats, ignored_files)
+        let mut universe = Self::from_counts(analyses.len(), analyses.len(), stats, ignored_files);
+        if let Some(tracked_count) = tracked {
+            let scanned = analyses.len();
+            universe.tracked = UniverseSlice {
+                inclusion: UniverseInclusion::Included,
+                files: Some(tracked_count),
+                note: "git ls-files count at the scan root".to_string(),
+            };
+            if tracked_count > scanned {
+                // Honest gap: git tracks more files than were scanned/indexed.
+                // `scan_complete` must stop claiming full coverage, and the
+                // shortfall must be a named, counted exclusion — not a
+                // silently dropped delta.
+                universe.scan_complete = false;
+                universe.exclusions.push(UniverseExclusion {
+                    kind: "tracked_not_scanned".to_string(),
+                    files: Some(tracked_count - scanned),
+                    reason: format!(
+                        "git tracks {tracked_count} files at the scan root but only {scanned} were scanned/indexed"
+                    ),
+                    sample: Vec::new(),
+                });
+            }
+        }
+        universe
     }
 
     /// Overlay untracked accounting without pretending those files are indexed.
     ///
     /// `scan_complete` stays an indexed-universe claim: extra untracked scans
     /// increase `scanned_files` but do not flip completeness false.
-    pub fn declare_untracked(&mut self, count: usize, included: bool, scanned: usize) {
+    ///
+    /// N4 (round-2): `sample` names the untracked paths (capped by the
+    /// caller) instead of throwing the already-enumerated list away.
+    pub fn declare_untracked(
+        &mut self,
+        count: usize,
+        included: bool,
+        scanned: usize,
+        sample: Vec<String>,
+    ) {
         self.untracked = UniverseSlice {
             inclusion: if included {
                 UniverseInclusion::Included
@@ -726,10 +908,20 @@ impl IndexedUniverse {
                 .iter()
                 .any(|entry| entry.kind == "untracked")
         {
+            let reason = if sample.is_empty() || sample.len() >= count {
+                "untracked source files exist; pass --include-untracked to scan them without a full rescan".to_string()
+            } else {
+                format!(
+                    "untracked source files exist; pass --include-untracked to scan them without a full rescan; sample truncated to first {} of {} paths",
+                    sample.len(),
+                    count
+                )
+            };
             self.exclusions.push(UniverseExclusion {
                 kind: "untracked".to_string(),
                 files: Some(count),
-                reason: "untracked source files exist; pass --include-untracked to scan them without a full rescan".to_string(),
+                reason,
+                sample,
             });
         }
     }
@@ -770,15 +962,48 @@ impl IndexedUniverse {
     }
 
     /// Human-readable exclusion list: `outside_snapshot, unreadable_or_non_utf8(1)`.
+    /// N4 (round-2): exclusions carrying a path sample are marked with a
+    /// concise `e.g. <first path>` mention - never the full list.
     pub fn exclusion_kinds_summary(&self) -> String {
         self.exclusions
             .iter()
-            .map(|entry| match entry.files {
-                Some(n) => format!("{}({})", entry.kind, n),
-                None => entry.kind.clone(),
+            .map(|entry| {
+                let base = match entry.files {
+                    Some(n) => format!("{}({})", entry.kind, n),
+                    None => entry.kind.clone(),
+                };
+                match entry.sample.first() {
+                    Some(first) => format!("{base}, e.g. {first}"),
+                    None => base,
+                }
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// N4 (round-2): one concise human mention of named exclusion samples
+    /// (up to 3 paths across all exclusions, `+N more` beyond), for the
+    /// coverage line. `None` when no exclusion carries a sample.
+    pub fn exclusion_sample_note(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut extra = 0usize;
+        for entry in &self.exclusions {
+            for path in &entry.sample {
+                if parts.len() < 3 {
+                    parts.push(format!("{} ({})", path, entry.kind));
+                } else {
+                    extra += 1;
+                }
+            }
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let mut note = format!("excluded sample: {}", parts.join(", "));
+        if extra > 0 {
+            note.push_str(&format!(", +{extra} more"));
+        }
+        Some(note)
     }
 
     /// Compact caveat appended to zero-hit human output when exclusions exist.
@@ -1008,6 +1233,12 @@ pub struct OccurrenceResults {
     /// Populated whenever there is at least one hit. Additive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit_shape: Option<HitShape>,
+    /// Set when this query's name resolves to more than one distinct,
+    /// unconnected definition — separate entities sharing a name, not one
+    /// ambiguous symbol. Populated by [`enrich_with_snapshot`]; `None` when no
+    /// snapshot enrichment ran or the candidates do not qualify. Additive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namesakes: Option<NamesakesVerdict>,
 }
 
 /// Expand agent multi-pattern forms into individual exact-literal patterns.
@@ -1019,7 +1250,7 @@ pub struct OccurrenceResults {
 ///   (`.` in `foo.bar`, `(` in `init(`) is that term's exact text, not a
 ///   veto of the split. Real regex OR is `--regex`.
 ///
-/// This closes the loctree-fail class where agents type
+/// This closes the loctree-feedback class where agents type
 /// `find 'global_async_runtime|get_tokio_runtime'`, get `fixed_string` total 0
 /// (looking for the pipe character), and fall back to `grep -E` — and the
 /// follow-on class where `foo.bar|baz` used to degrade the same way because
@@ -1215,6 +1446,7 @@ pub fn merge_occurrence_results(
         role_summary: role,
         file_context: Vec::new(),
         hit_shape: shape,
+        namesakes: None,
     };
     if res.generated_skipped.is_some() {
         res.refresh_coverage_line();
@@ -1274,9 +1506,17 @@ impl OccurrenceResults {
     /// Overlay untracked accounting after [`Self::declare_snapshot_universe`].
     ///
     /// Rebuilds the coverage line so `untracked=N` is visible without flipping
-    /// indexed `scan_complete`.
-    pub fn declare_untracked_overlay(&mut self, count: usize, included: bool, scanned: usize) {
-        self.universe.declare_untracked(count, included, scanned);
+    /// indexed `scan_complete`. N4 (round-2): `sample` names the untracked
+    /// paths (capped by the caller) instead of discarding the list.
+    pub fn declare_untracked_overlay(
+        &mut self,
+        count: usize,
+        included: bool,
+        scanned: usize,
+        sample: Vec<String>,
+    ) {
+        self.universe
+            .declare_untracked(count, included, scanned, sample);
         self.refresh_coverage_line();
         if !included && count > 0 && self.total == 0 {
             let hint = SuggestedNext {
@@ -1309,9 +1549,15 @@ impl OccurrenceResults {
                 generated: stats.generated,
                 templates: stats.templates,
             };
+            let sample_note = self.universe.exclusion_sample_note();
             self.coverage_line = format!(
                 "{}{}; {}",
-                coverage_line_for(stats.files_scanned, stats.files_in_universe, &artifacts),
+                coverage_line_for_with_note(
+                    stats.files_scanned,
+                    stats.files_in_universe,
+                    &artifacts,
+                    sample_note.as_deref(),
+                ),
                 skipped_part,
                 self.universe.summary_line()
             );
@@ -1323,7 +1569,7 @@ impl OccurrenceResults {
 
 /// Determine whether a file path or content represents a generated or minified artifact.
 pub fn is_generated_or_minified_file(path: &str, content: Option<&str>) -> bool {
-    if scope_classification(path) == ScopeClassification::Generated {
+    if scope_classification(path, content) == ScopeClassification::Generated {
         return true;
     }
     let class = crate::analyzer::classify::artifact_class(path, content);
@@ -1759,7 +2005,7 @@ fn is_source_extension(ext: &str) -> bool {
     )
 }
 
-fn scope_classification(path: &str) -> ScopeClassification {
+fn scope_classification(path: &str, content: Option<&str>) -> ScopeClassification {
     let lower = path.replace('\\', "/").to_ascii_lowercase();
     let file = lower.rsplit('/').next().unwrap_or(lower.as_str());
     let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
@@ -1855,10 +2101,22 @@ fn scope_classification(path: &str) -> ScopeClassification {
     // never overclaims. This is what keeps Python/Go/JVM/native sources from
     // collapsing into `unknown` the way the prior Rust/TS/CSS-only match did.
     if is_source_extension(ext) {
-        ScopeClassification::Production
-    } else {
-        ScopeClassification::Unknown
+        return ScopeClassification::Production;
     }
+
+    // Extensionless scripts (`bin/vc-theme`, first line `#!/usr/bin/env bash`)
+    // still carry a real source language; shebang-sniff before the honest
+    // Unknown default rather than losing them to a blank extension.
+    if ext.is_empty()
+        && let Some(text) = content
+        && let Some(first_line) = text.lines().next()
+        && let Some(sniffed) = crate::fs_utils::shebang_source_extension(first_line)
+        && is_source_extension(sniffed)
+    {
+        return ScopeClassification::Production;
+    }
+
+    ScopeClassification::Unknown
 }
 
 /// Lexical state of a prefix string at the point the identifier begins.
@@ -2099,12 +2357,23 @@ fn derive_match_role(
 ///
 /// Denominator is the **indexed** universe, not the full working tree. Saying
 /// "repo files" here was a false-completeness signal when gitignored /
-/// unindexed paths still held matches (loctree-fail: absolute "absence is
+/// unindexed paths still held matches (loctree-feedback: absolute "absence is
 /// trustworthy" while `exclusions>0`).
 fn coverage_line_for(
     files_scanned: usize,
     files_in_universe: usize,
     stats: &crate::analyzer::classify::ArtifactFenceStats,
+) -> String {
+    coverage_line_for_with_note(files_scanned, files_in_universe, stats, None)
+}
+
+/// N4 (round-2): `sample_note` appends a concise named-exclusion mention
+/// (from [`IndexedUniverse::exclusion_sample_note`]) - never a full list.
+fn coverage_line_for_with_note(
+    files_scanned: usize,
+    files_in_universe: usize,
+    stats: &crate::analyzer::classify::ArtifactFenceStats,
+    sample_note: Option<&str>,
 ) -> String {
     let mut line = format!("scanned {files_scanned} of {files_in_universe} indexed files");
     let mut parts = Vec::new();
@@ -2123,6 +2392,10 @@ fn coverage_line_for(
     if !parts.is_empty() {
         line.push_str("; artifact-flagged: ");
         line.push_str(&parts.join(", "));
+    }
+    if let Some(note) = sample_note {
+        line.push_str("; ");
+        line.push_str(note);
     }
     line
 }
@@ -2228,7 +2501,7 @@ pub fn scan_text_with(
     opts: ScanOptions,
 ) -> Vec<LiteralOccurrence> {
     let lang = lang_of_path(path);
-    let scope_classification = scope_classification(path);
+    let scope_classification = scope_classification(path, Some(text));
     let rust_import_lines = (lang == TokenLang::Rust).then(|| rust_import_line_flags(text));
     let mut out = Vec::new();
     for (idx, raw_line) in text.lines().enumerate() {
@@ -2261,6 +2534,7 @@ pub fn scan_text_with(
                 definition_candidates: Vec::new(),
                 enclosing_facts: None,
                 ignored: false,
+                semantic_label: None,
             });
         }
     }
@@ -2395,6 +2669,7 @@ where
         role_summary: role,
         file_context: Vec::new(),
         hit_shape: shape,
+        namesakes: None,
     }
 }
 
@@ -2406,7 +2681,7 @@ where
 /// patterns do not match across newlines.
 pub fn scan_text_regex(path: &str, text: &str, re: &regex::Regex) -> Vec<LiteralOccurrence> {
     let lang = lang_of_path(path);
-    let scope_classification = scope_classification(path);
+    let scope_classification = scope_classification(path, Some(text));
     let mut out = Vec::new();
     for (idx, raw_line) in text.lines().enumerate() {
         for m in re.find_iter(raw_line) {
@@ -2436,6 +2711,7 @@ pub fn scan_text_regex(path: &str, text: &str, re: &regex::Regex) -> Vec<Literal
                 definition_candidates: Vec::new(),
                 enclosing_facts: None,
                 ignored: false,
+                semantic_label: None,
             });
         }
     }
@@ -2567,6 +2843,7 @@ where
         role_summary: role,
         file_context: Vec::new(),
         hit_shape: shape,
+        namesakes: None,
     }
 }
 
@@ -2629,23 +2906,139 @@ pub fn enrich_with_snapshot(results: &mut OccurrenceResults, snapshot: &Snapshot
         .filter(|f| f.ignored)
         .map(|f| f.path.as_str())
         .collect();
+    let files_by_path: std::collections::HashMap<&str, &FileAnalysis> = snapshot
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
 
     let fan_in = file_fan_in(snapshot);
     let index = SnapshotOccurrenceIndex::new(snapshot, &results.query, &results.occurrences);
+    // A4: read-back cache of `#[cfg(test)]`-gated inline module line ranges,
+    // keyed by file. Populated lazily (disk read) only for Rust production
+    // hits, since that is the only shape this can affect.
+    let mut cfg_test_ranges_cache: std::collections::HashMap<String, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    // Occurrence paths are root-relative; resolving them against the process
+    // cwd only works when the caller happens to sit in the scanned repo. The
+    // snapshot knows its own roots — use them (audit N04).
+    let snapshot_roots: Vec<std::path::PathBuf> = snapshot
+        .metadata
+        .roots
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
     for occ in &mut results.occurrences {
         occ.definition_candidates = index.definition_candidates.clone();
         // Symbol-table role first so resolve_occurrence sees the corrected role.
         index.reclassify_role(occ);
         occ.enclosing_symbol = index.enclosing_symbol(occ);
         occ.resolved_definition = index.resolve_occurrence(occ);
-        occ.enclosing_facts = enclosing_facts_for(occ, &fan_in);
         occ.ignored = !ignored_files.is_empty() && ignored_files.contains(occ.file.as_str());
+        occ.semantic_label = files_by_path
+            .get(occ.file.as_str())
+            .and_then(|file| semantic_label_for(file, occ));
+
+        // A4: a hit lexically inside an inline `#[cfg(test)] mod tests { .. }`
+        // is test-scoped even though the file it lives in is production.
+        if occ.scope_classification == ScopeClassification::Production && occ.file.ends_with(".rs")
+        {
+            let ranges = cfg_test_ranges_cache
+                .entry(occ.file.clone())
+                .or_insert_with(|| {
+                    let path = std::path::Path::new(&occ.file);
+                    let content = if path.is_absolute() {
+                        std::fs::read_to_string(path).ok()
+                    } else {
+                        snapshot_roots
+                            .iter()
+                            .map(|root| root.join(path))
+                            .find(|candidate| candidate.is_file())
+                            .and_then(|candidate| std::fs::read_to_string(candidate).ok())
+                            // Rootless fixture snapshots keep the old cwd
+                            // behavior as a last resort.
+                            .or_else(|| std::fs::read_to_string(path).ok())
+                    };
+                    content
+                        .map(|content| cfg_test_line_ranges(&content))
+                        .unwrap_or_default()
+                });
+            if ranges
+                .iter()
+                .any(|(start, end)| occ.line >= *start && occ.line <= *end)
+            {
+                occ.scope_classification = ScopeClassification::Test;
+            }
+        }
     }
+
+    // A5: symbol-scoped usage counts, computed AFTER every occurrence's
+    // `resolved_definition` is settled — a definition site does not count as
+    // its own usage, so an unused export reads 0, not the file's fan-in.
+    let mut symbol_usage_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for occ in &results.occurrences {
+        if occ.match_role == MatchRole::Definition {
+            continue;
+        }
+        if let Some(def) = occ.resolved_definition.as_ref() {
+            *symbol_usage_counts
+                .entry(def.symbol_id.clone())
+                .or_default() += 1;
+        }
+    }
+    for occ in &mut results.occurrences {
+        occ.enclosing_facts = enclosing_facts_for(occ, &fan_in, &symbol_usage_counts);
+    }
+
     // Role-dependent rollups must refresh after symbol-table reclassification.
     results.role_summary = role_summary(&results.occurrences);
     results.hit_shape = hit_shape(&results.occurrences);
     results.file_context = file_contexts(snapshot, &results.occurrences);
     results.suggested_next = suggested_next(&results.query, &results.occurrences);
+    results.namesakes = index.namesakes();
+}
+
+/// B2 point 2: a short, snapshot-proven label joined from an existing
+/// `FileAnalysis` record whose line matches `occ`, or a coarse file-level
+/// fact when no line-exact record applies. Every branch reads a field the
+/// analyzer already extracted — never a guess.
+fn semantic_label_for(file: &FileAnalysis, occ: &LiteralOccurrence) -> Option<String> {
+    if let Some(route) = file.routes.iter().find(|route| route.line == occ.line) {
+        return Some(match &route.path {
+            Some(path) => format!("route:{} {}", route.method, path),
+            None => format!("route:{}", route.method),
+        });
+    }
+    if let Some(log) = file.log_messages.iter().find(|log| log.line == occ.line) {
+        return Some(format!("log:{:?}", log.level).to_ascii_lowercase());
+    }
+    if let Some(event) = file
+        .event_emits
+        .iter()
+        .chain(file.event_listens.iter())
+        .find(|event| event.line == occ.line)
+    {
+        return Some(format!("event:{} {}", event.kind, event.name));
+    }
+    if let Some(command) = file
+        .command_calls
+        .iter()
+        .find(|command| command.line == occ.line)
+    {
+        return Some(format!("command:{}", command.name));
+    }
+    if file
+        .dynamic_imports
+        .iter()
+        .any(|target| target.contains(occ.matched_text.as_str()))
+    {
+        return Some("dynamic_import".to_string());
+    }
+    if file.is_test {
+        return Some("test_file".to_string());
+    }
+    None
 }
 
 /// Count import-edge fan-in per file from the snapshot graph.
@@ -2667,6 +3060,7 @@ fn file_fan_in(snapshot: &Snapshot) -> std::collections::HashMap<String, usize> 
 fn enclosing_facts_for(
     occ: &LiteralOccurrence,
     fan_in: &std::collections::HashMap<String, usize>,
+    symbol_usage_counts: &std::collections::HashMap<String, usize>,
 ) -> Option<EnclosingFacts> {
     let enclosing = occ.enclosing_symbol.as_ref()?;
     // File-level fallback anchors are not structural insight.
@@ -2684,12 +3078,125 @@ fn enclosing_facts_for(
         || (occ.match_role == MatchRole::Definition
             && enclosing.name == occ.matched_text
             && enclosing.line == Some(occ.line));
+    // A5: file fan-in is not evidence about THIS symbol's usage — a
+    // 4-importer file can still export a symbol nobody calls.
+    let symbol_usages = occ
+        .resolved_definition
+        .as_ref()
+        .and_then(|def| symbol_usage_counts.get(&def.symbol_id).copied())
+        .unwrap_or(0);
     Some(EnclosingFacts {
         fan_in: fan_in.get(&occ.file).copied().unwrap_or(0),
         exported,
         symbol_kind: Some(enclosing.kind.clone()),
+        symbol_usages,
         authority: "loctree_derived",
     })
+}
+
+/// A4: 1-indexed inclusive line ranges of `#[cfg(test)]`-gated inline modules
+/// (`#[cfg(test)] mod tests { .. }`) in Rust source text.
+///
+/// Local twin of `analyzer::rust::preprocess::cfg_test_line_ranges` — kept
+/// private here rather than imported because `analyzer::rust::preprocess` is
+/// a private submodule of `analyzer::rust` (not reachable from
+/// `analyzer::occurrences` without a re-export in `analyzer::rust::mod`,
+/// which is outside this pass's edit scope; see the integrator note in the
+/// final report). Same char-by-char walk as `strip_cfg_test_modules`, but
+/// records line spans instead of stripped content. External module
+/// declarations (`#[cfg(test)] mod foo;`) carry no body lines and are not
+/// included.
+pub(crate) fn cfg_test_line_ranges(content: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut chars = content.chars().peekable();
+    let mut in_cfg_test_attr = false;
+    let mut attr_start_line = 0usize;
+    let mut line = 1usize;
+
+    while let Some(ch) = chars.next() {
+        if ch == '#' && chars.peek() == Some(&'[') {
+            let start_line = line;
+            let mut attr = String::from("#");
+            for next in chars.by_ref() {
+                attr.push(next);
+                if next == '\n' {
+                    line += 1;
+                }
+                if next == ']' {
+                    break;
+                }
+            }
+
+            let attr_inner = attr.trim();
+            if attr_inner.starts_with("#[cfg(test)")
+                || (attr_inner.starts_with("#[cfg(all(") && attr_inner.contains("test"))
+            {
+                in_cfg_test_attr = true;
+                attr_start_line = start_line;
+            }
+            continue;
+        }
+
+        if ch == '\n' {
+            line += 1;
+        }
+
+        if in_cfg_test_attr {
+            if ch.is_whitespace() {
+                continue;
+            }
+
+            if ch == 'm' {
+                let mut keyword = String::from("m");
+                while let Some(&next) = chars.peek() {
+                    if next.is_alphabetic() || next == '_' {
+                        keyword.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+
+                if keyword == "mod" {
+                    let mut found_body = false;
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            line += 1;
+                        }
+                        if next == ';' {
+                            break;
+                        }
+                        if next == '{' {
+                            found_body = true;
+                            let mut depth = 1;
+                            for inner in chars.by_ref() {
+                                if inner == '\n' {
+                                    line += 1;
+                                }
+                                match inner {
+                                    '{' => depth += 1,
+                                    '}' => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if found_body {
+                        ranges.push((attr_start_line, line));
+                    }
+                }
+            }
+            in_cfg_test_attr = false;
+            continue;
+        }
+    }
+
+    ranges
 }
 
 pub fn attach_near_matches(results: &mut OccurrenceResults, analyses: &[FileAnalysis]) {
@@ -2883,6 +3390,23 @@ struct SnapshotOccurrenceIndex {
     local_bindings: std::collections::HashMap<String, Vec<SymbolAnchor>>,
     imports: std::collections::HashMap<String, SymbolAnchor>,
     enclosing: std::collections::HashMap<String, Vec<SymbolAnchor>>,
+    /// `FileAnalysis::language` per snapshot path. Used to gate the global
+    /// same-name-uniqueness fallback in [`Self::resolve_occurrence`] so a
+    /// shell `x=` never resolves to a same-named Python definition just
+    /// because it happens to be the only one in the snapshot (A1).
+    languages: std::collections::HashMap<String, String>,
+    /// Forward import-edge targets per file (`from` -> set of `to`), mirroring
+    /// [`file_fan_in`]'s source but keyed the other direction. Used by the
+    /// same fallback gate: a proven edge from the occurrence's file to the
+    /// candidate's file is enough to trust the fallback even across languages.
+    edge_targets: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// `(occurrence_file, qualifier_identifier) -> target_file` for path-qualified
+    /// call sites (`diff::analyze(x)` in a file with `mod diff;`). Built once
+    /// from every file's imports (including Rust `mod` declarations) via
+    /// [`rust_import_target_path`] so [`Self::qualified_definition`] can narrow
+    /// `definition_candidates` to the qualifier's own module before falling
+    /// back to global same-name uniqueness (A2).
+    qualifier_targets: std::collections::HashMap<(String, String), String>,
 }
 
 impl SnapshotOccurrenceIndex {
@@ -2940,6 +3464,25 @@ impl SnapshotOccurrenceIndex {
             std::collections::HashMap::new();
         for occ in occurrences {
             if occ.match_role == MatchRole::LocalBinding {
+                // The lexical scanner initially buckets private declaration
+                // shapes as bindings too. Do not let an indexed private item
+                // create a fictitious `let` shadow for every later reference.
+                if derive_match_role(
+                    OccurrenceKind::Identifier,
+                    &occ.context,
+                    &occ.matched_text,
+                    occ.column,
+                ) == MatchRole::Definition
+                    && enclosing.get(&occ.file).is_some_and(|symbols| {
+                        symbols.iter().any(|symbol| {
+                            symbol.name == query
+                                && symbol.line == Some(occ.line)
+                                && local_item_definition(&symbol.kind)
+                        })
+                    })
+                {
+                    continue;
+                }
                 local_bindings
                     .entry(occ.file.clone())
                     .or_default()
@@ -2964,8 +3507,23 @@ impl SnapshotOccurrenceIndex {
         }
 
         let mut imports = std::collections::HashMap::new();
+        let mut qualifier_targets: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
         for file in &snapshot.files {
             for import in &file.imports {
+                // Every symbol this import introduces (a `use` binding, or the
+                // declared identifier of a `mod x;`) can act as a `<qualifier>::`
+                // prefix at a call site; index all of them regardless of
+                // whether they happen to also mention `query` by name.
+                if let Some(target_path) = rust_import_target_path(snapshot, &file.path, import) {
+                    for symbol in &import.symbols {
+                        let qualifier = symbol.alias.clone().unwrap_or_else(|| symbol.name.clone());
+                        qualifier_targets
+                            .entry((file.path.clone(), qualifier))
+                            .or_insert_with(|| target_path.clone());
+                    }
+                }
+
                 if !import_mentions(import, query) {
                     continue;
                 }
@@ -2975,12 +3533,30 @@ impl SnapshotOccurrenceIndex {
             }
         }
 
+        let languages: std::collections::HashMap<String, String> = snapshot
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.language.clone()))
+            .collect();
+
+        let mut edge_targets: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for edge in &snapshot.edges {
+            edge_targets
+                .entry(edge.from.clone())
+                .or_default()
+                .insert(edge.to.clone());
+        }
+
         Self {
             query: query.to_string(),
             definition_candidates,
             local_bindings,
             imports,
             enclosing,
+            languages,
+            edge_targets,
+            qualifier_targets,
         }
     }
 
@@ -3013,20 +3589,138 @@ impl SnapshotOccurrenceIndex {
                     // Line numbers can drift one off in rare extractors; fall
                     // back to same-file unique definition when proven.
                     self.definition_at_file(&occ.file)
+                })
+                .or_else(|| {
+                    self.local_symbol_at_line(&occ.file, occ.line)
+                        .filter(|symbol| local_item_definition(&symbol.kind))
+                        .cloned()
                 }),
             MatchRole::LocalBinding => None,
             MatchRole::Import => self.imports.get(&occ.file).cloned(),
             MatchRole::Reference | MatchRole::Mutation | MatchRole::FieldEmission => self
-                .local_binding_before(occ)
+                .qualified_definition(occ)
+                .or_else(|| self.local_binding_before(occ))
                 .or_else(|| self.imports.get(&occ.file).cloned())
                 .or_else(|| self.definition_at_file(&occ.file))
                 .or_else(|| {
+                    // Snapshot-wide uniqueness is not evidence on its own: a
+                    // shell `runtime_root=` and a Python `def runtime_root`
+                    // are unrelated just because they share a name — and a
+                    // Python kwarg `runtime_root=...` in an unrelated file is
+                    // equally unrelated even though the language matches.
+                    // Only trust the sole candidate over a proven import/edge,
+                    // or same language when the hit actually LOOKS like a call
+                    // of that name (A1).
                     (self.definition_candidates.len() == 1)
                         .then(|| self.definition_candidates.first().cloned())
                         .flatten()
+                        .filter(|def| {
+                            self.has_edge(&occ.file, &def.file)
+                                || (self.same_language(&occ.file, &def.file)
+                                    && occ.context.contains(&format!("{}(", occ.matched_text)))
+                        })
                 }),
             _ => None,
         }
+    }
+
+    /// A1 gate: do the occurrence's file and the candidate's file share a
+    /// known language, per the snapshot's own `FileAnalysis::language`?
+    /// `false` whenever either side's language is unknown to the snapshot —
+    /// absence of proof is not proof of a match.
+    fn same_language(&self, occ_file: &str, candidate_file: &str) -> bool {
+        match (
+            self.languages.get(occ_file),
+            self.languages.get(candidate_file),
+        ) {
+            (Some(a), Some(b)) => !a.is_empty() && a == b,
+            _ => false,
+        }
+    }
+
+    /// A1 gate: is there a proven snapshot import edge from `from` to `to`?
+    fn has_edge(&self, from: &str, to: &str) -> bool {
+        self.edge_targets
+            .get(from)
+            .is_some_and(|targets| targets.contains(to))
+    }
+
+    /// A2: resolve a path-qualified call/reference (`diff::analyze(x)`) by
+    /// reading the `<qualifier>::` prefix straight off the occurrence's own
+    /// line, mapping that qualifier to the file it names (via
+    /// `qualifier_targets`, built from the occurrence file's own imports —
+    /// including Rust `mod` declarations), and narrowing
+    /// `definition_candidates` to that one file before any snapshot-wide
+    /// fallback runs. `None` when there is no qualifier, the qualifier is not
+    /// one of this file's imports, or the target file does not carry exactly
+    /// one matching definition.
+    fn qualified_definition(&self, occ: &LiteralOccurrence) -> Option<SymbolAnchor> {
+        let column = context_match_column(&occ.context, occ.column, &occ.matched_text)?;
+        let qualifier = qualifier_before(&occ.context, column)?;
+        let target_path = self.qualifier_targets.get(&(occ.file.clone(), qualifier))?;
+        let mut matches = self
+            .definition_candidates
+            .iter()
+            .filter(|def| &def.file == target_path && def.name == self.query);
+        let first = matches.next()?.clone();
+        if matches.next().is_none() {
+            Some(first)
+        } else {
+            // More than one same-name definition in the qualifier's own
+            // target file — refuse to pick, same discipline as
+            // `definition_at_file`.
+            None
+        }
+    }
+
+    /// B2: when this query's name resolves to more than one distinct,
+    /// unconnected definition, that is not resolver ambiguity — those are
+    /// separate entities. `None` when fewer than two distinct files define
+    /// the name, or when any two candidate files are joined by a proven
+    /// import edge (more likely a re-export chain than true namesakes).
+    fn namesakes(&self) -> Option<NamesakesVerdict> {
+        let mut files: Vec<String> = self
+            .definition_candidates
+            .iter()
+            .map(|def| def.file.clone())
+            .collect();
+        files.sort();
+        files.dedup();
+        if files.len() < 2 {
+            return None;
+        }
+        // One connected pair must not veto the verdict for the whole set:
+        // prview's 4 `analyze` definitions include a mod.rs->diff.rs edge,
+        // yet the other two files are still separate entities. Group the
+        // candidate files by proven edges (either direction) and fire when
+        // at least two unconnected groups remain.
+        let mut group: Vec<usize> = (0..files.len()).collect();
+        fn root(group: &mut [usize], mut i: usize) -> usize {
+            while group[i] != i {
+                group[i] = group[group[i]];
+                i = group[i];
+            }
+            i
+        }
+        for a in 0..files.len() {
+            for b in (a + 1)..files.len() {
+                if self.has_edge(&files[a], &files[b]) || self.has_edge(&files[b], &files[a]) {
+                    let (ra, rb) = (root(&mut group, a), root(&mut group, b));
+                    group[ra] = rb;
+                }
+            }
+        }
+        let mut components: Vec<usize> = (0..files.len()).map(|i| root(&mut group, i)).collect();
+        components.sort_unstable();
+        components.dedup();
+        if components.len() < 2 {
+            return None;
+        }
+        Some(NamesakesVerdict {
+            distinct_definitions: self.definition_candidates.len(),
+            files,
+            note: "same name resolves to distinct, unconnected definitions across files — separate entities, not one ambiguous symbol",
+        })
     }
 
     /// When the snapshot symbol table proves this hit *is* the definition
@@ -3059,12 +3753,30 @@ impl SnapshotOccurrenceIndex {
         }
 
         // Local (non-export) symbol table entry at this line.
-        if self.local_symbol_at_line(&occ.file, occ.line).is_some() {
+        if let Some(symbol) = self.local_symbol_at_line(&occ.file, occ.line) {
             // Don't demote a proven mutation on the same line.
             if matches!(
                 occ.match_role,
                 MatchRole::Mutation | MatchRole::FieldEmission
             ) {
+                return;
+            }
+            // Private items are still definitions. Visibility is not a
+            // binding kind: demoting `struct Request` to LocalBinding erased
+            // its definition from find's role summary and entity navigation.
+            if local_item_definition(&symbol.kind) {
+                // A one-line private function can contain its own call.
+                // File+line identifies the item, not every same-name token.
+                if derive_match_role(
+                    OccurrenceKind::Identifier,
+                    &occ.context,
+                    &occ.matched_text,
+                    occ.column,
+                ) == MatchRole::Definition
+                {
+                    occ.match_role = MatchRole::Definition;
+                    occ.confidence = MatchConfidence::High;
+                }
                 return;
             }
             occ.match_role = MatchRole::LocalBinding;
@@ -3112,6 +3824,80 @@ impl SnapshotOccurrenceIndex {
                 .cloned()
         })
     }
+}
+
+fn local_item_definition(kind: &str) -> bool {
+    matches!(
+        kind,
+        "function"
+            | "method"
+            | "struct"
+            | "enum"
+            | "trait"
+            | "type"
+            | "class"
+            | "interface"
+            | "protocol"
+            | "actor"
+            | "module"
+    )
+}
+
+/// Translate an occurrence's full-line 1-based char `column` into the
+/// coordinate space of its `context` excerpt. For a short line the two
+/// agree; for a windowed long line ([`context_snippet`]) the match always
+/// lands right after the `…` prefix, at 1-based char
+/// `CONTEXT_WINDOW_CHARS + 2`. Every candidate is verified by re-reading
+/// `matched_text` at that spot, so a mistranslation degrades to `None`
+/// (conservative) instead of pointing qualifier extraction at unrelated
+/// text.
+fn context_match_column(context: &str, column: usize, matched_text: &str) -> Option<usize> {
+    if matched_text.is_empty() {
+        return None;
+    }
+    let matches_at = |col: usize| {
+        let idx = col.checked_sub(1)?;
+        let mut tail = context.chars().skip(idx);
+        matched_text
+            .chars()
+            .all(|expected| tail.next() == Some(expected))
+            .then_some(col)
+    };
+    matches_at(column).or_else(|| matches_at(CONTEXT_WINDOW_CHARS + 2))
+}
+
+/// Extract the `<qualifier>` immediately preceding a `<qualifier>::<ident>`
+/// call/path site on its own line — A2's raw-text half of qualified-call
+/// resolution. `column` is a 1-based char column INTO `context` (translate a
+/// full-line [`LiteralOccurrence::column`] through [`context_match_column`]
+/// first — `context` may be a windowed excerpt of a long line).
+/// Returns `None` when the two characters before the match are not
+/// `::`, or when no identifier characters precede them: this is deliberately
+/// conservative single-line lexical evidence, never a parse.
+fn qualifier_before(context: &str, column: usize) -> Option<String> {
+    let chars: Vec<char> = context.chars().collect();
+    let idx = column.checked_sub(1)?;
+    // `idx > chars.len()` guards a column pointing past the excerpt:
+    // `context` can be a WINDOWED snippet of a long line (see
+    // [`context_snippet`]), so a full-line column may overshoot it. Unguarded
+    // indexing here panicked ("index out of bounds: the len is 206 but the
+    // index is 314") and one deep qualified hit killed the whole run.
+    if idx < 2 || idx > chars.len() || chars[idx - 1] != ':' || chars[idx - 2] != ':' {
+        return None;
+    }
+    let end = idx - 2;
+    let mut start = end;
+    while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+        start -= 1;
+    }
+    if start == end {
+        return None;
+    }
+    let qualifier: String = chars[start..end].iter().collect();
+    if qualifier.is_empty() || qualifier.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(qualifier)
 }
 
 fn import_mentions(import: &ImportEntry, query: &str) -> bool {
@@ -3269,7 +4055,70 @@ fn rust_import_target_path(
     } else {
         import.source.as_str()
     };
+    if let Some(remainder) = source.strip_prefix("mod::") {
+        return rust_mod_decl_target_path(snapshot, importing_file, remainder);
+    }
     rust_source_target_path(snapshot, importing_file, source)
+}
+
+/// Resolve a `mod <name>;` declaration (recorded as an import whose `source`
+/// is `mod::<name>` or `mod::path:<explicit path>`, see
+/// `analyzer::rust::mod::analyze_rust_file`) to its target file, purely
+/// against the already-indexed snapshot paths — never disk I/O. A `mod.rs` /
+/// `lib.rs` / `main.rs` declarer keeps its submodules alongside it; any other
+/// `foo.rs` keeps them in a sibling `foo/` directory. Falls back to a
+/// parent-directory sibling for the common `lib.rs`/`main.rs`-adjacent shape.
+fn rust_mod_decl_target_path(
+    snapshot: &Snapshot,
+    importing_file: &str,
+    remainder: &str,
+) -> Option<String> {
+    let normalized_file = normalize_scope_path(importing_file);
+    let mut base: Vec<&str> = normalized_file.split('/').collect();
+    let file_name = base.pop().unwrap_or("");
+
+    if let Some(explicit_path) = remainder.strip_prefix("path:") {
+        let mut candidate = base.join("/");
+        if !candidate.is_empty() {
+            candidate.push('/');
+        }
+        candidate.push_str(explicit_path);
+        return snapshot_path_for(snapshot, &candidate);
+    }
+
+    let mut search_base = base.clone();
+    if file_name != "mod.rs"
+        && file_name != "lib.rs"
+        && file_name != "main.rs"
+        && let Some(stem) = file_name.strip_suffix(".rs")
+    {
+        search_base.push(stem);
+    }
+
+    let mut module_path = search_base.join("/");
+    if !module_path.is_empty() {
+        module_path.push('/');
+    }
+    module_path.push_str(remainder);
+    let direct = format!("{module_path}.rs");
+    let mod_rs = format!("{module_path}/mod.rs");
+    if let Some(found) =
+        snapshot_path_for(snapshot, &direct).or_else(|| snapshot_path_for(snapshot, &mod_rs))
+    {
+        return Some(found);
+    }
+
+    // Sibling fallback: `lib.rs`/`main.rs` submodules occasionally sit beside
+    // a differently-named parent rather than under a same-stem directory.
+    let mut sibling_path = base.join("/");
+    if !sibling_path.is_empty() {
+        sibling_path.push('/');
+    }
+    sibling_path.push_str(remainder);
+    let sibling_direct = format!("{sibling_path}.rs");
+    let sibling_mod = format!("{sibling_path}/mod.rs");
+    snapshot_path_for(snapshot, &sibling_direct)
+        .or_else(|| snapshot_path_for(snapshot, &sibling_mod))
 }
 
 fn rust_reexport_named_source_target_path(
@@ -3380,6 +4229,88 @@ mod tests {
     use super::*;
 
     #[test]
+    fn private_item_definition_is_not_a_local_let_binding() {
+        let source =
+            "struct StopCanvasRequest { value: u64 }\nfn use_it(stop: StopCanvasRequest) {}\n";
+        let mut result = scan_files([("src/lib.rs", source)], "StopCanvasRequest");
+        let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "metadata": {},
+            "files": [{"path": "src/lib.rs", "language": "rust", "local_symbols": [
+                {"name": "StopCanvasRequest", "kind": "struct", "line": 1}
+            ]}]
+        }))
+        .unwrap();
+        enrich_with_snapshot(&mut result, &snapshot);
+        assert_eq!(result.occurrences[0].match_role, MatchRole::Definition);
+        assert_eq!(
+            result.occurrences[0]
+                .resolved_definition
+                .as_ref()
+                .unwrap()
+                .kind,
+            "struct"
+        );
+        assert_eq!(result.role_summary.as_ref().unwrap().definitions, 1);
+        assert_eq!(result.occurrences[1].match_role, MatchRole::Reference);
+
+        let mut same_line =
+            scan_files([("src/lib.rs", "fn request() { request(); }\n")], "request");
+        let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "metadata": {},
+            "files": [{"path": "src/lib.rs", "language": "rust", "local_symbols": [
+                {"name": "request", "kind": "function", "line": 1}
+            ]}]
+        }))
+        .expect("private function snapshot");
+        enrich_with_snapshot(&mut same_line, &snapshot);
+        assert_eq!(same_line.occurrences[0].match_role, MatchRole::Definition);
+        assert_eq!(same_line.occurrences[1].match_role, MatchRole::Reference);
+
+        let mut shadow = scan_files(
+            [(
+                "src/lib.rs",
+                "fn request() { let request = 0; consume(request); }\n",
+            )],
+            "request",
+        );
+        enrich_with_snapshot(&mut shadow, &snapshot);
+        assert_eq!(
+            shadow
+                .occurrences
+                .iter()
+                .map(|occ| occ.match_role)
+                .collect::<Vec<_>>(),
+            [
+                MatchRole::Definition,
+                MatchRole::LocalBinding,
+                MatchRole::Reference
+            ]
+        );
+
+        let mut binding = scan_files(
+            [("src/lib.rs", "let request = 1;\nconsume(request);\n")],
+            "request",
+        );
+        let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "metadata": {},
+            "files": [{"path": "src/lib.rs", "language": "rust", "local_symbols": [
+                {"name": "request", "kind": "variable", "line": 1}
+            ]}]
+        }))
+        .unwrap();
+        enrich_with_snapshot(&mut binding, &snapshot);
+        assert_eq!(binding.occurrences[0].match_role, MatchRole::LocalBinding);
+        assert_eq!(
+            binding.occurrences[1]
+                .resolved_definition
+                .as_ref()
+                .unwrap()
+                .kind,
+            "local_binding"
+        );
+    }
+
+    #[test]
     fn token_boundary_rejects_substring_matches() {
         // `id` must NOT match inside `utterance_id`, `valid`, or `id_count`.
         let line = "let utterance_id = valid_id_count;";
@@ -3485,7 +4416,7 @@ mod tests {
             "cmd/server/main.go",
         ] {
             assert_eq!(
-                scope_classification(path),
+                scope_classification(path, None),
                 ScopeClassification::Production,
                 "{path} should classify as production, not unknown"
             );
@@ -3502,7 +4433,7 @@ mod tests {
             "web/src/main.js",
         ] {
             assert_eq!(
-                scope_classification(path),
+                scope_classification(path, None),
                 ScopeClassification::Production,
                 "{path} must remain production (no regression)"
             );
@@ -3520,7 +4451,7 @@ mod tests {
             "spec/widget_spec.rb",
         ] {
             assert_eq!(
-                scope_classification(path),
+                scope_classification(path, None),
                 ScopeClassification::Test,
                 "{path} should classify as test"
             );
@@ -3539,7 +4470,7 @@ mod tests {
             "Pipfile",
         ] {
             assert_eq!(
-                scope_classification(path),
+                scope_classification(path, None),
                 ScopeClassification::Config,
                 "{path} should classify as config"
             );
@@ -3555,7 +4486,7 @@ mod tests {
             "build/output.py",
         ] {
             assert_eq!(
-                scope_classification(path),
+                scope_classification(path, None),
                 ScopeClassification::Generated,
                 "{path} should classify as generated"
             );
@@ -3573,11 +4504,29 @@ mod tests {
             "no_extension_file",
         ] {
             assert_eq!(
-                scope_classification(path),
+                scope_classification(path, None),
                 ScopeClassification::Unknown,
                 "{path} should stay unknown — an honest signal, not a guess"
             );
         }
+    }
+
+    #[test]
+    fn scope_classification_shebang_sniffs_extensionless_scripts() {
+        // A1/A6: `bin/vc-theme` with no extension but a real bash shebang must
+        // not collapse into Unknown when content is available to sniff.
+        let content = "#!/usr/bin/env bash\necho hi\n";
+        assert_eq!(
+            scope_classification("bin/vc-theme", Some(content)),
+            ScopeClassification::Production,
+            "shebang-sniffed extensionless script should classify as production"
+        );
+        // Without content, the honest Unknown default is unchanged (no regression).
+        assert_eq!(
+            scope_classification("bin/vc-theme", None),
+            ScopeClassification::Unknown,
+            "no content available to sniff — stay honest, do not guess"
+        );
     }
 
     // ----- classify_occurrence: the three proven Rust shapes + unknown -----
@@ -3927,7 +4876,7 @@ mod tests {
 
     #[test]
     fn scan_files_with_regex_finds_pattern_and_labels_context() {
-        // loctree-fail.md (2026-06-21): `--literal` false-cleans a regex query
+        // loctree-feedback.md (2026-06-21): `--literal` false-cleans a regex query
         // like `100\.[0-9]+\.[0-9]+`. `--regex` actually evaluates the pattern.
         let re = regex::Regex::new(r"100\.[0-9]+\.[0-9]+\.[0-9]+").unwrap();
         let res = scan_files_with_regex(
@@ -4010,6 +4959,45 @@ mod tests {
             snip.chars().count() <= 2 * CONTEXT_WINDOW_CHARS + 6 + 2,
             "window stays bounded, got {} chars",
             snip.chars().count()
+        );
+    }
+
+    /// div0 field crash (2026-09-28): `context` is a WINDOWED snippet of a
+    /// long line, but A2 handed [`qualifier_before`] the occurrence's
+    /// full-line column — `chars[idx - 1]` then read past the snippet
+    /// ("index out of bounds: the len is 206 but the index is 314") and a
+    /// single deep qualified hit killed the whole occurrences run.
+    #[test]
+    fn qualifier_before_survives_column_beyond_windowed_context() {
+        let snippet = format!("…{}util::mint(7);", "x".repeat(90));
+        assert_eq!(qualifier_before(&snippet, 315), None);
+        assert_eq!(qualifier_before("short", 478), None);
+    }
+
+    /// The half that keeps A2 WORKING on long lines: the full-line column is
+    /// translated into snippet coordinates (match sits right after the `…`
+    /// prefix) and verified against `matched_text`, so the qualifier is
+    /// still read correctly instead of being silently lost.
+    #[test]
+    fn qualified_call_deep_in_long_line_still_resolves_its_qualifier() {
+        let line = format!("let _s = \"{}\"; util::mint(7);", "x".repeat(300));
+        let occs = scan_text("src/main.rs", &line, "mint");
+        let occ = occs
+            .iter()
+            .find(|o| o.matched_text == "mint")
+            .expect("literal scan must see the deep qualified hit");
+        assert!(occ.context.starts_with('…'), "long line must be windowed");
+        assert!(
+            occ.column > occ.context.chars().count(),
+            "the repro needs a column past the snippet (got {} vs {})",
+            occ.column,
+            occ.context.chars().count()
+        );
+        let column = context_match_column(&occ.context, occ.column, &occ.matched_text)
+            .expect("translated column must land on the match");
+        assert_eq!(
+            qualifier_before(&occ.context, column).as_deref(),
+            Some("util")
         );
     }
 
@@ -4203,6 +5191,43 @@ mod tests {
     }
 
     #[test]
+    fn role_summary_splits_callsites_by_occurrence_kind() {
+        // A1: References / mutations / field-emissions / local-bindings used to
+        // collapse into one undifferentiated `callsites` bucket, so a kwarg-style
+        // field shorthand or a local rebinding looked exactly like a real call
+        // site. The rollup must expose each kind while keeping `callsites` as the
+        // historical sum (no regression for existing readers).
+        let res = scan_files(
+            [(
+                "src/lib.rs",
+                "print(gamma);\ngamma += 1;\nWidget { gamma };\nlet gamma = 0;\n",
+            )],
+            "gamma",
+        );
+        let summary = res
+            .role_summary
+            .expect("role_summary is present whenever there is at least one hit");
+        assert_eq!(summary.references, 1, "the `print(gamma)` read site");
+        assert_eq!(summary.mutations, 1, "the `gamma += 1` write site");
+        assert_eq!(
+            summary.field_emissions, 1,
+            "the `Widget {{ gamma }}` shorthand — not a call"
+        );
+        assert_eq!(
+            summary.local_bindings, 1,
+            "the `let gamma = 0` rebinding — not a call"
+        );
+        assert_eq!(
+            summary.callsites,
+            summary.references
+                + summary.mutations
+                + summary.field_emissions
+                + summary.local_bindings,
+            "callsites remains the historical sum of the four split buckets"
+        );
+    }
+
+    #[test]
     fn not_found_omits_role_summary() {
         // A not-found result must omit the rollup entirely (additive: the field
         // is `None`, not a misleading all-zeros object).
@@ -4246,6 +5271,363 @@ mod tests {
         assert!(
             !ctx.truncated,
             "a single edge is well under the truncation cap"
+        );
+    }
+
+    #[test]
+    fn a1_same_name_across_languages_does_not_resolve_without_edge() {
+        // A shell `runtime_root=` and a Python `def runtime_root` share a name
+        // but nothing else. The old global-uniqueness fallback resolved the
+        // shell hit to the Python definition just because it was the
+        // snapshot's only candidate — that must no longer happen without a
+        // shared language or a proven import edge between the two files.
+        let mut res = scan_files(
+            [
+                (
+                    "scripts/setup.sh",
+                    "runtime_root=/opt/app\necho \"$runtime_root\"\n",
+                ),
+                (
+                    "app/config.py",
+                    "def runtime_root():\n    return '/opt/app'\n",
+                ),
+            ],
+            "runtime_root",
+        );
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+                "metadata": {},
+                "files": [
+                    {"path": "scripts/setup.sh", "language": "shell"},
+                    {
+                        "path": "app/config.py",
+                        "language": "python",
+                        "exports": [
+                            {"name": "runtime_root", "kind": "function", "export_type": "named", "line": 1}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let shell_hit = res
+            .occurrences
+            .iter()
+            .find(|o| o.file == "scripts/setup.sh" && o.match_role == MatchRole::Mutation)
+            .expect("the `runtime_root=` assignment is present");
+        assert!(
+            shell_hit.resolved_definition.is_none(),
+            "a same-named Python def must not resolve a shell assignment without a shared language or import edge"
+        );
+    }
+
+    #[test]
+    fn a2_path_qualified_call_resolves_through_mod_declaration() {
+        // `diff::analyze(x)` in a file with `mod diff;`, with FOUR `analyze`
+        // definitions across the snapshot (including one in diff.rs itself).
+        // Global same-name uniqueness can never resolve this ambiguously; the
+        // `diff::` qualifier must narrow it to diff.rs specifically.
+        let mut res = scan_files(
+            [(
+                "src/mod.rs",
+                "mod diff;\n\nfn run(x: u32) {\n    diff::analyze(x);\n}\n",
+            )],
+            "analyze",
+        );
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+                "metadata": {},
+                "files": [
+                    {
+                        "path": "src/mod.rs",
+                        "language": "rust",
+                        "imports": [
+                            {
+                                "line": 1,
+                                "source": "mod::diff",
+                                "source_raw": "mod diff;",
+                                "kind": "Static",
+                                "resolved_path": null,
+                                "is_bare": true,
+                                "symbols": [{"name": "diff", "alias": null, "is_default": false}],
+                                "resolution": "Unknown",
+                                "is_type_checking": false,
+                                "is_mod_declaration": true,
+                                "raw_path": "mod::diff"
+                            }
+                        ]
+                    },
+                    {
+                        "path": "src/diff.rs",
+                        "language": "rust",
+                        "exports": [{"name": "analyze", "kind": "function", "export_type": "named", "line": 1}]
+                    },
+                    {
+                        "path": "src/other_a.rs",
+                        "language": "rust",
+                        "exports": [{"name": "analyze", "kind": "function", "export_type": "named", "line": 1}]
+                    },
+                    {
+                        "path": "src/other_b.rs",
+                        "language": "rust",
+                        "exports": [{"name": "analyze", "kind": "function", "export_type": "named", "line": 1}]
+                    },
+                    {
+                        "path": "src/other_c.rs",
+                        "language": "rust",
+                        "exports": [{"name": "analyze", "kind": "function", "export_type": "named", "line": 1}]
+                    }
+                ]
+            }"#,
+        )
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let call = res
+            .occurrences
+            .iter()
+            .find(|o| o.file == "src/mod.rs" && o.match_role == MatchRole::Reference)
+            .expect("the `diff::analyze(x)` call site is present");
+        let resolved = call
+            .resolved_definition
+            .as_ref()
+            .expect("qualifier resolution must land on diff.rs's analyze, not refuse ambiguously");
+        assert_eq!(resolved.file, "src/diff.rs");
+    }
+
+    #[test]
+    fn a4_cfg_test_ranges_resolve_against_snapshot_root_not_cwd() {
+        // Audit N04: `occ.file` is root-relative, and the old code read it
+        // against the process cwd. Here the fixture lives in a temp dir the
+        // test NEVER chdirs into; only the snapshot's `metadata.roots` knows
+        // where the file is. cwd = workspace, project = temp dir.
+        let content = "pub fn analyze() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        analyze();\n    }\n}\n";
+        let dir =
+            std::env::temp_dir().join(format!("loctree_n04_a4_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("create temp fixture dir");
+        std::fs::write(dir.join("lib.rs"), content).expect("write temp fixture file");
+
+        let mut res = scan_files([("lib.rs", content)], "analyze");
+        let snapshot: Snapshot = serde_json::from_str(&format!(
+            r#"{{"metadata": {{"roots": [{:?}]}}, "files": [{{"path": "lib.rs", "language": "rust"}}]}}"#,
+            dir.to_string_lossy()
+        ))
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let test_hit = res
+            .occurrences
+            .iter()
+            .find(|o| o.line == 6)
+            .expect("the `analyze()` call inside `mod tests` is present");
+        assert_eq!(
+            test_hit.scope_classification,
+            ScopeClassification::Test,
+            "cfg-test ranges must be read via the snapshot root, not the process cwd"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn h9_tracked_count_comes_from_the_given_root_not_cwd() {
+        // Audit N04: cwd A, project B. The tracked denominator must be B's,
+        // and with no root it must stay unknown instead of counting whatever
+        // repo the process happens to sit in.
+        let dir =
+            std::env::temp_dir().join(format!("loctree_n04_h9_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("create temp repo dir");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        std::fs::write(dir.join("a.sh"), "echo a\n").unwrap();
+        std::fs::write(dir.join("b.sh"), "echo b\n").unwrap();
+        assert!(git(&["add", "."]).status.success());
+
+        let with_root = IndexedUniverse::from_analyses(&[], Some(dir.as_path()));
+        assert_eq!(
+            with_root.tracked.files,
+            Some(2),
+            "tracked count must be the given root's ls-files count"
+        );
+        let without_root = IndexedUniverse::from_analyses(&[], None);
+        assert_eq!(
+            without_root.tracked.files, None,
+            "no root means an unknown denominator, never the cwd repo's count"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a4_cfg_test_mod_hits_downgrade_scope_to_test() {
+        // A production `fn analyze` is called again inside an inline
+        // `#[cfg(test)] mod tests { .. }` in the SAME file. That call site is
+        // test-scoped even though `scope_classification` (path-only) reads the
+        // whole file as production.
+        let content = "pub fn analyze() {}\n\n#[cfg(test)]\nmod tests {\n    fn t() {\n        analyze();\n    }\n}\n";
+        let dir = std::env::temp_dir().join(format!(
+            "loctree_recipes_e1_a4_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp fixture dir");
+        let file_path = dir.join("lib.rs");
+        std::fs::write(&file_path, content).expect("write temp fixture file");
+        let path_str = file_path.to_string_lossy().to_string();
+
+        let mut res = scan_files([(path_str.as_str(), content)], "analyze");
+        let snapshot: Snapshot = serde_json::from_str(&format!(
+            r#"{{"metadata": {{}}, "files": [{{"path": {:?}, "language": "rust"}}]}}"#,
+            path_str
+        ))
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let test_hit = res
+            .occurrences
+            .iter()
+            .find(|o| o.line == 6)
+            .expect("the `analyze()` call inside `mod tests` is present");
+        assert_eq!(
+            test_hit.scope_classification,
+            ScopeClassification::Test,
+            "a call inside an inline #[cfg(test)] mod must classify as Test even though the file is production"
+        );
+
+        let def_hit = res
+            .occurrences
+            .iter()
+            .find(|o| o.line == 1)
+            .expect("the `pub fn analyze` definition site is present");
+        assert_eq!(
+            def_hit.scope_classification,
+            ScopeClassification::Production,
+            "the definition outside the test module stays production"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a5_symbol_usage_count_is_not_file_fan_in() {
+        // Four files import src/util.rs (file-level fan-in 4), but the
+        // specific exported symbol `helper` has zero call sites in this
+        // query's hit set. `fan_in` may honestly report 4; `symbol_usages`
+        // must report 0 — not silently reuse the file's fan-in.
+        let mut res = scan_files([("src/util.rs", "pub fn helper() {}\n")], "helper");
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+                "metadata": {},
+                "files": [
+                    {
+                        "path": "src/util.rs",
+                        "language": "rust",
+                        "exports": [{"name": "helper", "kind": "function", "export_type": "named", "line": 1}]
+                    },
+                    {"path": "src/a.rs", "language": "rust"},
+                    {"path": "src/b.rs", "language": "rust"},
+                    {"path": "src/c.rs", "language": "rust"},
+                    {"path": "src/d.rs", "language": "rust"}
+                ],
+                "edges": [
+                    {"from": "src/a.rs", "to": "src/util.rs", "label": "import"},
+                    {"from": "src/b.rs", "to": "src/util.rs", "label": "import"},
+                    {"from": "src/c.rs", "to": "src/util.rs", "label": "import"},
+                    {"from": "src/d.rs", "to": "src/util.rs", "label": "import"}
+                ]
+            }"#,
+        )
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let def_hit = res
+            .occurrences
+            .iter()
+            .find(|o| o.match_role == MatchRole::Definition)
+            .expect("the `pub fn helper` definition site is present");
+        let facts = def_hit
+            .enclosing_facts
+            .as_ref()
+            .expect("enclosing facts present for a named function definition");
+        assert_eq!(facts.fan_in, 4, "file-level fan-in is honestly 4 importers");
+        assert_eq!(
+            facts.symbol_usages, 0,
+            "the exported symbol itself has zero call sites in this hit set — not 4"
+        );
+    }
+
+    #[test]
+    fn b2_namesakes_verdict_flags_distinct_unconnected_definitions() {
+        let mut res = scan_files([("src/a.rs", "pub fn widget() {}\n")], "widget");
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+                "metadata": {},
+                "files": [
+                    {"path": "src/a.rs", "language": "rust", "exports": [{"name": "widget", "kind": "function", "export_type": "named", "line": 1}]},
+                    {"path": "src/b.rs", "language": "rust", "exports": [{"name": "widget", "kind": "function", "export_type": "named", "line": 5}]},
+                    {"path": "src/c.rs", "language": "rust", "exports": [{"name": "widget", "kind": "function", "export_type": "named", "line": 9}]},
+                    {"path": "src/d.rs", "language": "rust", "exports": [{"name": "widget", "kind": "function", "export_type": "named", "line": 13}]}
+                ]
+            }"#,
+        )
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let namesakes = res
+            .namesakes
+            .as_ref()
+            .expect("four unconnected same-name definitions must produce a namesakes verdict");
+        assert_eq!(namesakes.distinct_definitions, 4);
+        assert_eq!(
+            namesakes.files,
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/c.rs".to_string(),
+                "src/d.rs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn b2_semantic_label_joins_log_message_at_matching_line() {
+        let mut res = scan_files(
+            [("src/service.rs", "fn run() {\n    let startup = true;\n}\n")],
+            "startup",
+        );
+        let snapshot: Snapshot = serde_json::from_str(
+            r#"{
+                "metadata": {},
+                "files": [
+                    {
+                        "path": "src/service.rs",
+                        "language": "rust",
+                        "log_messages": [
+                            {"level": "info", "macro_or_fn": "log::info!", "format_string": "startup", "line": 2}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("minimal snapshot deserializes via serde defaults");
+        enrich_with_snapshot(&mut res, &snapshot);
+
+        let hit = res
+            .occurrences
+            .iter()
+            .find(|o| o.line == 2)
+            .expect("the `startup` hit on line 2 is present");
+        assert_eq!(
+            hit.semantic_label.as_deref(),
+            Some("log:info"),
+            "a hit on a line recorded in log_messages must carry the log-level label"
         );
     }
 
@@ -4693,6 +6075,89 @@ class AgentConstraints {\n\
         assert_eq!(res.universe.untracked.files, None);
     }
 
+    /// N4 (round-2): when the snapshot carries gather scan diagnostics, the
+    /// `outside_snapshot` boundary gets an exact count and per-reason
+    /// exclusions name a capped path sample instead of `files: None`.
+    #[test]
+    fn snapshot_universe_names_excluded_paths_from_scan_diagnostics() {
+        use crate::fs_utils::{GatherDiagnostics, GatherExclusionBucket, GatherExclusionReason};
+
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot
+            .files
+            .push(FileAnalysis::new("src/present.rs".into()));
+        snapshot.scan_diagnostics = Some(GatherDiagnostics {
+            buckets: vec![
+                GatherExclusionBucket {
+                    reason: GatherExclusionReason::UnsupportedExtension,
+                    count: 2,
+                    sample: vec!["notes.xyz".to_string(), "data.bin".to_string()],
+                },
+                GatherExclusionBucket {
+                    reason: GatherExclusionReason::Hidden,
+                    count: 1,
+                    sample: vec![".hidden/data.rs".to_string()],
+                },
+            ],
+        });
+
+        let mut res = scan_files([("src/present.rs", "pub fn needle() {}")], "needle");
+        res.declare_snapshot_universe(&snapshot, FileScope::default());
+
+        let outside = res
+            .universe
+            .exclusions
+            .iter()
+            .find(|entry| entry.kind == "outside_snapshot")
+            .expect("outside_snapshot boundary must remain");
+        assert_eq!(outside.files, Some(3), "diagnostics give an exact count");
+
+        let unsupported = res
+            .universe
+            .exclusions
+            .iter()
+            .find(|entry| entry.kind == "unsupported_extension")
+            .expect("per-reason exclusion must exist");
+        assert_eq!(unsupported.files, Some(2));
+        assert_eq!(unsupported.sample, vec!["notes.xyz", "data.bin"]);
+
+        // Human surfaces: concise sample mentions, never full lists.
+        let summary = res.universe.exclusion_kinds_summary();
+        assert!(summary.contains("unsupported_extension(2), e.g. notes.xyz"));
+        assert!(res.coverage_line.contains("excluded sample:"));
+        assert!(
+            res.coverage_line
+                .contains("notes.xyz (unsupported_extension)")
+        );
+    }
+
+    /// N4 (round-2): the untracked overlay names the untracked paths (sample)
+    /// and marks truncation explicitly.
+    #[test]
+    fn untracked_overlay_carries_path_sample() {
+        let mut universe = IndexedUniverse::from_analyses_with_tracked(&[], None);
+        universe.declare_untracked(3, false, 0, vec!["scratch.rs".to_string()]);
+
+        let exclusion = universe
+            .exclusions
+            .iter()
+            .find(|entry| entry.kind == "untracked")
+            .expect("untracked exclusion must exist");
+        assert_eq!(exclusion.files, Some(3));
+        assert_eq!(exclusion.sample, vec!["scratch.rs"]);
+        assert!(
+            exclusion
+                .reason
+                .contains("sample truncated to first 1 of 3 paths"),
+            "truncation must be explicit: {}",
+            exclusion.reason
+        );
+        assert_eq!(
+            universe.exclusion_sample_note().as_deref(),
+            Some("excluded sample: scratch.rs (untracked)")
+        );
+    }
+
     #[test]
     fn analyzer_universe_declares_generated_fixtures_and_ignored_policy() {
         let product = FileAnalysis::new("src/lib.rs".into());
@@ -4702,7 +6167,15 @@ class AgentConstraints {\n\
         let mut ignored = FileAnalysis::new("vendor/ignored.rs".into());
         ignored.ignored = true;
 
-        let universe = IndexedUniverse::from_analyses(&[product, generated, fixture, ignored]);
+        // H9: this test is about the artifact-classification policy
+        // (generated/fixtures/ignored), not about git tracking — use the
+        // injectable core directly with `tracked: None` so it stays a unit
+        // test (no real `git` process) and keeps testing exactly what it
+        // always tested. See `h9_*` tests below for the tracked-count gap.
+        let universe = IndexedUniverse::from_analyses_with_tracked(
+            &[product, generated, fixture, ignored],
+            None,
+        );
 
         assert_eq!(universe.indexed_files, 4);
         assert_eq!(universe.scanned_files, 4);
@@ -4713,6 +6186,64 @@ class AgentConstraints {\n\
         assert_eq!(universe.generated.files, Some(1));
         assert_eq!(universe.fixtures.files, Some(1));
         assert!(!universe.exclusions.is_empty());
+    }
+
+    #[test]
+    fn h9_tracked_exceeding_scanned_exposes_the_coverage_gap() {
+        // A fake `tracked` count ahead of `analyses.len()` — no real `git`
+        // process spawned — must surface the shortfall instead of the old
+        // tautological indexed==scanned==100% claim.
+        let product = FileAnalysis::new("src/lib.rs".into());
+        let universe = IndexedUniverse::from_analyses_with_tracked(&[product], Some(5));
+
+        assert_eq!(universe.scanned_files, 1);
+        assert_eq!(universe.tracked.files, Some(5));
+        assert!(
+            !universe.scan_complete,
+            "git tracks more files than were scanned — coverage must not claim complete"
+        );
+        assert!(
+            universe
+                .exclusions
+                .iter()
+                .any(|exclusion| exclusion.kind == "tracked_not_scanned"
+                    && exclusion.files == Some(4)),
+            "the exact shortfall (5 tracked - 1 scanned = 4) must be a named, counted exclusion: {:?}",
+            universe.exclusions
+        );
+        assert!(
+            universe.summary_line().contains("coverage incomplete"),
+            "the honest gap must surface in the human summary line too: {}",
+            universe.summary_line()
+        );
+    }
+
+    #[test]
+    fn h9_tracked_at_or_below_scanned_stays_complete() {
+        let a = FileAnalysis::new("src/a.rs".into());
+        let b = FileAnalysis::new("src/b.rs".into());
+        let universe = IndexedUniverse::from_analyses_with_tracked(&[a, b], Some(2));
+
+        assert!(universe.scan_complete);
+        assert!(
+            !universe
+                .exclusions
+                .iter()
+                .any(|exclusion| exclusion.kind == "tracked_not_scanned"),
+            "tracked == scanned is genuinely complete — no shortfall to name"
+        );
+    }
+
+    #[test]
+    fn h9_no_tracked_count_stays_honestly_unknown() {
+        // Non-git dirs (or a failed git call) must not invent a tracked
+        // count — `from_analyses`'s own git call already returns `None` for
+        // these; this exercises the same contract through the injectable core.
+        let product = FileAnalysis::new("src/lib.rs".into());
+        let universe = IndexedUniverse::from_analyses_with_tracked(&[product], None);
+
+        assert_eq!(universe.tracked.files, None);
+        assert!(universe.scan_complete);
     }
 
     #[test]
@@ -4736,7 +6267,7 @@ class AgentConstraints {\n\
 
     #[test]
     fn expand_literal_patterns_splits_agent_pipe_or() {
-        // loctree-fail: agents type A|B as one fixed_string → total 0 + grep.
+        // loctree-feedback: agents type A|B as one fixed_string → total 0 + grep.
         let patterns =
             expand_literal_patterns(&["global_async_runtime|get_tokio_runtime".to_string()]);
         assert_eq!(

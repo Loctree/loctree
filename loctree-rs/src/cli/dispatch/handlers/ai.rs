@@ -25,6 +25,29 @@ fn tagmap_matches(value: &str, keyword_lower: &str, keyword_normalized: &str) ->
             && tagmap_normalize(&value_lower).contains(keyword_normalized))
 }
 
+/// G9: classify a symbol-usage fact match as a primary hit (the *name*
+/// itself matches the keyword) or a lower-confidence context-only hit (only
+/// the raw source line mentions the keyword — e.g. a doc-comment on the same
+/// line as an unrelated call). Previously `handle_tagmap_command` OR'd
+/// `usage.name` and `usage.context` into one bucket, so one line mentioning
+/// the keyword in a comment surfaced every usage sharing that line
+/// regardless of name. Returns `(kind_label, is_primary)`, or `None` when
+/// neither matches.
+fn tagmap_symbol_usage_kind(
+    usage_name: &str,
+    usage_context: &str,
+    keyword_lower: &str,
+    keyword_normalized: &str,
+) -> Option<(&'static str, bool)> {
+    if tagmap_matches(usage_name, keyword_lower, keyword_normalized) {
+        Some(("symbol-usage", true))
+    } else if tagmap_matches(usage_context, keyword_lower, keyword_normalized) {
+        Some(("symbol-usage-context", false))
+    } else {
+        None
+    }
+}
+
 /// Handle the crowd command - detect functional crowds
 pub fn handle_crowd_command(opts: &CrowdOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::crowd::{
@@ -242,15 +265,19 @@ pub fn handle_tagmap_command(opts: &TagmapOptions, global: &GlobalOptions) -> Di
         }
 
         for usage in &file.symbol_usages {
-            if tagmap_matches(&usage.name, &keyword_lower, &keyword_normalized)
-                || tagmap_matches(&usage.context, &keyword_lower, &keyword_normalized)
-            {
+            if let Some((kind, is_primary)) = tagmap_symbol_usage_kind(
+                &usage.name,
+                &usage.context,
+                &keyword_lower,
+                &keyword_normalized,
+            ) {
                 fact_matches.push(serde_json::json!({
-                    "kind": "symbol-usage",
+                    "kind": kind,
                     "file": file.path,
                     "name": usage.name,
                     "line": usage.line,
-                    "context": usage.context
+                    "context": usage.context,
+                    "confidence": if is_primary { "high" } else { "low" }
                 }));
             }
         }
@@ -490,10 +517,22 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
     use crate::analyzer::frameworks::detect_frameworks;
     use crate::analyzer::route_twins::{detect_route_twins, print_route_twins_human};
     use crate::analyzer::twins::{
-        TwinCategory, categorize_twin, detect_exact_twins_with_frameworks, detect_language,
-        print_exact_twins_human, print_twins_human,
+        DEAD_PARROTS_PAGE_CAP, TwinCategory, categorize_twin, detect_exact_twins_with_frameworks,
+        detect_language, order_twins_for_page, page_family_windows, parse_twin_class_filter,
+        print_exact_twins_human, print_twins_human, retain_twin_classes,
     };
     use std::path::Path;
+
+    let class_filter = match opts.class.as_deref() {
+        Some(spec) => match parse_twin_class_filter(spec) {
+            Ok(classes) => classes,
+            Err(err) => {
+                eprintln!("[loct][error] {err}");
+                return DispatchResult::Exit(1);
+            }
+        },
+        None => Vec::new(),
+    };
 
     // Show spinner unless in quiet/json mode
     let spinner = if !global.quiet && !global.json {
@@ -648,21 +687,46 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
     });
     let total_findings = dead_count + twin_count + route_twin_count + barrel_count;
 
+    // Class partition, then class filter, then offset/limit. The limit
+    // spends on exact twins and then route twins. Dead parrots do not
+    // spend it: full `loct twins` caps them at DEAD_PARROTS_PAGE_CAP,
+    // `follow twins` emits none.
+    order_twins_for_page(&mut twins);
+    let twins_before_class = twins.len();
+    retain_twin_classes(&mut twins, &class_filter);
+    let class_dropped_twins = twins_before_class - twins.len();
+    let class_dropped_routes = if class_filter.is_empty() {
+        0
+    } else {
+        let dropped = route_twins.len();
+        route_twins.clear();
+        dropped
+    };
+    let windows = page_family_windows(&[twins.len(), route_twins.len()], opts.offset, opts.limit);
+    twins = twins
+        .into_iter()
+        .skip(windows[0].0)
+        .take(windows[0].1)
+        .collect();
+    route_twins = route_twins
+        .into_iter()
+        .skip(windows[1].0)
+        .take(windows[1].1)
+        .collect();
+    if opts.omit_dead_parrots {
+        dead_result.dead_parrots.clear();
+    } else {
+        dead_result.dead_parrots.truncate(DEAD_PARROTS_PAGE_CAP);
+    }
+
     let mut nested_findings_truncated = false;
     if let Some(limit) = opts.limit {
-        let mut remaining = limit;
-        dead_result.dead_parrots.truncate(remaining);
-        remaining = remaining.saturating_sub(dead_result.dead_parrots.len());
-        twins.truncate(remaining);
-        remaining = remaining.saturating_sub(twins.len());
-        route_twins.truncate(remaining);
-        remaining = remaining.saturating_sub(route_twins.len());
+        // Barrels stay out of the twin-family budget. Cap each list at
+        // `limit` so a bounded request cannot dump the whole barrel report.
         if let Some(analysis) = barrel_analysis.as_mut() {
-            analysis.missing_barrels.truncate(remaining);
-            remaining = remaining.saturating_sub(analysis.missing_barrels.len());
-            analysis.deep_chains.truncate(remaining);
-            remaining = remaining.saturating_sub(analysis.deep_chains.len());
-            analysis.inconsistent_paths.truncate(remaining);
+            analysis.missing_barrels.truncate(limit);
+            analysis.deep_chains.truncate(limit);
+            analysis.inconsistent_paths.truncate(limit);
         }
         for twin in &mut twins {
             nested_findings_truncated |= twin.locations.len() > limit;
@@ -691,6 +755,14 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
                 + analysis.deep_chains.len()
                 + analysis.inconsistent_paths.len()
         });
+    let page_total = total_findings
+        .saturating_sub(if opts.omit_dead_parrots {
+            dead_count
+        } else {
+            0
+        })
+        .saturating_sub(class_dropped_twins)
+        .saturating_sub(class_dropped_routes);
 
     // Finish spinner before printing results
     if let Some(s) = spinner {
@@ -778,14 +850,15 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
                 "high_similarity_groups": high_similarity_count,
             }
         });
-        if let Some(limit) = opts.limit {
+        if opts.limit.is_some() || opts.offset > 0 || opts.class.is_some() {
             output["page"] = serde_json::json!({
                 "semantics": "global",
-                "limit": limit,
+                "limit": opts.limit,
+                "offset": opts.offset,
                 "returned": returned_findings,
-                "total": total_findings,
-                "has_more": returned_findings < total_findings,
-                "nested_item_limit": limit,
+                "total": page_total,
+                "has_more": returned_findings < page_total,
+                "nested_item_limit": opts.limit,
                 "nested_truncated": nested_findings_truncated,
             });
         }
@@ -813,10 +886,16 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
                 println!("{}", format_barrel_analysis(ba));
             }
         }
-        if opts.limit.is_some() && returned_findings < total_findings {
+        if opts.limit.is_some() && returned_findings < page_total {
             println!(
-                "{} additional finding(s) omitted by the global --limit",
-                total_findings - returned_findings
+                "{} additional finding(s) omitted by --limit/--offset/--class",
+                page_total - returned_findings
+            );
+        }
+        if !opts.omit_dead_parrots && dead_count > dead_result.dead_parrots.len() {
+            println!(
+                "{} additional dead parrot(s) omitted by the dead-parrot cap ({DEAD_PARROTS_PAGE_CAP})",
+                dead_count - dead_result.dead_parrots.len()
             );
         }
         if nested_findings_truncated {
@@ -830,7 +909,8 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
 /// Handle the sniff command - aggregate code smells
 pub fn handle_sniff_command(opts: &SniffOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::crowd::detect_all_crowds_with_edges;
-    use crate::analyzer::twins::{detect_exact_twins, find_dead_parrots};
+    use crate::analyzer::health_inputs::canonical_exact_twins;
+    use crate::analyzer::twins::find_dead_parrots;
     use std::path::Path;
 
     // Deprecation warning (goes to stderr, won't break piped output)
@@ -876,7 +956,11 @@ pub fn handle_sniff_command(opts: &SniffOptions, global: &GlobalOptions) -> Disp
     let mut crowds_count = 0;
 
     let twins = if !opts.crowds_only && !opts.dead_only {
-        let t = detect_exact_twins(&files, opts.include_tests);
+        // N13 (audit): the sniff surface was the one remaining direct
+        // `detect_exact_twins` caller — every twins-reporting surface goes
+        // through the canonical helper over the same files/include_tests
+        // input, with the snapshot's semantic facts applied when present.
+        let t = canonical_exact_twins(&files, snapshot.semantic_facts.as_ref(), opts.include_tests);
         twins_count = t.len();
         Some(t)
     } else {
@@ -1217,4 +1301,68 @@ pub fn handle_suppress_command(opts: &SuppressOptions, _global: &GlobalOptions) 
     println!("Use --include-suppressed to show suppressed items.");
 
     DispatchResult::Exit(0)
+}
+
+#[cfg(test)]
+mod tagmap_tests {
+    use super::*;
+
+    #[test]
+    fn g9_context_only_match_is_not_a_primary_hit() {
+        // Two usages share one source line whose *context* mentions "pdu"
+        // only in a trailing comment; neither usage's *name* has anything to
+        // do with "pdu". Before the fix both surfaced as primary
+        // "symbol-usage" hits for keyword "pdu" purely because of the shared
+        // line text.
+        let keyword_lower = "pdu".to_ascii_lowercase();
+        let keyword_normalized = tagmap_normalize(&keyword_lower);
+
+        let hit = tagmap_symbol_usage_kind(
+            "length",
+            "let length = of(pdu); // pdu framing",
+            &keyword_lower,
+            &keyword_normalized,
+        );
+        assert_eq!(
+            hit,
+            Some(("symbol-usage-context", false)),
+            "context-only match must be downgraded, not a primary hit: {hit:?}"
+        );
+
+        let hit2 = tagmap_symbol_usage_kind(
+            "of",
+            "let length = of(pdu); // pdu framing",
+            &keyword_lower,
+            &keyword_normalized,
+        );
+        assert_eq!(hit2, Some(("symbol-usage-context", false)));
+    }
+
+    #[test]
+    fn g9_name_match_is_a_primary_hit() {
+        let keyword_lower = "pdu".to_ascii_lowercase();
+        let keyword_normalized = tagmap_normalize(&keyword_lower);
+        let hit = tagmap_symbol_usage_kind(
+            "PduHeader",
+            "let h = PduHeader::parse(buf);",
+            &keyword_lower,
+            &keyword_normalized,
+        );
+        assert_eq!(hit, Some(("symbol-usage", true)));
+    }
+
+    #[test]
+    fn g9_no_match_returns_none() {
+        let keyword_lower = "pdu".to_ascii_lowercase();
+        let keyword_normalized = tagmap_normalize(&keyword_lower);
+        assert_eq!(
+            tagmap_symbol_usage_kind(
+                "length",
+                "let length = of(x);",
+                &keyword_lower,
+                &keyword_normalized
+            ),
+            None
+        );
+    }
 }

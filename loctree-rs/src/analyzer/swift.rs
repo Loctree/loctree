@@ -80,7 +80,7 @@ const SWIFT_BODY_REQUIREMENT_PROTOCOLS: &[&str] = &[
 /// AppKit/UIKit (and peers) delegate/datasource protocols whose requirement
 /// methods are invoked by the framework dynamically — never by identifier.
 ///
-/// W9-B / loctree-fail.md (2026-07-23): W9-A credited SwiftUI `body`/`previews`
+/// W9-B / loctree-feedback.md (2026-07-23): W9-A credited SwiftUI `body`/`previews`
 /// and XCTest, but left NSToolbarDelegate / NSTableView* methods as dead-HIGH
 /// (e.g. `toolbarDefaultItemIdentifiers` in vibecrafted). Conformance in the
 /// same file gates the credit so a free-standing helper with the same name
@@ -843,7 +843,7 @@ const UNIFFI_FFICONVERTER_DENSITY_THRESHOLD: usize = 4;
 /// Recognize a UniFFI-generated Swift bridge file and credit ALL of its exports
 /// as `local_uses` so they are not flagged HIGH-confidence dead.
 ///
-/// loctree-fail.md (2026-06-26): `loct dead --full` flagged ~50 symbols in
+/// loctree-feedback.md (2026-06-26): `loct dead --full` flagged ~50 symbols in
 /// `*_ffi.swift` (`FfiConverterType*_lift/_lower`, `UNIFFI_CALLBACK_*`,
 /// `uniffiTraitInterface*`, …) as HIGH dead. These are machine-written FFI glue
 /// whose ONLY consumers live across the FFI boundary (C / Rust) — exactly the
@@ -897,7 +897,7 @@ fn is_uniffi_generated_bridge(content: &str) -> bool {
 /// identifier" in user code. They conform to NSApplicationDelegate /
 /// UIApplicationDelegate / scene protocols, so an import-graph dead scan sees
 /// 0 references and (before this) flagged them HIGH-confidence dead
-/// (loctree-fail.md, 2026-06-16). Curated, not exhaustive — `override` and
+/// (loctree-feedback.md, 2026-06-16). Curated, not exhaustive — `override` and
 /// `@objc` cover the rest.
 const SWIFT_FRAMEWORK_DISPATCH_METHODS: &[&str] = &[
     // NSApplicationDelegate
@@ -1089,7 +1089,15 @@ fn parse_symbol_usages(content: &str, exports: &[ExportSymbol]) -> Vec<SymbolUsa
         exports.iter().map(|e| e.name.as_str()).collect();
 
     for (idx, line) in content.lines().enumerate() {
-        let effective = strip_line_comment(line);
+        let stripped = strip_line_comment(line);
+        // G8: RE_WORD matches any identifier-shaped token, including the
+        // capitalized words inside a string literal ("Split View" ->
+        // usages "Split", "View"). `strip_line_comment` only removes `//`
+        // comments; blank out quoted spans too before scanning for words so
+        // UI copy/log text stops seeding false symbol usages (and the
+        // cross-language `implicit_symbol` edges built from them).
+        let blanked = blank_string_literals(stripped);
+        let effective = blanked.as_str();
         if effective.trim().is_empty() {
             continue;
         }
@@ -1107,7 +1115,11 @@ fn parse_symbol_usages(content: &str, exports: &[ExportSymbol]) -> Vec<SymbolUsa
                 out.push(SymbolUsage {
                     name: word.to_string(),
                     line: idx + 1,
-                    context: effective.trim().to_string(),
+                    // Real source text for humans/tagmap, not the blanked
+                    // scanning copy — only word-matching needs strings
+                    // blanked, the reported context should still read like
+                    // the actual line.
+                    context: stripped.trim().to_string(),
                 });
             }
         }
@@ -1115,6 +1127,36 @@ fn parse_symbol_usages(content: &str, exports: &[ExportSymbol]) -> Vec<SymbolUsa
     // Deduplicate symbol usages
     out.sort_by(|a, b| a.name.cmp(&b.name).then(a.line.cmp(&b.line)));
     out.dedup_by(|a, b| a.name == b.name && a.line == b.line);
+    out
+}
+
+/// Replace the contents of `"..."` string-literal spans on a line with
+/// spaces (keeping every byte offset intact), handling escaped quotes
+/// (`\"`) so the scan doesn't end the span early. Only string bodies are
+/// blanked, not the quotes themselves — irrelevant either way since RE_WORD
+/// never matches `"`.
+fn blank_string_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_str = false;
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if in_str => {
+                // Escaped char inside a string: blank both the backslash and
+                // the char it escapes so `\"` doesn't flip `in_str` early.
+                out.push(' ');
+                if let Some(next) = chars.next() {
+                    out.push(if next == '\n' { '\n' } else { ' ' });
+                }
+            }
+            '"' => {
+                in_str = !in_str;
+                out.push('"');
+            }
+            _ if in_str => out.push(if ch == '\n' { '\n' } else { ' ' }),
+            _ => out.push(ch),
+        }
+    }
     out
 }
 
@@ -1147,7 +1189,7 @@ fn strip_line_comment(line: &str) -> &str {
 /// stdlib/framework symbol (the nested one needs `Outer.Error` qualification),
 /// so an `implicit_symbol` edge on these names is categorically noise.
 /// Evidence: blinksh/blink — nested `enum Error` in `SSHDefaultAgent.swift`
-/// turned 75 unrelated files into "importers" (loctree-fail.md 2026-07-25).
+/// turned 75 unrelated files into "importers" (loctree-feedback.md 2026-07-25).
 pub fn is_swift_shadowed_stdlib_name(word: &str) -> bool {
     matches!(
         word,
@@ -1308,6 +1350,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn g8_string_literal_words_are_not_symbol_usages() {
+        let src = r#"
+struct Sidebar {
+    func title() -> String {
+        return "Split View"
+    }
+}
+"#;
+        let analysis = analyze_swift_file(src, "Sidebar.swift".to_string());
+        assert!(
+            !analysis.symbol_usages.iter().any(|u| u.name == "Split"),
+            "words inside a string literal must not become symbol usages: {:?}",
+            analysis.symbol_usages
+        );
+        assert!(
+            !analysis.symbol_usages.iter().any(|u| u.name == "View"),
+            "words inside a string literal must not become symbol usages: {:?}",
+            analysis.symbol_usages
+        );
+    }
+
+    #[test]
+    fn g8_string_with_escaped_quote_still_blanks_fully() {
+        // An escaped quote inside the literal must not end the blanked span
+        // early and let the trailing word ("Editor") leak through as a
+        // usage.
+        let src = r#"let s = "quote \" then Editor""#;
+        let blanked = blank_string_literals(src);
+        assert!(
+            !blanked.contains("Editor"),
+            "escaped-quote string body must stay fully blanked: {blanked:?}"
+        );
+    }
+
+    #[test]
+    fn g8_code_outside_strings_still_scans_normally() {
+        let src = r#"
+struct Sidebar {
+    func run() {
+        HelperType.shared.doThing()
+    }
+}
+"#;
+        let analysis = analyze_swift_file(src, "Sidebar.swift".to_string());
+        assert!(
+            analysis
+                .symbol_usages
+                .iter()
+                .any(|u| u.name == "HelperType"),
+            "real code identifiers outside strings must still be scanned: {:?}",
+            analysis.symbol_usages
+        );
+    }
+
+    #[test]
     fn parses_swift_decls() {
         let src = r#"
 import Foundation
@@ -1352,7 +1449,7 @@ extension WorkspaceCacheStore: Searchable {}
 
     #[test]
     fn marks_nsapplicationmain_file_as_entry_point() {
-        // loctree-fail.md (2026-06-16): main.swift drives the app via
+        // loctree-feedback.md (2026-06-16): main.swift drives the app via
         // NSApplicationMain; it is a runtime entry point, not dead.
         let src = "import AppKit\n\nlet delegate = AppDelegate()\nNSApplication.shared.delegate = delegate\n_ = NSApplicationMain(CommandLine.argc, CommandLine.unsafeArgv)\n";
         let analysis = analyze_swift_file(src, "main.swift".to_string());
@@ -1374,7 +1471,7 @@ extension WorkspaceCacheStore: Searchable {}
 
     #[test]
     fn credits_appkit_lifecycle_and_override_methods_as_used() {
-        // loctree-fail.md (2026-06-16): NSApplicationDelegate protocol methods
+        // loctree-feedback.md (2026-06-16): NSApplicationDelegate protocol methods
         // and `override`/`@objc` self-dispatched helpers are framework-invoked,
         // never "called by identifier" — they were FALSE HIGH-confidence dead.
         // Crediting them as local_uses removes the FP (can only ADD a use,
@@ -1403,7 +1500,7 @@ extension WorkspaceCacheStore: Searchable {}
 
     #[test]
     fn credits_uniffi_generated_glue_via_header() {
-        // loctree-fail.md (2026-06-26): UniFFI-generated bridge glue is reached
+        // loctree-feedback.md (2026-06-26): UniFFI-generated bridge glue is reached
         // only across the FFI boundary (C/Rust), has 0 in-Swift references, and
         // was flagged HIGH-confidence dead. The autogenerated header marks the
         // whole file as generated → every export is credited as used.
@@ -1526,7 +1623,7 @@ extension WorkspaceCacheStore: Searchable {}
 
     #[test]
     fn credits_appkit_toolbar_and_table_delegate_requirements() {
-        // W9-B / loctree-fail.md (2026-07-23): NSToolbarDelegate /
+        // W9-B / loctree-feedback.md (2026-07-23): NSToolbarDelegate /
         // NSTableViewDataSource requirements are AppKit-dispatched with zero
         // identifier references. Without protocol-gated credit they land as
         // dead-HIGH (vibecrafted MainWindowController).

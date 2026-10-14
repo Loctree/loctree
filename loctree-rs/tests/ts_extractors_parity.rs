@@ -3,7 +3,7 @@
 //! green test set; invoke explicitly to print a per-category match table.
 //!
 //! OXC's `analyze_js_file_ast` is `pub(crate)`, so direct cross-stack diff
-//! lives in the report (`.vibecrafted/reports/lsp/19-cross-lang-stage-1.md`)
+//! lives in the report (`internal-artifacts/reports/lsp/19-cross-lang-stage-1.md`)
 //! using the canonical CLI smoke (`LOCTREE_PARSER=ts ... vs ... LOCTREE_PARSER=oxc`).
 //! This harness validates the tree-sitter side hits the expected counts.
 

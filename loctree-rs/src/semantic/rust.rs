@@ -34,6 +34,15 @@ use crate::semantic::{
 };
 use crate::types::{FileAnalysis, Language, Visibility};
 
+// H3(a): axum route detector. Declared here (not in `semantic/mod.rs`,
+// which this executor does not own) via an explicit `#[path]` so the
+// sibling file `semantic/rust_routes.rs` becomes reachable as
+// `semantic::rust::rust_routes` without touching any file outside this
+// executor's COMPILE_EMBARGO edit surface. See that module's doc comment
+// for the pipeline-wiring gap this leaves for the integrator.
+#[path = "rust_routes.rs"]
+pub(crate) mod rust_routes;
+
 /// `FileAnalysis::language` is a string. Layer 1 emits `"rs"` for Rust files
 /// via `analyzer/classify::detect_language`.
 const LANG_STR: &str = "rs";

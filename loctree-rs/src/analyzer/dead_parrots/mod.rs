@@ -643,6 +643,15 @@ pub fn find_dead_exports(
                 // Skip barrel bindings to avoid double-reporting re-exported symbols
                 continue;
             }
+            if exp.kind == "test" {
+                // Zig `test { ... }` blocks are pushed as synthetic exports
+                // (`test#N`, zig.rs push_tests) so they show up in the
+                // symbol/tagmap surfaces. They are never referenced by
+                // anything (a test block has no caller by design), so
+                // without this skip every one of them is a guaranteed
+                // 0-reference "high confidence dead" false positive.
+                continue;
+            }
 
             // Rust-specific heuristics: skip common macro-derived public types and CLI args
             let rust_macro_marked = is_rust_file
@@ -768,7 +777,9 @@ pub fn find_dead_exports(
                 continue;
             }
 
-            let is_used = used_exports.contains(&(path_norm.clone(), exp.name.clone()));
+            let is_used = used_exports.contains(&(path_norm.clone(), exp.name.clone()))
+                || (exp.kind == "default_object_member"
+                    && used_exports.contains(&(path_norm.clone(), "default".to_string())));
             // Also check if "*" was imported from this file
             let star_used = used_exports.contains(&(path_norm.clone(), "*".to_string()));
             let locally_used = local_uses.contains(&exp.name);
@@ -1398,6 +1409,44 @@ fn scan_command_new_spawns(content: &str) -> CommandNewScan {
     CommandNewScan { keys, unknown }
 }
 
+/// Function-call markers that mark a line as spawn/exec/dynamic-load
+/// context, across the languages this scanner sees in the wild (Rust,
+/// JS/TS, Python, shell). A string literal that merely CONTAINS a
+/// candidate's file stem is not, by itself, evidence the file is spawned by
+/// string — a log message or comment mentioning the module name by
+/// coincidence must not degrade every export in that file. Requiring one of
+/// these markers on the same line ties the evidence to an actual call site.
+const SPAWN_EXEC_CONTEXT_MARKERS: &[&str] = &[
+    "Command::new",
+    "spawn(",
+    "spawnSync(",
+    "spawn_link(",
+    "execFile(",
+    "execFileSync(",
+    "exec(",
+    "execSync(",
+    "Popen(",
+    "subprocess.run(",
+    "subprocess.call(",
+    "subprocess.check_call(",
+    "subprocess.check_output(",
+    "os.system(",
+    "os.exec",
+    "require(",
+    "import(",
+    "dlopen(",
+    "LoadLibrary(",
+    "posix_spawn(",
+];
+
+/// True when `line` looks like an actual spawn/exec/dynamic-load call site,
+/// not just incidental text. Used to fence stem-based string-hit evidence
+/// (see [`SPAWN_EXEC_CONTEXT_MARKERS`]) — never applied to a direct
+/// candidate-symbol-name match, which is already a more specific signal.
+fn line_has_spawn_exec_context(line: &str) -> bool {
+    SPAWN_EXEC_CONTEXT_MARKERS.iter().any(|m| line.contains(m))
+}
+
 /// Cross-check dead-export candidates against the literal truth layer and —
 /// when the snapshot carries one — the symbol graph, then apply the
 /// entry-point fence. Generic evidence degrades confidence into `reason`.
@@ -1465,11 +1514,13 @@ pub fn cross_check_dead_exports(
                     push_hit(&mut string_hits, sym, &fa.path, lit.line, true, &mut seen);
                 }
             }
-            for stem in &all_stems {
-                if !occurrences_in_line(&lit.value, stem).is_empty() {
-                    push_hit(&mut string_hits, stem, &fa.path, lit.line, true, &mut seen);
-                }
-            }
+            // Stem hits need spawn/exec context (F1: same-stem string-hit
+            // fencing must not broadcast to every candidate in the file).
+            // The snapshot's `string_literals` fact carries only the
+            // literal's own text, not its surrounding line, so it cannot be
+            // context-checked here — Pass 2's disk scan (below) is the only
+            // source for stem evidence; it re-derives the same literals
+            // with real line text to gate against.
         }
     }
 
@@ -1515,7 +1566,20 @@ pub fn cross_check_dead_exports(
                     continue;
                 }
                 for occ in scan_text(&fa.path, &content, stem) {
-                    if occ.occurrence_kind == OccurrenceKind::StringLiteral {
+                    if occ.occurrence_kind != OccurrenceKind::StringLiteral {
+                        continue;
+                    }
+                    // F1: a string literal that merely contains the file's
+                    // stem is not spawn-by-string evidence on its own — an
+                    // unrelated log message ("loading from hf_cache") must
+                    // not degrade every export in hf_cache.rs. Require the
+                    // hit's own line to look like an actual spawn/exec/
+                    // dynamic-load call (Command::new, spawn(...), etc.).
+                    let line_text = content
+                        .lines()
+                        .nth(occ.line.saturating_sub(1))
+                        .unwrap_or("");
+                    if line_has_spawn_exec_context(line_text) {
                         push_hit(&mut string_hits, stem, &fa.path, occ.line, true, &mut seen);
                     }
                 }
@@ -1895,7 +1959,7 @@ mod tests {
         );
     }
 
-    // loctree-fail 2026-08-12: `canBecomeKey` (an AppKit `override`) was promoted
+    // loctree-feedback 2026-08-12: `canBecomeKey` (an AppKit `override`) was promoted
     // to a delete quick-win with confidence=high. An override is dispatched by the
     // superclass, so "no references from Swift code" is what a correct override
     // looks like — not evidence that it is dead.
@@ -2919,6 +2983,44 @@ pub fn boot() {
         assert!(
             result.is_empty(),
             "alias-prefixed dynamic import should keep target reachable"
+        );
+    }
+
+    #[test]
+    fn consumed_default_object_keeps_members_live_but_not_named_exports() {
+        let mut importer = mock_file("src/app.ts");
+        let mut import = ImportEntry::new("./jobs".into(), ImportKind::Static);
+        import.resolved_path = Some("src/jobs.ts".into());
+        import.symbols = vec![ImportSymbol {
+            name: "jobs".into(),
+            alias: None,
+            is_default: true,
+        }];
+        importer.imports.push(import);
+        let mut exporter =
+            mock_file_with_exports("src/jobs.ts", vec!["default", "getJob", "unusedNamed"]);
+        exporter.exports[0].kind = "default".into();
+        exporter.exports[0].export_type = "default".into();
+        exporter.exports[1].kind = "default_object_member".into();
+        exporter.exports[1].export_type = "default".into();
+        let dead = find_dead_exports(
+            &[importer, exporter.clone()],
+            false,
+            None,
+            DeadFilterConfig::default(),
+        );
+        assert!(
+            !dead.iter().any(|d| d.symbol == "getJob"),
+            "default object consumption keeps its members live"
+        );
+        assert!(
+            dead.iter().any(|d| d.symbol == "unusedNamed"),
+            "unrelated named exports remain candidates"
+        );
+        let unconsumed = find_dead_exports(&[exporter], false, None, DeadFilterConfig::default());
+        assert!(
+            unconsumed.iter().any(|d| d.symbol == "getJob"),
+            "unconsumed objects still expose dead members"
         );
     }
 

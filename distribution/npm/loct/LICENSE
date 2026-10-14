@@ -18,7 +18,7 @@ Parameters
                         - The Loctree suite and all artifacts
                           published from it: loct, loctree-mcp, loctree-lsp,
                           the loctree library crate, report-leptos,
-                          and the loctree-landing site.
+                          rmcp-common, and the loctree-landing site.
                         - Copyright (c) 2024-2026 Libraxis AI sp. z o.o.
 
   Additional Use Grant: You may make production use of the Licensed Work,

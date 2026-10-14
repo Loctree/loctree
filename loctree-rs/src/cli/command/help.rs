@@ -642,7 +642,7 @@ mod tests {
         assert!(find.contains("--regex"));
         assert!(find.contains("--count-only"));
         assert!(find.contains("--offset"));
-        // Advertised flags must stay parseable (loctree-fail help↔parser drift).
+        // Advertised flags must stay parseable (loctree-feedback help↔parser drift).
         for flag in ["--root", "--compact", "--project", "--path"] {
             assert!(find.contains(flag), "find help missing {flag}");
         }

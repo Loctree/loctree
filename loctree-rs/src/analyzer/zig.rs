@@ -133,7 +133,15 @@ fn strip_line_comment(line: &str) -> &str {
 
 /// Resolve a Zig `@import("path.zig")` relative to the file's directory.
 /// `std`/`builtin`/`root` return None (stdlib).
-pub fn resolve_zig_import(spec: &str, file_path: &Path, _root: &Path) -> Option<String> {
+///
+/// G6: every other resolver in this analyzer (JS/TS, Python, Rust) returns a
+/// path relative to `root` so impact/cycles can do exact keyed lookups
+/// against `FileAnalysis::path` (also root-relative). This resolver used to
+/// return the OS-canonical *absolute* path instead, so a resolved Zig edge's
+/// `to` never matched any indexed file's `path` and the edge was invisible
+/// to impact/cycles. Canonicalize for the `.exists()` check (symlinks,
+/// `..`), then re-express the result relative to `root` before returning.
+pub fn resolve_zig_import(spec: &str, file_path: &Path, root: &Path) -> Option<String> {
     if spec == "std" || spec == "builtin" || spec == "root" {
         return None;
     }
@@ -145,7 +153,15 @@ pub fn resolve_zig_import(spec: &str, file_path: &Path, _root: &Path) -> Option<
     };
     if candidate.exists() {
         let canon = candidate.canonicalize().unwrap_or(candidate);
-        return Some(canon.to_string_lossy().to_string());
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        // Indexed FileAnalysis paths are slash-normalized; keep edge targets
+        // in the same alphabet on Windows.
+        let rel = canon
+            .strip_prefix(&canon_root)
+            .ok()?
+            .to_string_lossy()
+            .replace('\\', "/");
+        return Some(rel);
     }
     None
 }
@@ -227,6 +243,59 @@ const tree = @import("../shared/tree.zig");
             .find(|i| i.source == "std")
             .expect("std import present");
         assert_eq!(std_entry.resolution, ImportResolutionKind::Stdlib);
+    }
+
+    #[test]
+    fn resolve_zig_import_returns_root_relative_path() {
+        // G6: resolve_zig_import used to return the OS-canonical *absolute*
+        // path while every other resolver (JS/TS, Python, Rust) returns a
+        // path relative to `root` — impact/cycles key their lookups against
+        // `FileAnalysis::path`, which is always root-relative, so an absolute
+        // `to` made every Zig edge invisible to those passes.
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+        std::fs::write(root.join("src/main.zig"), "// entry\n").expect("write main.zig");
+        std::fs::write(root.join("src/helpers.zig"), "pub fn help() void {}\n")
+            .expect("write helpers.zig");
+
+        let file_path = root.join("src/main.zig");
+        let resolved =
+            resolve_zig_import("./helpers.zig", &file_path, root).expect("resolves sibling");
+
+        assert!(
+            !resolved.starts_with('/'),
+            "resolved zig import must be root-relative, got: {resolved:?}"
+        );
+        assert!(
+            !Path::new(&resolved).is_absolute(),
+            "resolved zig import must not be an absolute path: {resolved:?}"
+        );
+        assert_eq!(resolved, "src/helpers.zig");
+    }
+
+    #[test]
+    fn resolve_zig_import_rejects_target_outside_root() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let root = tmp.path().join("src");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("main.zig"), "// entry\n").unwrap();
+        std::fs::write(tmp.path().join("shared.zig"), "pub fn shared() void {}\n").unwrap();
+        assert_eq!(
+            resolve_zig_import("../shared.zig", &root.join("main.zig"), &root),
+            None,
+            "outside-root files cannot be local graph targets"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("shared.zig"), root.join("alias.zig"))
+                .unwrap();
+            assert_eq!(
+                resolve_zig_import("alias.zig", &root.join("main.zig"), &root),
+                None,
+                "a symlink must not bypass the canonical root fence"
+            );
+        }
     }
 
     #[test]

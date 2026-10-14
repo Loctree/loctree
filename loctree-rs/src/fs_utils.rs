@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use crate::types::Options;
 
 /// Newtype proving a path has been:
@@ -526,7 +528,7 @@ fn matchers_exclude(matchers: &IgnoreMatchers, abs_path: &Path) -> bool {
 /// not loctignore-excluded. This lets callers (focus / slice) distinguish
 /// "wrong path — check it" from "right path, but parked outside the snapshot by
 /// .loctignore", instead of misleadingly telling the user to check a path that
-/// is in fact correct (loctree-fail.md: example-app `docs/` excluded by .loctignore).
+/// is in fact correct (loctree-feedback.md: example-app `docs/` excluded by .loctignore).
 pub fn loctignore_exclusion_hint(root: &Path, target: &str) -> Option<String> {
     let abs = root.join(target);
     if !abs.exists() {
@@ -805,7 +807,7 @@ pub fn is_allowed_hidden(name: &str) -> bool {
     }
     matches!(
         lower.as_str(),
-        ".cargo" | ".config" | ".github" | ".example"
+        ".cargo" | ".config" | ".github" | ".example" | ".devcontainer"
     ) || is_hidden_truth_config_filename(&lower)
 }
 
@@ -906,6 +908,195 @@ pub fn should_ignore(
     false
 }
 
+/// N4 (round-2): why the scan walk dropped a path. Recorded per reason into
+/// [`GatherDiagnostics`] so universe accounting can name what fell outside
+/// the index instead of a bare "outside_snapshot" boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatherExclusionReason {
+    /// Matched by the git ignore checker (`.gitignore` and friends).
+    Gitignore,
+    /// Matched a `.loctignore`/`--ignore` path-prefix or glob rule (both
+    /// share one matcher channel at walk time and cannot be told apart here).
+    IgnoreRule,
+    /// Dotfile/dot-dir not whitelisted by `show_hidden`/allowed-hidden rules.
+    Hidden,
+    /// `node_modules`/`.git`/`target`/`.venv`/`venv`/`__pycache__` with
+    /// `scan_all` off.
+    HeavyDir,
+    /// File extension not in the analyzer extension set.
+    UnsupportedExtension,
+    /// Directory carrying its own `.git` - another project's checkout.
+    NestedRepo,
+    /// Symlink whose target escapes the scan root.
+    SymlinkEscape,
+    /// Directory beyond `max_depth`.
+    Depth,
+    /// Broken symlink or metadata/stat failure.
+    Unreadable,
+}
+
+impl GatherExclusionReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gitignore => "gitignore",
+            Self::IgnoreRule => "ignore_rule",
+            Self::Hidden => "hidden",
+            Self::HeavyDir => "heavy_dir",
+            Self::UnsupportedExtension => "unsupported_extension",
+            Self::NestedRepo => "nested_repo",
+            Self::SymlinkEscape => "symlink_escape",
+            Self::Depth => "depth",
+            Self::Unreadable => "unreadable",
+        }
+    }
+
+    /// Human phrasing used in universe exclusion `reason` strings.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Gitignore => "excluded by gitignore rules",
+            Self::IgnoreRule => "excluded by .loctignore/--ignore rules",
+            Self::Hidden => "hidden dotfile/dot-dir not shown",
+            Self::HeavyDir => "heavy directory skipped (node_modules/.git/target/...)",
+            Self::UnsupportedExtension => "extension outside the analyzer set",
+            Self::NestedRepo => "nested git checkout boundary",
+            Self::SymlinkEscape => "symlink target escapes the scan root",
+            Self::Depth => "beyond max_depth",
+            Self::Unreadable => "broken symlink or unreadable metadata",
+        }
+    }
+}
+
+/// Max sample paths kept per exclusion reason. Beyond the cap only the exact
+/// count grows - full excluded lists on huge repos would be a payload-budget
+/// DoS (N4 boundary 4).
+pub const GATHER_SAMPLE_CAP: usize = 50;
+
+/// One reason bucket: exact count plus a capped path sample.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatherExclusionBucket {
+    pub reason: GatherExclusionReason,
+    pub count: usize,
+    /// First [`GATHER_SAMPLE_CAP`] excluded paths (scan-root-relative when
+    /// possible). Truncated by construction; compare against `count`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample: Vec<String>,
+}
+
+/// Scan-walk exclusion diagnostics: which paths the gather dropped and why.
+/// Attached to the `Snapshot` so universe accounting can name excluded
+/// surfaces instead of a bare `outside_snapshot` with `files: None`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatherDiagnostics {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub buckets: Vec<GatherExclusionBucket>,
+}
+
+impl GatherDiagnostics {
+    fn record(&mut self, reason: GatherExclusionReason, path: &Path, scan_root: &Path) {
+        let idx = match self.buckets.iter().position(|b| b.reason == reason) {
+            Some(idx) => idx,
+            None => {
+                self.buckets.push(GatherExclusionBucket {
+                    reason,
+                    count: 0,
+                    sample: Vec::new(),
+                });
+                self.buckets.len() - 1
+            }
+        };
+        let bucket = &mut self.buckets[idx];
+        bucket.count += 1;
+        if bucket.sample.len() < GATHER_SAMPLE_CAP {
+            let display = path
+                .strip_prefix(scan_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            bucket.sample.push(display);
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.buckets.iter().map(|bucket| bucket.count).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// Fold another root's diagnostics into this one (multi-root scans),
+    /// keeping the per-reason sample cap.
+    pub fn merge(&mut self, other: GatherDiagnostics) {
+        for bucket in other.buckets {
+            match self.buckets.iter_mut().find(|b| b.reason == bucket.reason) {
+                Some(existing) => {
+                    existing.count += bucket.count;
+                    for path in bucket.sample {
+                        if existing.sample.len() >= GATHER_SAMPLE_CAP {
+                            break;
+                        }
+                        existing.sample.push(path);
+                    }
+                }
+                None => self.buckets.push(bucket),
+            }
+        }
+    }
+}
+
+/// Process-local handoff of gather diagnostics from the scan walk to
+/// snapshot assembly, keyed by canonical scan root. This avoids changing the
+/// `gather_files` signature for callers outside this cut's write scope
+/// (`root_scan.rs`); the snapshot builder drains entries via
+/// [`take_gather_diagnostics`]. At most one entry per distinct scanned root
+/// lives here, and only until the snapshot build drains it.
+static GATHER_DIAGNOSTICS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, GatherDiagnostics>>,
+> = std::sync::OnceLock::new();
+
+fn gather_diagnostics_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, GatherDiagnostics>> {
+    GATHER_DIAGNOSTICS.get_or_init(std::sync::Mutex::default)
+}
+
+/// Drain gather-walk diagnostics recorded for `root` (canonicalized inside).
+/// Returns `None` when nothing was excluded or the entry was already taken.
+pub fn take_gather_diagnostics(root: &Path) -> Option<GatherDiagnostics> {
+    let canon = root.canonicalize().ok()?;
+    let registry = GATHER_DIAGNOSTICS.get()?;
+    let mut map = registry.lock().ok()?;
+    map.remove(&canon).filter(|diag| !diag.is_empty())
+}
+
+/// Like [`should_ignore`], but reports WHICH channel matched so the walk can
+/// record an honest exclusion reason.
+fn ignore_reason(
+    full_path: &Path,
+    options: &Options,
+    git_checker: Option<&GitIgnoreChecker>,
+) -> Option<GatherExclusionReason> {
+    if options
+        .ignore_paths
+        .iter()
+        .any(|ignored| full_path.starts_with(ignored))
+    {
+        return Some(GatherExclusionReason::IgnoreRule);
+    }
+    if let Some(globs) = &options.ignore_globs
+        && globs.is_match(full_path)
+    {
+        return Some(GatherExclusionReason::IgnoreRule);
+    }
+    if options.use_gitignore
+        && let Some(checker) = git_checker
+        && checker.is_ignored(full_path)
+    {
+        return Some(GatherExclusionReason::Gitignore);
+    }
+    None
+}
+
 pub fn gather_files(
     dir: &Path,
     options: &Options,
@@ -915,8 +1106,24 @@ pub fn gather_files(
     files: &mut Vec<PathBuf>,
 ) -> io::Result<()> {
     let dir_canon = dir.canonicalize()?;
+    let mut diagnostics = GatherDiagnostics::default();
     // First call: scan_root = dir_canon. Recursive calls pass it through.
-    gather_files_inner(dir, &dir_canon, options, depth, git_checker, visited, files)
+    gather_files_inner(
+        dir,
+        &dir_canon,
+        options,
+        depth,
+        git_checker,
+        visited,
+        files,
+        &mut diagnostics,
+    )?;
+    if !diagnostics.is_empty()
+        && let Ok(mut map) = gather_diagnostics_registry().lock()
+    {
+        map.insert(dir_canon, diagnostics);
+    }
+    Ok(())
 }
 
 /// A subdirectory that carries its own `.git` (directory, or file for
@@ -932,6 +1139,9 @@ fn is_nested_git_repo(dir: &Path) -> bool {
     dir.join(".git").exists()
 }
 
+// The walker's state is threaded explicitly through the recursion; folding it
+// into a context struct would touch every call site for no behavioral gain.
+#[allow(clippy::too_many_arguments)]
 fn gather_files_inner(
     dir: &Path,
     scan_root: &Path,
@@ -940,6 +1150,7 @@ fn gather_files_inner(
     git_checker: Option<&GitIgnoreChecker>,
     visited: &mut HashSet<PathBuf>,
     files: &mut Vec<PathBuf>,
+    diagnostics: &mut GatherDiagnostics,
 ) -> io::Result<()> {
     let dir_canon = dir.canonicalize()?;
     if !visited.insert(dir_canon.clone()) {
@@ -961,11 +1172,16 @@ fn gather_files_inner(
                     || name_str == "venv"
                     || name_str == "__pycache__")
             {
+                diagnostics.record(GatherExclusionReason::HeavyDir, &entry.path(), scan_root);
                 return false;
             }
 
             let is_hidden = name_str.starts_with('.');
-            options.show_hidden || !is_hidden || is_allowed_hidden(&name_str)
+            let shown = options.show_hidden || !is_hidden || is_allowed_hidden(&name_str);
+            if !shown {
+                diagnostics.record(GatherExclusionReason::Hidden, &entry.path(), scan_root);
+            }
+            shown
         })
         .collect();
 
@@ -978,18 +1194,25 @@ fn gather_files_inner(
 
     for entry in dir_entries {
         let path = entry.path();
-        if should_ignore(&path, options, git_checker) {
+        if let Some(reason) = ignore_reason(&path, options, git_checker) {
+            diagnostics.record(reason, &path, scan_root);
             continue;
         }
 
         let file_type = match entry.file_type() {
             Ok(ft) => ft,
-            Err(_) => continue,
+            Err(_) => {
+                diagnostics.record(GatherExclusionReason::Unreadable, &path, scan_root);
+                continue;
+            }
         };
         if file_type.is_symlink() {
             let target = match fs::canonicalize(&path) {
                 Ok(p) => p,
-                Err(_) => continue, // broken symlink
+                Err(_) => {
+                    diagnostics.record(GatherExclusionReason::Unreadable, &path, scan_root);
+                    continue; // broken symlink
+                }
             };
             if visited.contains(&target) {
                 continue;
@@ -999,14 +1222,19 @@ fn gather_files_inner(
             // scan root, not the current recursion dir, so intra-repo symlinks
             // like src/data -> ../shared/data still work.
             if !target.starts_with(scan_root) {
+                diagnostics.record(GatherExclusionReason::SymlinkEscape, &path, scan_root);
                 continue;
             }
             let meta = match fs::metadata(&path) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    diagnostics.record(GatherExclusionReason::Unreadable, &path, scan_root);
+                    continue;
+                }
             };
             if meta.is_dir() && options.max_depth.is_none_or(|max| depth < max) {
                 if !options.scan_all && is_nested_git_repo(&target) {
+                    diagnostics.record(GatherExclusionReason::NestedRepo, &target, scan_root);
                     continue;
                 }
                 gather_files_inner(
@@ -1017,13 +1245,22 @@ fn gather_files_inner(
                     git_checker,
                     visited,
                     files,
+                    diagnostics,
                 )?;
+            } else if meta.is_dir() {
+                diagnostics.record(GatherExclusionReason::Depth, &target, scan_root);
             } else if meta.is_file()
                 && (matches_extension(&target, options.extensions.as_ref())
                     || matches_extensionless_source_shebang(&target, options.extensions.as_ref())
                     || matches_extensionless_text(&target))
             {
                 files.push(target);
+            } else if meta.is_file() {
+                diagnostics.record(
+                    GatherExclusionReason::UnsupportedExtension,
+                    &target,
+                    scan_root,
+                );
             }
             continue;
         }
@@ -1035,11 +1272,18 @@ fn gather_files_inner(
                 || matches_extensionless_text(&canonical)
             {
                 files.push(canonical);
+            } else {
+                diagnostics.record(
+                    GatherExclusionReason::UnsupportedExtension,
+                    &path,
+                    scan_root,
+                );
             }
             continue;
         }
         if path.is_dir() && options.max_depth.is_none_or(|max| depth < max) {
             if !options.scan_all && is_nested_git_repo(&path) {
+                diagnostics.record(GatherExclusionReason::NestedRepo, &path, scan_root);
                 continue;
             }
             gather_files_inner(
@@ -1050,7 +1294,10 @@ fn gather_files_inner(
                 git_checker,
                 visited,
                 files,
+                diagnostics,
             )?;
+        } else if path.is_dir() {
+            diagnostics.record(GatherExclusionReason::Depth, &path, scan_root);
         }
     }
 
@@ -1168,6 +1415,49 @@ mod tests {
         assert!(!as_strings.contains(&"skip.txt".to_string()));
         assert!(as_strings.contains(&"deep.rs".to_string()));
         assert!(!as_strings.contains(&".hidden.rs".to_string()));
+    }
+
+    /// N4 (round-2): the walk records excluded paths with reasons so universe
+    /// accounting can name what fell outside the index.
+    #[test]
+    fn gather_records_exclusion_diagnostics() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let root = tmp.path();
+        std::fs::write(root.join("keep.rs"), "// ok").expect("write keep.rs");
+        std::fs::write(root.join("skip.txt"), "nope").expect("write skip.txt");
+        std::fs::create_dir_all(root.join("node_modules")).expect("node_modules");
+        std::fs::write(root.join("node_modules").join("pkg.rs"), "// vendored")
+            .expect("vendored file");
+        std::fs::create_dir_all(root.join(".hidden")).expect("hidden dir");
+        std::fs::write(root.join(".hidden").join("data.rs"), "// hidden").expect("hidden file");
+
+        let mut files = Vec::new();
+        let opts = opts_with_ext("rs");
+        let mut visited = HashSet::new();
+        gather_files(root, &opts, 0, None, &mut visited, &mut files).expect("gather files");
+
+        let diag = take_gather_diagnostics(root).expect("diagnostics must be recorded");
+        let bucket =
+            |reason: GatherExclusionReason| diag.buckets.iter().find(|b| b.reason == reason);
+
+        let unsupported = bucket(GatherExclusionReason::UnsupportedExtension)
+            .expect("skip.txt must be counted as unsupported_extension");
+        assert_eq!(unsupported.count, 1);
+        assert!(
+            unsupported.sample.iter().any(|p| p.ends_with("skip.txt")),
+            "sample must name the excluded path: {:?}",
+            unsupported.sample
+        );
+
+        let heavy =
+            bucket(GatherExclusionReason::HeavyDir).expect("node_modules must be heavy_dir");
+        assert!(heavy.sample.iter().any(|p| p.ends_with("node_modules")));
+
+        let hidden = bucket(GatherExclusionReason::Hidden).expect(".hidden must be hidden");
+        assert!(hidden.sample.iter().any(|p| p.ends_with(".hidden")));
+
+        // The take drains the entry - a second take observes nothing.
+        assert!(take_gather_diagnostics(root).is_none());
     }
 
     #[test]
@@ -1575,6 +1865,15 @@ mod tests {
     }
 
     #[test]
+    fn test_is_allowed_hidden_accepts_devcontainer() {
+        // H9: `.devcontainer/` is a tracked, agent-relevant dot-dir (devcontainer.json,
+        // Dockerfile) that was silently dropped by the hidden-dir filter like any
+        // other dotfile. It belongs in the allowlist alongside `.github`/`.cargo`.
+        assert!(is_allowed_hidden(".devcontainer"));
+        assert!(is_allowed_hidden(".DEVCONTAINER")); // case insensitive, matches other entries
+    }
+
+    #[test]
     fn explain_ignore_for_path_reports_hidden_parent_filter() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         std::fs::create_dir_all(tmp.path().join(".secret")).expect("mkdir hidden dir");
@@ -1723,7 +2022,7 @@ mod tests {
 
     #[test]
     fn loctignore_exclusion_hint_distinguishes_ignored_from_wrong_path() {
-        // loctree-fail.md (2026-06-25, example-app): focus(docs)/slice fell back with
+        // loctree-feedback.md (2026-06-25, example-app): focus(docs)/slice fell back with
         // "No files found. Check the path." when docs/ EXISTS on disk but is
         // excluded by .loctignore. The hint must name .loctignore so the agent
         // does not chase a wrong-path that is actually correct.

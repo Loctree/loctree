@@ -188,6 +188,23 @@ pub(crate) fn regex_rust_async_main_attr() -> &'static Regex {
     RE.get_or_init(|| regex(r#"(?m)^#\[(tokio|async_std)::main\]"#))
 }
 
+/// H3(a): matches axum-style `.route("/path", method(handler))`
+/// registrations (`Router::new().route("/api/x", get(handler))`).
+/// Captures: (1) route path literal, (2) HTTP method combinator name
+/// (get/post/put/delete/patch/head/options/trace/any/get_service),
+/// (3) handler function/expression name. Deliberately regex-based, not a
+/// full chain parse — a `.route("/x", get(a).post(b))` combo only matches
+/// the first bound method, matching this crate's existing Rust
+/// route/command detectors' level of precision.
+pub(crate) fn regex_axum_route() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex(
+            r#"(?m)\.\s*route\s*\(\s*"([^"]+)"\s*,\s*(get|post|put|delete|patch|head|options|trace|any|get_service)\s*\(\s*([A-Za-z_][A-Za-z0-9_:]*)\s*\)"#,
+        )
+    })
+}
+
 // --- CSS Regexes ---
 
 pub(crate) fn regex_css_import() -> &'static Regex {
@@ -298,6 +315,31 @@ mod tests {
         // but should still capture the mod name
         assert!(caps.is_some() || regex_rust_mod_decl().is_match("mod test_utils;"));
     }
+}
+
+#[test]
+fn test_axum_route_matches_get_handler() {
+    let re = regex_axum_route();
+    let content = r#"
+let app = Router::new()
+    .route("/api/x", get(handler));
+"#;
+    let caps = re.captures(content).expect("axum .route() must match");
+    assert_eq!(caps.get(1).map(|m| m.as_str()), Some("/api/x"));
+    assert_eq!(caps.get(2).map(|m| m.as_str()), Some("get"));
+    assert_eq!(caps.get(3).map(|m| m.as_str()), Some("handler"));
+}
+
+#[test]
+fn test_axum_route_matches_multiple_in_chain() {
+    let re = regex_axum_route();
+    let content = r#"
+Router::new()
+    .route("/api/x", get(get_x))
+    .route("/api/y", post(create_y))
+"#;
+    let matches: Vec<_> = re.captures_iter(content).collect();
+    assert_eq!(matches.len(), 2, "expected two .route() matches");
 }
 
 #[test]

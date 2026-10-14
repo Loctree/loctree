@@ -867,7 +867,7 @@ pub fn handle_coverage_command(opts: &CoverageOptions, global: &GlobalOptions) -
 
         if include_gaps {
             if gaps.is_empty() {
-                println!("[OK] No coverage gaps found - all production code is tested!");
+                println!("{}", coverage_gaps_ok_message(&snapshot));
                 if !fence.is_empty() {
                     println!(
                         "{} (use --include-artifacts to inspect)",
@@ -966,4 +966,81 @@ pub fn handle_coverage_command(opts: &CoverageOptions, global: &GlobalOptions) -
     }
 
     DispatchResult::Exit(0)
+}
+
+/// H4(a): "[OK] No coverage gaps found - all production code is tested!"
+/// used to print whenever `gaps.is_empty()`, but a repo with ZERO detected
+/// handlers/events (a non-Tauri codebase, or a scan that simply found
+/// nothing to bridge) also produces an empty gap list - and that's not a
+/// coverage win, there was nothing to check in the first place. Distinguish
+/// the two so an empty result only reads as "fully tested" when there was
+/// something to test.
+fn coverage_gaps_ok_message(snapshot: &crate::snapshot::Snapshot) -> &'static str {
+    let has_any_handlers = snapshot
+        .command_bridges
+        .iter()
+        .any(|bridge| bridge.has_handler && bridge.is_called)
+        || snapshot
+            .event_bridges
+            .iter()
+            .any(|bridge| !bridge.emits.is_empty());
+
+    if has_any_handlers {
+        "[OK] No coverage gaps found - all production code is tested!"
+    } else {
+        "[--] No handlers or events detected - nothing to check coverage for (not a coverage result)"
+    }
+}
+
+#[cfg(test)]
+mod coverage_message_tests {
+    use super::coverage_gaps_ok_message;
+    use crate::snapshot::{CommandBridge, EventBridge, Snapshot};
+
+    /// H4(a) RED: zero handlers AND zero events must not read as "all
+    /// production code is tested" - there was nothing to test.
+    #[test]
+    fn zero_handlers_and_events_is_not_reported_as_full_coverage() {
+        let snapshot = Snapshot::new(vec![".".to_string()]);
+        let msg = coverage_gaps_ok_message(&snapshot);
+        assert!(
+            !msg.contains("all production code is tested"),
+            "a snapshot with zero handlers/events must not claim full coverage, got: {msg:?}"
+        );
+    }
+
+    /// Guard: a real, called, tested handler with no gaps must still read as
+    /// genuine full coverage - the H4(a) fix must not over-fire.
+    #[test]
+    fn real_handler_with_no_gaps_is_reported_as_full_coverage() {
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.command_bridges = vec![CommandBridge {
+            name: "get_user".to_string(),
+            frontend_calls: vec![("src/app.ts".to_string(), 10)],
+            backend_handler: Some(("src/handlers.rs".to_string(), 5)),
+            has_handler: true,
+            is_called: true,
+        }];
+        let msg = coverage_gaps_ok_message(&snapshot);
+        assert!(
+            msg.contains("all production code is tested"),
+            "a snapshot with a real called+handled command must read as full coverage, got: {msg:?}"
+        );
+    }
+
+    /// Guard: an emitted-but-ungapped event also counts as "something to
+    /// check" even with zero command bridges.
+    #[test]
+    fn real_event_with_no_gaps_is_reported_as_full_coverage() {
+        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        snapshot.event_bridges = vec![EventBridge {
+            name: "user_saved".to_string(),
+            emits: vec![("src/app.ts".to_string(), 10, "emit_const".to_string())],
+            listens: vec![],
+            is_fe_sync: false,
+            same_file_sync: false,
+        }];
+        let msg = coverage_gaps_ok_message(&snapshot);
+        assert!(msg.contains("all production code is tested"));
+    }
 }

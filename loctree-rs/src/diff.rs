@@ -607,6 +607,7 @@ mod tests {
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         }
     }
 
@@ -621,6 +622,7 @@ mod tests {
             barrels: vec![],
             semantic_facts: None,
             symbol_graph: None,
+            scan_diagnostics: None,
         }
     }
 

@@ -29,6 +29,20 @@ fn layout_positions(comps: &[Vec<String>]) -> HashMap<String, (f32, f32)> {
     positions
 }
 
+/// Number of edges touching each node, over the untruncated edge list.
+/// Empty endpoints (unresolved imports) are skipped, matching `compute_components`.
+fn incident_degrees(edges: &[(String, String, String)]) -> HashMap<String, usize> {
+    let mut degrees: HashMap<String, usize> = HashMap::new();
+    for (a, b, _) in edges {
+        if a.is_empty() || b.is_empty() {
+            continue;
+        }
+        *degrees.entry(a.clone()).or_insert(0) += 1;
+        *degrees.entry(b.clone()).or_insert(0) += 1;
+    }
+    degrees
+}
+
 type ComponentResult = (
     Vec<Vec<String>>,
     HashMap<String, usize>,
@@ -126,41 +140,51 @@ pub fn build_graph_data(
     let mut truncated = false;
     let mut truncation_reason = None;
 
-    // Truncate to limits if exceeded (instead of discarding entire graph)
+    // Truncate to limits if exceeded (instead of discarding entire graph).
+    // The cut keeps the most connected surface: nodes ranked by degree over the
+    // FULL edge list, edges ranked by the degree of their endpoints. Ties break
+    // on path so the same snapshot always yields the same graph.
     if total_nodes > max_nodes || total_edges > max_edges {
         truncated = true;
         truncation_reason = Some(format!(
-            "Graph exceeds limits: {} nodes (limit: {}), {} edges (limit: {})",
+            "Graph exceeds limits: {} nodes (limit: {}), {} edges (limit: {}); kept highest-degree nodes and edges",
             total_nodes, max_nodes, total_edges, max_edges
         ));
-
-        // Emit warning to stderr
-        eprintln!(
-            "Warning: Graph truncated: showing {} of {} nodes, {} of {} edges",
-            max_nodes.min(total_nodes),
-            total_nodes,
-            max_edges.min(total_edges),
-            total_edges
-        );
     }
 
     let mut nodes_vec: Vec<String> = nodes.into_iter().collect();
     nodes_vec.sort();
 
-    // Truncate nodes if necessary
-    if nodes_vec.len() > max_nodes {
-        nodes_vec.truncate(max_nodes);
-    }
-
-    // Truncate edges if necessary (keep only edges between remaining nodes)
     let truncated_edges: Vec<(String, String, String)> = if truncated {
-        let node_set: HashSet<String> = nodes_vec.iter().cloned().collect();
-        graph_edges
+        let full_degrees = incident_degrees(graph_edges);
+        let degree_of = |n: &String| full_degrees.get(n).copied().unwrap_or(0);
+
+        if nodes_vec.len() > max_nodes {
+            nodes_vec.sort_by(|a, b| degree_of(b).cmp(&degree_of(a)).then_with(|| a.cmp(b)));
+            nodes_vec.truncate(max_nodes);
+            nodes_vec.sort();
+        }
+
+        let node_set: HashSet<&str> = nodes_vec.iter().map(String::as_str).collect();
+        let mut kept: Vec<(String, String, String)> = graph_edges
             .iter()
-            .filter(|(a, b, _)| node_set.contains(a) && node_set.contains(b))
-            .take(max_edges)
+            .filter(|(a, b, _)| node_set.contains(a.as_str()) && node_set.contains(b.as_str()))
             .cloned()
-            .collect()
+            .collect();
+        if kept.len() > max_edges {
+            let weight = |e: &(String, String, String)| degree_of(&e.0) + degree_of(&e.1);
+            kept.sort_by(|x, y| weight(y).cmp(&weight(x)).then_with(|| x.cmp(y)));
+            kept.truncate(max_edges);
+        }
+
+        eprintln!(
+            "Warning: Graph truncated: showing {} of {} nodes, {} of {} edges (highest-degree first)",
+            nodes_vec.len(),
+            total_nodes,
+            kept.len(),
+            total_edges
+        );
+        kept
     } else {
         graph_edges.to_vec()
     };
@@ -566,5 +590,114 @@ mod tests {
         // Label should be just filename, not full path
         assert_eq!(node.label, "Button.tsx");
         assert_eq!(node.id, "src/components/Button.tsx");
+    }
+
+    #[test]
+    fn test_node_truncation_keeps_highest_degree_not_alphabetical() {
+        // 20 isolated files that sort FIRST alphabetically, plus a hub that sorts LAST
+        // with five dependants. An alphabetical cut would keep the isolated files
+        // and drop the hub; a degree cut must do the opposite.
+        let mut analyses: Vec<FileAnalysis> = (0..20)
+            .map(|i| mock_file(&format!("a/isolated{i:02}.ts"), 10))
+            .collect();
+        analyses.push(mock_file("z/hub.ts", 500));
+        let leaves: Vec<String> = (1..=5).map(|i| format!("y/leaf{i}.ts")).collect();
+        for leaf in &leaves {
+            analyses.push(mock_file(leaf, 20));
+        }
+        let edges: Vec<(String, String, String)> = leaves
+            .iter()
+            .map(|leaf| (leaf.clone(), "z/hub.ts".to_string(), "import".to_string()))
+            .collect();
+        let loc_map: HashMap<String, usize> = HashMap::new();
+        let fe_commands: CommandUsage = HashMap::new();
+        let be_commands: CommandUsage = HashMap::new();
+
+        let (graph, _) = build_graph_data(
+            &analyses,
+            &edges,
+            &loc_map,
+            &fe_commands,
+            &be_commands,
+            6, // hub + five leaves exactly
+            MAX_GRAPH_EDGES,
+        );
+
+        let g = graph.unwrap();
+        assert!(g.truncated);
+        assert_eq!(g.total_nodes, 26);
+        let kept: Vec<&str> = g.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "y/leaf1.ts",
+                "y/leaf2.ts",
+                "y/leaf3.ts",
+                "y/leaf4.ts",
+                "y/leaf5.ts",
+                "z/hub.ts",
+            ]
+        );
+        // Every edge lives between kept nodes, so none is lost.
+        assert_eq!(g.edges.len(), 5);
+        assert!(g.truncation_reason.unwrap().contains("highest-degree"));
+    }
+
+    #[test]
+    fn test_edge_truncation_prefers_hub_edges() {
+        // A hub with four dependants (edge weight 5) and two disconnected pairs
+        // (edge weight 2). Input order puts the pairs first so a positional
+        // `.take()` would keep them; the degree cut must keep the hub edges.
+        let analyses = vec![
+            mock_file("p1.ts", 1),
+            mock_file("p2.ts", 1),
+            mock_file("p3.ts", 1),
+            mock_file("p4.ts", 1),
+            mock_file("hub.ts", 1),
+            mock_file("h1.ts", 1),
+            mock_file("h2.ts", 1),
+            mock_file("h3.ts", 1),
+            mock_file("h4.ts", 1),
+        ];
+        let e = |a: &str, b: &str| (a.to_string(), b.to_string(), "import".to_string());
+        let edges = vec![
+            e("p1.ts", "p2.ts"),
+            e("p3.ts", "p4.ts"),
+            e("h4.ts", "hub.ts"),
+            e("h3.ts", "hub.ts"),
+            e("h2.ts", "hub.ts"),
+            e("h1.ts", "hub.ts"),
+        ];
+        let loc_map: HashMap<String, usize> = HashMap::new();
+        let fe_commands: CommandUsage = HashMap::new();
+        let be_commands: CommandUsage = HashMap::new();
+
+        let (graph, _) = build_graph_data(
+            &analyses,
+            &edges,
+            &loc_map,
+            &fe_commands,
+            &be_commands,
+            100,
+            4,
+        );
+
+        let g = graph.unwrap();
+        assert!(g.truncated);
+        assert_eq!(g.total_edges, 6);
+        let kept: Vec<(&str, &str)> = g
+            .edges
+            .iter()
+            .map(|(a, b, _)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                ("h1.ts", "hub.ts"),
+                ("h2.ts", "hub.ts"),
+                ("h3.ts", "hub.ts"),
+                ("h4.ts", "hub.ts"),
+            ]
+        );
     }
 }

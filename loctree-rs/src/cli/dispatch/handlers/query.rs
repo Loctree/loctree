@@ -11,6 +11,81 @@ use super::super::{
 
 const DEFAULT_WHERE_SYMBOL_LIMIT: usize = 25;
 
+/// Standalone `find --file` searches indexed paths, including files without
+/// exported symbols. With a positional query, --file remains a content scope.
+pub fn handle_find_files_command(opts: &FindOptions, global: &GlobalOptions) -> DispatchResult {
+    let pattern = opts.file.as_deref().unwrap_or_default();
+    let regex = match regex::Regex::new(pattern) {
+        Ok(regex) => regex,
+        Err(error) => {
+            eprintln!("[loct][error] invalid file pattern: {error}");
+            return DispatchResult::Exit(2);
+        }
+    };
+    let snapshot = match load_or_create_query_snapshot_for_roots(
+        &opts.scan_roots(),
+        &query_global_options(global),
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            eprintln!("[loct][error] {error}");
+            return DispatchResult::Exit(1);
+        }
+    };
+    let mut files: Vec<_> = snapshot
+        .files
+        .iter()
+        .filter(|file| regex.is_match(&file.path))
+        .filter(|file| {
+            !opts.no_generated
+                || !matches!(
+                    crate::analyzer::classify::artifact_class(&file.path, None),
+                    crate::analyzer::classify::ArtifactClass::Generated
+                        | crate::analyzer::classify::ArtifactClass::Vendored
+                )
+        })
+        .filter(|file| opts.lang.as_ref().is_none_or(|lang| lang == &file.language))
+        .map(|file| file.path.as_str())
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    let total = files.len();
+    let limit = if opts.all {
+        total
+    } else {
+        opts.limit.unwrap_or(50)
+    };
+    let files: Vec<_> = files.into_iter().skip(opts.offset).take(limit).collect();
+    let emitted = files.len();
+    let has_more = opts.offset.saturating_add(emitted) < total;
+    let universe = crate::analyzer::occurrences::IndexedUniverse::from_snapshot(
+        &snapshot,
+        crate::analyzer::occurrences::FileScope::default(),
+        snapshot.files.len(),
+    );
+    if global.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "mode": "files", "pattern": pattern, "files": files, "total": total,
+                "emitted": emitted, "offset": opts.offset, "limit": limit,
+                "has_more": has_more, "truncated": emitted < total, "universe": universe,
+            })
+        );
+    } else {
+        println!("Files matching /{pattern}/ ({total} indexed paths):");
+        for file in files {
+            println!("  {file}");
+        }
+        println!(
+            "accounting: total={total}, emitted={emitted}, offset={}, has_more={has_more}",
+            opts.offset
+        );
+        println!("{}", universe.summary_line());
+    }
+    DispatchResult::Exit(0)
+}
+
 pub fn handle_find_where_symbol_command(
     opts: &FindOptions,
     global: &GlobalOptions,

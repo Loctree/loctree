@@ -211,6 +211,16 @@ pub fn compute_command_gaps_with_confidence(
     let be_norm_set: HashSet<String> = be_norms.values().cloned().collect();
     let fe_norm_set: HashSet<String> = fe_norms.values().cloned().collect();
 
+    // N06 (audit): a frontend call site whose only evidence is a
+    // wrapper-shaped NAME in a file with no Tauri import is a smell, not a
+    // proven runtime break. Collect the import-confirmed call names so the
+    // gap below can carry that distinction.
+    let confirmed_calls: HashSet<String> = analyses
+        .iter()
+        .flat_map(|analysis| analysis.command_calls.iter())
+        .filter(|call| !call.unconfirmed_import)
+        .map(|call| normalize_cmd_name(&call.name))
+        .collect();
     let missing_handlers: Vec<CommandGap> = fe_commands
         .iter()
         .filter_map(|(name, locs)| {
@@ -229,11 +239,18 @@ pub fn compute_command_gaps_with_confidence(
                     .iter()
                     .find(|(p, l, _)| p == &kept[0].0 && *l == kept[0].1)
                     .map(|(_, _, n)| n.clone());
+                // `None` = confirmed missing handler (CRITICAL-worthy).
+                // `Smell` = every call site is unconfirmed wrapper spelling.
+                let confidence = if analyses.is_empty() || confirmed_calls.contains(&norm) {
+                    None
+                } else {
+                    Some(Confidence::Smell)
+                };
                 Some(CommandGap {
                     name: name.clone(),
                     implementation_name: impl_name,
                     locations: kept,
-                    confidence: None, // Missing handlers don't have confidence
+                    confidence,
                     string_literal_matches: Vec::new(),
                 })
             }
@@ -715,5 +732,61 @@ mod tests {
 
         let matches = scan_content_for_handler_literals("get_user", content, "src/test.ts");
         assert!(matches.is_empty());
+    }
+    #[test]
+    fn unconfirmed_wrapper_gap_is_a_smell_not_a_confirmed_missing_handler() {
+        // Audit N06: a gap whose only frontend evidence is an unconfirmed
+        // wrapper call carries Confidence::Smell; an import-confirmed call
+        // keeps `None` (the CRITICAL-worthy shape).
+        let mut fe: CommandUsage = HashMap::new();
+        fe.insert(
+            "wrapper_only".to_string(),
+            vec![("src/app.tsx".to_string(), 3, "wrapper_only".to_string())],
+        );
+        fe.insert(
+            "confirmed_cmd".to_string(),
+            vec![("src/api.ts".to_string(), 7, "confirmed_cmd".to_string())],
+        );
+        let be: CommandUsage = HashMap::new();
+
+        let mut file = FileAnalysis::new("src/app.tsx".to_string());
+        file.command_calls.push(crate::types::CommandRef {
+            name: "wrapper_only".to_string(),
+            exposed_name: None,
+            line: 3,
+            generic_type: None,
+            payload: None,
+            plugin_name: None,
+            unconfirmed_import: true,
+        });
+        let mut api = FileAnalysis::new("src/api.ts".to_string());
+        api.command_calls.push(crate::types::CommandRef {
+            name: "confirmed_cmd".to_string(),
+            exposed_name: None,
+            line: 7,
+            generic_type: None,
+            payload: None,
+            plugin_name: None,
+            unconfirmed_import: false,
+        });
+
+        let (missing, _unused) =
+            compute_command_gaps_with_confidence(&fe, &be, &None, &None, &[file, api]);
+        let wrapper = missing
+            .iter()
+            .find(|g| g.name == "wrapper_only")
+            .expect("wrapper gap present");
+        assert!(
+            matches!(wrapper.confidence, Some(Confidence::Smell)),
+            "unconfirmed wrapper evidence must degrade to Smell"
+        );
+        let confirmed = missing
+            .iter()
+            .find(|g| g.name == "confirmed_cmd")
+            .expect("confirmed gap present");
+        assert!(
+            confirmed.confidence.is_none(),
+            "an import-confirmed missing handler keeps the CRITICAL-worthy shape"
+        );
     }
 }

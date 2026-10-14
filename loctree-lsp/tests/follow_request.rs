@@ -270,6 +270,7 @@ fn compute_trace_scope_returns_engine_trace_result() {
             generic_type: None,
             payload: None,
             plugin_name: None,
+            unconfirmed_import: false,
         }],
         tauri_registered_handlers: vec!["get_user".into()],
         ..Default::default()

@@ -4,12 +4,12 @@
     "div0-space"
   ],
   "name": "loctree",
-  "description": "Structural code intelligence for AI agents. Scan once, query everything: dependency graphs, blast radius, dead exports, circular imports, duplicate surfaces and exact occurrences — so an agent orients before it edits. loctree-suite is the integration repo for the whole product line: the loctree engine and loct CLI, the loctree-mcp MCP server, and the loctree-lsp language server.",
+  "description": "The loctree engine and loct CLI — the AST/import-graph analyzer that loctree-mcp serves over MCP. Scans a repository once and answers structural questions from the snapshot: dependency and importer graphs, blast radius, dead exports, circular imports, duplicate surfaces, health and audit reports, and the Context Atlas. This repository is the full source workspace and also carries the loctree-mcp server source; the standalone MCP server listing is Loctree/loctree-mcp.",
   "license": "BUSL-1.1",
   "homepage": "https://loct.io",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Loctree/loctree-suite"
+    "url": "https://github.com/Loctree/loctree"
   },
   "categories": [
     "developer-tools",
@@ -22,59 +22,12 @@
     "dependency-graph",
     "impact-analysis",
     "dead-code",
-    "refactoring",
-    "rust",
     "cli",
-    "lsp"
+    "rust"
   ],
-  "tools": [
-    {
-      "name": "context",
-      "description": "Complete Agent Context Pack: structural + runtime + risk + action + authority, with optional AICX memory. The session-start surface."
-    },
-    {
-      "name": "repo-view",
-      "description": "Repository overview: file count, LOC, languages, health summary, top hubs, quick wins."
-    },
-    {
-      "name": "slice",
-      "description": "File context before modifying: the file plus every import it pulls and every file that depends on it."
-    },
-    {
-      "name": "body",
-      "description": "Bounded source body/range for a symbol, with extent and truncation metadata."
-    },
-    {
-      "name": "find",
-      "description": "Symbol, importer and occurrence search. Modes: symbols, who-imports, where-symbol, tagmap, crowd, literal."
-    },
-    {
-      "name": "impact",
-      "description": "Blast radius before deleting or refactoring: direct and transitive consumers of a file."
-    },
-    {
-      "name": "diff",
-      "description": "Compare the live snapshot against a git ref: file, graph, export and impact changes."
-    },
-    {
-      "name": "tree",
-      "description": "Directory structure with LOC counts, filters, artifact detection."
-    },
-    {
-      "name": "focus",
-      "description": "Understand a module: files, exports, internal edges, external dependencies, optional consumers."
-    },
-    {
-      "name": "follow",
-      "description": "Pursue structural signals: dead, cycles, twins, hotspots, trace, commands, events, pipelines."
-    },
-    {
-      "name": "suppressions",
-      "description": "Source-side silencer inventory: Rust #[allow]/#[ignore]/unsafe, nosemgrep, @ts-ignore, eslint-disable, noqa, type: ignore, shellcheck disable."
-    },
-    {
-      "name": "prism",
-      "description": "Score conceptual smear across task framings; emits the loctree.prism.v1 schema."
-    }
-  ]
+  "mcpServer": {
+    "package": "loctree-mcp",
+    "listing": "https://github.com/Loctree/loctree-mcp",
+    "note": "This repo ships the engine plus the loctree-mcp source; the MCP surface itself is listed from Loctree/loctree-mcp."
+  }
 }

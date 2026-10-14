@@ -166,10 +166,18 @@ fn parse_concat_args(args_str: &str) -> Option<String> {
             let env_var = part_trimmed["env!(".len()..part_trimmed.len() - 1].trim();
             let parsed_env =
                 parse_rust_string_literal(env_var).unwrap_or_else(|| env_var.to_string());
-            if parsed_env == "CARGO_MANIFEST_DIR" {
-                result.push_str("env:CARGO_MANIFEST_DIR");
-            } else {
-                return None;
+            match parsed_env.as_str() {
+                "CARGO_MANIFEST_DIR" => result.push_str("env:CARGO_MANIFEST_DIR"),
+                // F2d: `env!("OUT_DIR")` names a build-script-generated path
+                // that genuinely does not exist on disk at scan time — hard
+                // rejecting it (as before) threw away the WHOLE concat!,
+                // including a real literal suffix like `/egl_bindings.rs`,
+                // and made `include!(concat!(env!("OUT_DIR"), "..."))`
+                // unparseable. Record it with the same `env:` sentinel
+                // convention as CARGO_MANIFEST_DIR so it stays a structured,
+                // visible include instead of an opaque dynamic blob.
+                "OUT_DIR" => result.push_str("env:OUT_DIR"),
+                _ => return None,
             }
         } else {
             let lit = parse_rust_string_literal(part_trimmed)?;
@@ -382,6 +390,34 @@ mod tests {
             Some("env:CARGO_MANIFEST_DIR/data/x.json".to_string())
         );
         assert_eq!(parse_rust_string_literal("VARIABLE_PATH"), None);
+    }
+
+    #[test]
+    fn f2d_out_dir_concat_include_is_parseable() {
+        // RED (pre-fix): parse_concat_args hard-rejected any env!() other
+        // than CARGO_MANIFEST_DIR, so this returned None and the whole
+        // include! looked unparseable / opaque-dynamic.
+        let result = parse_rust_string_literal(r#"concat!(env!("OUT_DIR"), "/egl_bindings.rs")"#);
+        assert_eq!(
+            result,
+            Some("env:OUT_DIR/egl_bindings.rs".to_string()),
+            "OUT_DIR include must parse to a structured marker, not None"
+        );
+    }
+
+    #[test]
+    fn f2d_extract_includes_records_out_dir_generated_binding() {
+        let code = r#"
+            include!(concat!(env!("OUT_DIR"), "/egl_bindings.rs"));
+        "#;
+        let incs = extract_rust_includes(code, "src/lib.rs");
+        assert_eq!(incs.len(), 1, "expected exactly one include: {:?}", incs);
+        assert_eq!(incs[0].raw, "env:OUT_DIR/egl_bindings.rs");
+        assert!(
+            !incs[0].is_dynamic,
+            "OUT_DIR marker must be a structured record, not an opaque dynamic blob: {:?}",
+            incs[0]
+        );
     }
 
     #[test]

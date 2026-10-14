@@ -408,6 +408,7 @@ mod tests {
                 generic_type: None,
                 payload: None,
                 plugin_name: None,
+                unconfirmed_import: false,
             }],
             ..Default::default()
         }
@@ -518,6 +519,7 @@ mod tests {
             generic_type: None,
             payload: None,
             plugin_name: None,
+            unconfirmed_import: false,
         }];
 
         let analyses = vec![ts_file];

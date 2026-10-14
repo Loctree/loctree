@@ -9,7 +9,7 @@
 //!   member expression, otherwise the full callee text.
 //!
 //! Parity gaps versus OXC are documented in
-//! `.vibecrafted/reports/lsp/19-cross-lang-stage-1.md` (Stage 2 follow-ups).
+//! `internal-artifacts/reports/lsp/19-cross-lang-stage-1.md` (Stage 2 follow-ups).
 
 use std::sync::OnceLock;
 

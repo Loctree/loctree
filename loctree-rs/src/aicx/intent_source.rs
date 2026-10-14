@@ -55,7 +55,7 @@
 //!   tomorrow: a `MockIntentSource` that hands back canned rows
 //!   without touching env vars).
 //! - The blocker doc cited at
-//!   `~/.vibecrafted/inbox/Loctree/aicx/blockers/loctree-side-needs.md`.
+//!   `~/internal-artifacts/inbox/Loctree/aicx/blockers/loctree-side-needs.md`.
 //! - The eventual paid-tier vs. free-tier split (`aicx = { features =
 //!   ["canonical-store"] }` for free; add `"semantic"` for the
 //!   embedding/LLM-enriched paid build). Loctree's trait surface does

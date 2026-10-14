@@ -594,12 +594,8 @@ pub fn resolve_shell_source(spec: &str, file_path: &Path, root: &Path) -> Option
         || target_basename == "."
         || target_basename == ".."
     {
-        // Dynamic or invalid filename: fail closed with an honest unresolved note
-        eprintln!(
-            "[loctree][shell] unresolved source '{}' in {}: dynamic filename",
-            spec,
-            file_path.display()
-        );
+        // The caller retains the unresolved import in the analysis. A library
+        // resolver must not print one process-wide warning per dynamic source.
         return None;
     }
 
@@ -640,14 +636,7 @@ pub fn resolve_shell_source(spec: &str, file_path: &Path, root: &Path) -> Option
         let matched = matches.remove(0);
         return Some(format_resolved_path(&matched, root));
     } else if matches.len() > 1 {
-        // Ambiguous basename: multiple candidate files exist.
-        // Fail closed (no edge) with an honest unresolved note.
-        eprintln!(
-            "[loctree][shell] unresolved source '{}' in {}: ambiguous basename '{}' matches multiple candidates",
-            spec,
-            file_path.display(),
-            target_basename
-        );
+        // Ambiguous basename: retain the unresolved import, never invent an edge.
         return None;
     }
 

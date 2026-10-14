@@ -414,6 +414,70 @@ fn line_is_complete_statement(line: &str, language: &str) -> bool {
     }
 }
 
+/// How far past the definition to search for a depth-0 `{`.
+/// A bare 10-line window missed multi-line signatures and fell through to
+/// [`FALLBACK_WINDOW`], which then swallowed the next item.
+const BRACE_OPENER_LOOKAHEAD_LINES: usize = 200;
+
+/// First `{` at parenthesis depth 0, searching at most
+/// [`BRACE_OPENER_LOOKAHEAD_LINES`] lines from `start_idx`.
+///
+/// Parentheses carry across lines so a `{` inside the parameter list is not
+/// the body opener. `None` means no opener exists in that range — the caller
+/// falls back to the fixed window.
+fn find_depth0_body_brace(lines: &[&str], start_idx: usize, language: &str) -> Option<usize> {
+    let end = (start_idx + BRACE_OPENER_LOOKAHEAD_LINES).min(lines.len());
+    let rust_quotes = language == "rs";
+    let python = is_python_family(language);
+    let mut paren_depth: i32 = 0;
+    let mut in_string: Option<char> = None;
+    for (offset, line) in lines[start_idx..end].iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let mut escaped = false;
+        let mut idx = 0;
+        while idx < chars.len() {
+            let ch = chars[idx];
+            if let Some(q) = in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == q {
+                    in_string = None;
+                }
+                idx += 1;
+                continue;
+            }
+            match ch {
+                '"' | '`' => in_string = Some(ch),
+                '\'' => {
+                    if rust_quotes {
+                        let opens_char_literal =
+                            chars.get(idx + 1) == Some(&'\\') || chars.get(idx + 2) == Some(&'\'');
+                        if opens_char_literal {
+                            in_string = Some('\'');
+                        }
+                    } else {
+                        in_string = Some('\'');
+                    }
+                }
+                '/' if chars.get(idx + 1) == Some(&'/') => break,
+                '#' if python => break,
+                '(' => paren_depth += 1,
+                ')' => {
+                    if paren_depth > 0 {
+                        paren_depth -= 1;
+                    }
+                }
+                '{' if paren_depth == 0 => return Some(start_idx + offset),
+                _ => {}
+            }
+            idx += 1;
+        }
+    }
+    None
+}
+
 /// Resolve the 0-based end index of the body at `start_idx`, together with the
 /// extent strategy that proved it. `EXTENT_WINDOW` means no strategy could
 /// prove a closing boundary — callers must report that as truncated.
@@ -446,15 +510,9 @@ fn resolve_extent(lines: &[&str], start_idx: usize, language: &str) -> (usize, &
         return (start_idx, EXTENT_LINE);
     }
 
-    // Look for the opening brace within a small lookahead from the definition.
-    let mut brace_open_idx: Option<usize> = None;
-    let lookahead_end = (start_idx + 10).min(lines.len());
-    'outer: for (offset, line) in lines[start_idx..lookahead_end].iter().enumerate() {
-        if line.contains('{') {
-            brace_open_idx = Some(start_idx + offset);
-            break 'outer;
-        }
-    }
+    // Depth-0 `{` within BRACE_OPENER_LOOKAHEAD_LINES. A `{` inside the
+    // parameter list does not open the body. No opener in range → window.
+    let brace_open_idx = find_depth0_body_brace(lines, start_idx, language);
 
     if let Some(open_idx) = brace_open_idx {
         // Brace-balanced scan from the opening brace line.
@@ -591,18 +649,29 @@ fn extract_body(
 /// its own checkout, where a coincidentally named `src/lib.rs` would otherwise
 /// return valid-looking source from the wrong repository.
 fn read_source(snapshot: &Snapshot, file: &str) -> Option<String> {
+    std::fs::read_to_string(source_path(snapshot, file)?).ok()
+}
+
+fn source_path(snapshot: &Snapshot, file: &str) -> Option<std::path::PathBuf> {
     let path = std::path::Path::new(file);
     if path.is_absolute() {
-        return std::fs::read_to_string(path).ok();
+        return path.canonicalize().ok();
     }
     for root in &snapshot.metadata.roots {
-        if let Ok(content) = std::fs::read_to_string(std::path::Path::new(root).join(path)) {
-            return Some(content);
+        if let Ok(source) = crate::fs_utils::SanitizedPath::within(
+            std::path::Path::new(root),
+            &std::path::Path::new(root).join(path),
+        ) {
+            return Some(source.as_path().to_path_buf());
         }
     }
-    // Compatibility for old snapshots whose root metadata is empty. This is
-    // intentionally last so cwd can never shadow an authoritative root.
-    std::fs::read_to_string(path).ok()
+    // A missing file in an authoritative root must never fall back to a
+    // coincidentally named file in the server's own checkout.
+    if snapshot.metadata.roots.is_empty() {
+        path.canonicalize().ok()
+    } else {
+        None
+    }
 }
 
 /// Split a file-qualified symbol like `src/a.rs::helper` into `(Some("src/a.rs"), "helper")`.
@@ -636,9 +705,66 @@ fn split_file_qualified_symbol<'a>(
 pub fn query_symbol_body(snapshot: &Snapshot, symbol: &str, line_cap: Option<usize>) -> BodyResult {
     let (file_qualifier, target_symbol) = split_file_qualified_symbol(symbol, snapshot);
     let cap = line_cap.unwrap_or(DEFAULT_BODY_LINE_CAP).max(1);
-    let where_result = query_where_symbol(snapshot, target_symbol);
+    let indexed = query_where_symbol(snapshot, target_symbol);
+    // The snapshot locates candidate files, not live line numbers. Reuse the
+    // scanner on each candidate's current bytes before extracting a body.
+    // This protects cached MCP/LSP snapshots and edits racing CLI acquisition.
+    let mut current = Snapshot::new(snapshot.metadata.roots.clone());
+    let mut sources = std::collections::HashMap::new();
+    for candidate in &indexed.results {
+        if sources.contains_key(&candidate.file) {
+            continue;
+        }
+        let Some(path) = source_path(snapshot, &candidate.file) else {
+            continue;
+        };
+        let Some(content) = read_source(snapshot, &candidate.file) else {
+            continue;
+        };
+        let root = snapshot
+            .metadata
+            .roots
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter_map(|root| root.canonicalize().ok())
+            .find(|root| path.starts_with(root))
+            .or_else(|| path.parent().map(std::path::Path::to_path_buf));
+        let Some(root) = root else {
+            continue;
+        };
+        let context = crate::analyzer::scan::AnalyzeContext {
+            root_canon: &root,
+            extensions: None,
+            ts_resolver: None,
+            py_roots: &[],
+            py_stdlib: &std::collections::HashSet::new(),
+            symbol: None,
+            custom_command_macros: &[],
+            command_cfg: &crate::analyzer::ast_js::CommandDetectionConfig::default(),
+        };
+        let Ok(mut analysis) = crate::analyzer::scan::analyze_source(path, &content, &context)
+        else {
+            continue;
+        };
+        analysis.path = candidate.file.clone();
+        if let Some(fragment) = &mut analysis.symbol_fragment {
+            // Keep paths in the same coordinate space as the caller's snapshot.
+            for node in &mut fragment.symbols {
+                node.file = Some(candidate.file.clone().into());
+            }
+            current
+                .symbol_graph
+                .get_or_insert_with(Default::default)
+                .symbols
+                .extend(fragment.symbols.iter().cloned());
+        }
+        current.files.push(analysis);
+        sources.insert(candidate.file.clone(), content);
+    }
+    let where_result = query_where_symbol(&current, target_symbol);
     let declarations = module_declarations(snapshot, target_symbol);
-    let declaration_sites: std::collections::HashSet<(&str, Option<usize>)> = declarations
+    let current_declarations = module_declarations(&current, target_symbol);
+    let declaration_sites: std::collections::HashSet<(&str, Option<usize>)> = current_declarations
         .iter()
         .map(|d| (d.declared_in.as_str(), d.line))
         .collect();
@@ -673,7 +799,7 @@ pub fn query_symbol_body(snapshot: &Snapshot, symbol: &str, line_cap: Option<usi
             continue;
         }
 
-        let Some(content) = read_source(snapshot, &m.file) else {
+        let Some(content) = sources.get(&m.file) else {
             continue;
         };
         let lines: Vec<&str> = content.lines().collect();
@@ -940,6 +1066,76 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_rust_twelve_line_signature_is_brace_not_neighbor() {
+        // The `{` sits past the old 10-line lookahead. The body must close on
+        // this function and must not swallow `neighbor`.
+        let src = "\
+pub fn long_signature(
+    a01: i32,
+    a02: i32,
+    a03: i32,
+    a04: i32,
+    a05: i32,
+    a06: i32,
+    a07: i32,
+    a08: i32,
+    a09: i32,
+    a10: i32,
+    a11: i32,
+    a12: i32,
+) {
+    let marker = 0x_body_ok;
+    marker
+}
+
+pub fn neighbor() { let other = 1; other }
+";
+        let lines: Vec<&str> = src.lines().collect();
+        let b = extract_body(&lines, 0, 200, "rs");
+        assert_eq!(b.extent, EXTENT_BRACE);
+        assert!(
+            b.source.contains("0x_body_ok"),
+            "body marker missing: {}",
+            b.source
+        );
+        assert!(
+            !b.source.contains("neighbor"),
+            "neighbor was swallowed: {}",
+            b.source
+        );
+        assert!(!b.truncated);
+    }
+
+    #[test]
+    fn test_extract_ignores_brace_inside_parameter_list() {
+        // `{` inside the parameter list is not the body opener.
+        let src = "\
+fn wrapped(
+    extra: { not_body: i32 },
+    a01: i32,
+) {
+    let marker = 0x_body_ok;
+    marker
+}
+
+pub fn neighbor() { let other = 1; other }
+";
+        let lines: Vec<&str> = src.lines().collect();
+        let b = extract_body(&lines, 0, 200, "rs");
+        assert_eq!(b.extent, EXTENT_BRACE);
+        assert!(
+            b.source.contains("0x_body_ok"),
+            "body marker missing: {}",
+            b.source
+        );
+        assert!(
+            !b.source.contains("neighbor"),
+            "neighbor was swallowed: {}",
+            b.source
+        );
+    }
+
+    #[test]
     fn test_extract_brace_balanced() {
         let src =
             "fn outer() {\n    let x = 1;\n    if x > 0 {\n        return;\n    }\n}\ntrailing";
@@ -1015,7 +1211,7 @@ mod tests {
 
     #[test]
     fn test_extract_balances_assignment_collection_not_fixed_window() {
-        // Hak (loctree-fail.md, 2026-06-15): a module-level tuple/list/dict const
+        // Hak (loctree-feedback.md, 2026-06-15): a module-level tuple/list/dict const
         // has no `{` fn-body brace, so it fell into the fixed 40-line window and
         // over-captured trailing code. An assignment that opens `(`/`[`/`{` should
         // balance that bracket and stop at its close.
@@ -1225,6 +1421,107 @@ mod tests {
             !source.contains("pub mod auth"),
             "server cwd must not shadow the snapshot root"
         );
+    }
+
+    #[test]
+    fn cached_body_relocates_definition_from_current_source() {
+        for (file_name, original, edited, expected_line) in [
+            (
+                "lib.rs",
+                "pub fn wanted() -> i32 { 42 }\n",
+                "pub fn wrong() -> i32 { 99 }\n\npub fn wanted() -> i32 { 42 }\n",
+                3,
+            ),
+            (
+                "lib.py",
+                "def wanted():\n    return 42\n",
+                "def wrong():\n    return 99\n\ndef wanted():\n    return 42\n",
+                4,
+            ),
+            (
+                "lib.ts",
+                "export function wanted() { return 42; }\n",
+                "export function wrong() { return 99; }\n\nexport function wanted() { return 42; }\n",
+                3,
+            ),
+        ] {
+            let tmp = tempfile::tempdir().expect("project");
+            let path = tmp.path().join(file_name);
+            std::fs::write(&path, original).expect("initial source");
+            let mut snapshot = Snapshot::new(vec![tmp.path().display().to_string()]);
+            let mut file = crate::types::FileAnalysis::new(file_name.to_string());
+            file.exports.push(crate::types::ExportSymbol::new(
+                "wanted".into(),
+                "function",
+                "named",
+                Some(1),
+            ));
+            snapshot.files.push(file);
+            assert_eq!(query_symbol_body(&snapshot, "wanted", None).bodies.len(), 1);
+
+            std::fs::write(&path, edited).expect("shift definition after scan");
+            let result = query_symbol_body(&snapshot, "wanted", None);
+            assert_eq!(result.bodies.len(), 1, "{file_name}: {result:?}");
+            assert_eq!(result.bodies[0].start_line, expected_line, "{file_name}");
+            assert!(result.bodies[0].source.contains("42"));
+            assert!(!result.bodies[0].source.contains("99"));
+        }
+    }
+
+    #[test]
+    fn cached_body_does_not_relabel_removed_symbol_or_a_reference() {
+        let tmp = tempfile::tempdir().expect("project");
+        let path = tmp.path().join("lib.rs");
+        let mut snapshot = Snapshot::new(vec![tmp.path().display().to_string()]);
+        let mut file = crate::types::FileAnalysis::new("lib.rs".into());
+        file.exports.push(crate::types::ExportSymbol::new(
+            "wanted".into(),
+            "function",
+            "named",
+            Some(1),
+        ));
+        snapshot.files.push(file);
+        for replacement in [
+            "pub fn wrongx() -> i32 { 42 }\n", // same-length rename
+            "pub fn other() { wanted(); }\n",  // name exists only as a reference
+            "// wanted\npub fn other() {}\n",  // name exists only as a comment
+        ] {
+            std::fs::write(&path, replacement).expect("replace source");
+            assert!(
+                query_symbol_body(&snapshot, "wanted", None)
+                    .bodies
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn cached_body_preserves_impl_qualification_after_line_shift() {
+        let tmp = tempfile::tempdir().expect("project");
+        let path = tmp.path().join("lib.rs");
+        let mut snapshot = Snapshot::new(vec![tmp.path().display().to_string()]);
+        let mut file = crate::types::FileAnalysis::new("lib.rs".into());
+        file.impl_methods.push(crate::types::ImplMethod {
+            name: "run".into(),
+            qualifier: "Wanted".into(),
+            line: Some(2),
+            ..Default::default()
+        });
+        snapshot.files.push(file);
+        std::fs::write(&path,
+            "struct Other;\nimpl Other { fn run() { wrong(); } }\nstruct Wanted;\nimpl Wanted { fn run() { correct(); } }\n").expect("shifted impl source");
+        let result = query_symbol_body(&snapshot, "Wanted::run", None);
+        assert_eq!(result.bodies.len(), 1);
+        assert!(result.bodies[0].source.contains("correct()"));
+        assert!(!result.bodies[0].source.contains("wrong()"));
+    }
+
+    #[test]
+    fn missing_authoritative_source_never_reads_server_checkout() {
+        let tmp = tempfile::tempdir().expect("empty authoritative root");
+        let snapshot = Snapshot::new(vec![tmp.path().display().to_string()]);
+        assert!(std::path::Path::new("src/body.rs").exists());
+        assert!(read_source(&snapshot, "src/body.rs").is_none());
     }
 
     #[test]

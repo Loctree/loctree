@@ -474,7 +474,7 @@ pub(super) fn identifier_finder() -> &'static Regex {
 /// W2.2 fix: exclude comment tokens (///, //) and definition-site tokens (the `pub fn NAME`
 /// or `pub struct NAME` line itself, and its doc comment) from local_uses. Otherwise a Rust
 /// `pub fn` is structurally never dead (its own def line + docs always "use" the name).
-/// See loctree-fail.md:2928 (collect_identifier_mentions).
+/// See loctree-feedback.md:2928 (collect_identifier_mentions).
 pub(super) fn collect_identifier_mentions(content: &str, local_uses: &mut Vec<String>) {
     const SKIP: &[&str] = &[
         "if", "else", "while", "for", "loop", "match", "return", "break", "continue", "fn", "let",

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::fs_utils::SanitizedPath;
 
@@ -27,6 +28,9 @@ pub const CONTEXT_ATLAS_DIR: &str = "context-atlas";
 pub const CONTEXT_ATLAS_RUNS_DIR: &str = "runs";
 /// Human-facing identity table and MCP pointer payload cap (G-CONTEXT-CAP).
 pub const ATLAS_IDENTITY_LIST_LIMIT: usize = 20;
+/// Task identities (`task-*`) kept under the default atlas root.
+/// `project` and `scope-*` are never trimmed by this policy.
+pub(crate) const TASK_ATLAS_KEEP_LAST: usize = 3;
 const ATLAS_IDENTITIES_FULL_JSON: &str = "manifest.full.json";
 const ATLAS_STATUS_READY: &str = "atlas_ready";
 const ATLAS_STATUS_HOLLOW: &str = "hollow";
@@ -259,7 +263,17 @@ pub fn materialize_context_atlas(
     // mirror so concurrent scoped contexts cannot tear shared cards or
     // drop catalog identities (G-ATLAS-SHARED-MUTABLE).
     let _lock = acquire_atlas_mirror_lock(&atlas_root)?;
-    let known_atlases = load_retained_atlases(&atlas_root)?;
+    let mut known_atlases = load_retained_atlases(&atlas_root)?;
+    // Prune under the mirror lock, and only on this default root. The
+    // explicit `atlas_dir` branch above returns before the catalog exists.
+    // Pass the filtered catalog in so manifest.json cannot name a run this
+    // prune just deleted.
+    retain_task_atlas_runs(
+        &atlas_root,
+        &mut known_atlases,
+        Some(identity.atlas_id.as_str()),
+        TASK_ATLAS_KEEP_LAST,
+    )?;
     let run_dir = atlas_root
         .join(CONTEXT_ATLAS_RUNS_DIR)
         .join(&identity.atlas_id);
@@ -288,11 +302,17 @@ fn materialize_context_atlas_at(
     let status = atlas_status(pack);
     let card_status =
         (status == ATLAS_STATUS_HOLLOW).then(|| CARD_STATUS_UNREAD_UNUSABLE.to_string());
-    let message = atlas_status_message(status);
+    let mut message = atlas_status_message(status);
 
     // Cards 00 and 03 read the same intent layer — card 00 for the identity
     // revisions, card 03 for the theses — so it is resolved once here.
     let intent_source = resolve_intent_card_source(pack, project_root);
+    if let Some(stale) = &intent_source.stale {
+        message.push_str(&format!(" Intent freshness: {stale}."));
+    }
+    message.push_str(
+        " Runtime execution and verification results: not measured by this structural pack.",
+    );
 
     let specs = vec![
         CardSpec {
@@ -346,7 +366,7 @@ fn materialize_context_atlas_at(
             filename: "05-risk-register.md",
             why: "Hotspots, cache/snapshot health, stale assumptions, next risk-reducing actions.",
             saves: "release blockers, high fan-in surprises, stale-cache decisions",
-            body: render_card_body(pack, "risk", "05-risk-register.md", "Risk Register"),
+            body: render_risk_card_with_intent(pack, intent_source.stale.as_deref()),
         },
     ];
 
@@ -544,6 +564,164 @@ fn load_retained_atlases(atlas_root: &Path) -> io::Result<Vec<ContextAtlasRefere
     archived.atlases = vec![reference.clone()];
     write_manifest_files(&archived)?;
     Ok(vec![reference])
+}
+
+/// Drop `task-*` run directories past `keep_last` and remove them from
+/// `atlases`. `project`, `scope-*`, and any other identity stay.
+///
+/// `protect_id` is the identity about to be written. It occupies one of the
+/// kept slots even when its directory does not exist yet. Freshness is the
+/// catalog `generated_at` when that field is non-empty, otherwise the run
+/// directory mtime. Equal catalog timestamps break ties on mtime.
+///
+/// Caller holds the atlas mirror lock. This function does not take it again.
+fn retain_task_atlas_runs(
+    atlas_root: &Path,
+    atlases: &mut Vec<ContextAtlasReference>,
+    protect_id: Option<&str>,
+    keep_last: usize,
+) -> io::Result<()> {
+    let runs_dir = atlas_root.join(CONTEXT_ATLAS_RUNS_DIR);
+    let protect = protect_id.filter(|id| is_task_atlas_id(id));
+
+    let mut ranked: Vec<ContextAtlasReference> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for atlas in atlases.iter() {
+        let id = atlas.identity.atlas_id.as_str();
+        if !is_task_atlas_id(id) || !seen.insert(id.to_string()) {
+            continue;
+        }
+        if task_run_dir(&runs_dir, id).is_dir() || protect == Some(id) {
+            ranked.push(atlas.clone());
+        }
+    }
+    if runs_dir.is_dir() {
+        for entry in fs::read_dir(&runs_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if !is_task_atlas_id(&id) || !seen.insert(id.clone()) {
+                continue;
+            }
+            ranked.push(ContextAtlasReference {
+                identity: ContextAtlasIdentity {
+                    atlas_id: id,
+                    kind: "task".to_string(),
+                    ..ContextAtlasIdentity::default()
+                },
+                ..ContextAtlasReference::default()
+            });
+        }
+    }
+
+    ranked.sort_by(|left, right| {
+        let left_key = atlas_recency_key(&runs_dir, left);
+        let right_key = atlas_recency_key(&runs_dir, right);
+        right_key
+            .0
+            .cmp(&left_key.0)
+            .then(right_key.1.cmp(&left_key.1))
+    });
+
+    let mut keep: Vec<String> = Vec::new();
+    if let Some(id) = protect
+        && keep_last > 0
+    {
+        keep.push(id.to_string());
+    }
+    for atlas in &ranked {
+        if keep.len() >= keep_last {
+            break;
+        }
+        let id = &atlas.identity.atlas_id;
+        if !keep.iter().any(|kept| kept == id) {
+            keep.push(id.clone());
+        }
+    }
+
+    for atlas in &ranked {
+        let id = atlas.identity.atlas_id.as_str();
+        if keep.iter().any(|kept| kept == id) {
+            continue;
+        }
+        let dir = task_run_dir(&runs_dir, id);
+        if dir.is_dir() {
+            fs::remove_dir_all(dir)?;
+        }
+    }
+
+    atlases.retain(|atlas| {
+        let id = atlas.identity.atlas_id.as_str();
+        !is_task_atlas_id(id) || keep.iter().any(|kept| kept == id)
+    });
+    Ok(())
+}
+
+fn is_task_atlas_id(atlas_id: &str) -> bool {
+    atlas_id.starts_with("task-")
+        && atlas_id.len() > "task-".len()
+        && !atlas_id.contains(['/', '\\', '\0'])
+}
+
+/// Run directory for one atlas id. `id` is a single path component.
+fn task_run_dir(runs_dir: &Path, atlas_id: &str) -> PathBuf {
+    runs_dir.join(atlas_id)
+}
+
+/// Catalog `generated_at` when present; otherwise the run directory mtime
+/// rendered as RFC3339 so it shares an axis with catalog timestamps.
+/// The `SystemTime` is the tie-break.
+fn atlas_recency_key(runs_dir: &Path, reference: &ContextAtlasReference) -> (String, SystemTime) {
+    let mtime = fs::metadata(task_run_dir(runs_dir, &reference.identity.atlas_id))
+        .and_then(|meta| meta.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let generated = reference.generated_at.trim();
+    if generated.is_empty() {
+        (format_system_time_rfc3339(mtime), mtime)
+    } else {
+        (generated.to_string(), mtime)
+    }
+}
+
+fn format_system_time_rfc3339(mtime: SystemTime) -> String {
+    use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
+
+    OffsetDateTime::from(mtime)
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// Apply task-atlas retention to `<project>/.loctree/context-atlas/runs`.
+///
+/// `keep_last == 0` removes every `task-*` directory. Any other value keeps
+/// that many newest task runs. `project` and `scope-*` directories stay, and
+/// the flat mirror cards at `context-atlas/*` are not deleted. The root
+/// catalog is rewritten so `atlases` does not name a removed run.
+///
+/// No-op when this project has no `runs/` directory. Does not search other
+/// checkouts.
+pub(crate) fn prune_project_task_atlases(project_root: &Path, keep_last: usize) -> io::Result<()> {
+    let atlas_root = atlas_dir_for_project(project_root);
+    let runs_dir = atlas_root.join(CONTEXT_ATLAS_RUNS_DIR);
+    if !runs_dir.is_dir() {
+        return Ok(());
+    }
+    let _lock = acquire_atlas_mirror_lock(&atlas_root)?;
+    let manifest_path = atlas_root.join("manifest.json");
+    if manifest_path.is_file() {
+        let raw = fs::read_to_string(&manifest_path)?;
+        let mut manifest: ContextAtlasManifest =
+            serde_json::from_str(&raw).map_err(io::Error::other)?;
+        retain_task_atlas_runs(&atlas_root, &mut manifest.atlases, None, keep_last)?;
+        write_manifest_files(&manifest)?;
+    } else {
+        let mut atlases = Vec::new();
+        retain_task_atlas_runs(&atlas_root, &mut atlases, None, keep_last)?;
+    }
+    Ok(())
 }
 
 fn atlas_reference(manifest: &ContextAtlasManifest) -> ContextAtlasReference {
@@ -759,7 +937,7 @@ fn atlas_status_message(status: &str) -> String {
                 .to_string()
         }
         _ => {
-            "This atlas contains the repo understanding an agent would otherwise rediscover manually. Start with manifest.md, then read the recommended cards; broad repo-level answers are incomplete until core, structural, and runtime are read."
+            "This atlas contains the repo understanding an agent would otherwise rediscover manually. Start with manifest.md and 00-core-map.md for a bounded entry briefing; expand structural/runtime/risk cards for the actual question. Broad repo-level claims require evidence for that breadth."
                 .to_string()
         }
     }
@@ -1163,7 +1341,21 @@ fn render_core_card(pack: &ContextPack, source: &IntentCardSource) -> CardBody {
     ));
 
     md.push_str("\n## Freshness\n\n");
-    md.push_str(&format!("{}\n", atlas_freshness_line(pack)));
+    md.push_str(&format!("structural: {}\n", atlas_freshness_line(pack)));
+    md.push_str(&format!(
+        "intent: {}\n",
+        source
+            .stale
+            .as_deref()
+            .unwrap_or("no stale marker supplied; inspect cache evidence in 03-intent-map.md")
+    ));
+    md.push_str("runtime execution: not measured · verification results: not measured\n");
+    md.push_str(&format!(
+        "coverage: selected targets {} / indexed files {} · returned neighborhood files {} · symbols {} · imports {} · selection truncated {}\n",
+        pack.coverage.selected, pack.coverage.total, pack.structural.files.len(),
+        pack.structural.symbols.len(), pack.structural.imports.len(), pack.coverage.truncated
+    ));
+    md.push_str("Coverage counts describe returned evidence; zero is not proof that the repository has no such surface.\n");
     md.push_str(
         "cache/snapshot details → 05-risk-register.md §Cache & Snapshot Health (freshness domain owner)\n",
     );
@@ -1175,7 +1367,7 @@ fn render_core_card(pack: &ContextPack, source: &IntentCardSource) -> CardBody {
     ranked.sort_by(|a, b| b.importers.cmp(&a.importers).then(a.file.cmp(&b.file)));
     if ranked.is_empty() {
         md.push_str(&format!(
-            "no fan-in risks in pack — hotspots: {} → 01-structural-map.md\n",
+            "no above-threshold fan-in rows returned — hotspots: {} → 01-structural-map.md\n",
             pack.risk.hotspots.len()
         ));
     } else {
@@ -1197,7 +1389,7 @@ fn render_core_card(pack: &ContextPack, source: &IntentCardSource) -> CardBody {
     // contextPack "core" page serves this card — executable guidance must
     // survive the dense render.
     let mut listed_commands: BTreeSet<&str> = BTreeSet::new();
-    for command in &pack.action.next_safe_commands {
+    for command in pack.action.next_safe_commands.iter().take(3) {
         if !listed_commands.insert(command.as_str()) {
             continue;
         }
@@ -1212,6 +1404,9 @@ fn render_core_card(pack: &ContextPack, source: &IntentCardSource) -> CardBody {
         }
     }
     for suggested in &pack.action.power_path {
+        if listed_commands.len() >= 3 {
+            break;
+        }
         if listed_commands.insert(suggested.command.as_str()) {
             md.push_str(&format!("{} — {}\n", suggested.command, suggested.reason));
         }
@@ -2001,6 +2196,15 @@ fn render_verification_card(pack: &ContextPack) -> CardBody {
 }
 
 fn render_risk_card(pack: &ContextPack) -> CardBody {
+    let stale = pack
+        .memory
+        .overlay
+        .as_ref()
+        .and_then(|state| state.stale_marker());
+    render_risk_card_with_intent(pack, stale.as_deref())
+}
+
+fn render_risk_card_with_intent(pack: &ContextPack, intent_stale: Option<&str>) -> CardBody {
     let risk = &pack.risk;
     let mut md = card_frame_header(
         pack,
@@ -2028,10 +2232,13 @@ fn render_risk_card(pack: &ContextPack) -> CardBody {
     ));
 
     md.push_str("\n## Stale Assumptions\n\n");
-    md.push_str(&empty_section_line(
-        "registered stale assumptions in pack",
-        0,
-    ));
+    match intent_stale {
+        Some(stale) => md.push_str(&format!("{stale}\n")),
+        None => md.push_str(
+            "intent freshness: no stale marker supplied; see 03-intent-map.md for cache evidence\n",
+        ),
+    }
+    md.push_str("runtime execution, delivery acceptance, and verification results: not measured; structural freshness does not establish product health\n");
 
     md.push_str("\n## Actions\n\n");
     // Command guidance is owned by karta 00 (Safe Next Commands) — a copy of
@@ -2061,7 +2268,7 @@ fn render_risk_card(pack: &ContextPack) -> CardBody {
 /// 2026-05-21 operator decision that no single card should pass 1000 lines
 /// and surface the truncation honestly when it does.
 ///
-/// loctree-fail hak 2026-05-23 #3: the Memory Trail card was emitting
+/// loctree-feedback hak 2026-05-23 #3: the Memory Trail card was emitting
 /// 740 lines / 35 KB out of a ~50 KB atlas (87 % of total bytes). Without
 /// a per-card cap, one fat slice silently pushed the other five cards
 /// off the operator's screen budget. The cap below truncates the JSON
@@ -2692,7 +2899,152 @@ mod tests {
         );
     }
 
-    /// loctree-fail hak 2026-05-23 #3 regression: a fat JSON card body
+    /// Five distinct task identities collapse to the three newest. `project`
+    /// and `scope-*` stay addressable, and the catalog names no removed run.
+    #[test]
+    fn task_atlases_keep_last_three_newest_and_catalog_matches_dirs() {
+        fn task_pack(root: &Path, text: &str) -> ContextPack {
+            let mut pack = ContextPack::empty(ProjectIdentity {
+                canonical_root: Some(root.display().to_string()),
+                branch: Some("main".to_string()),
+                commit: Some("abc1234".to_string()),
+                snapshot_id: Some("scan-1".to_string()),
+            });
+            pack.task = Some(TaskReport {
+                text: text.to_string(),
+                mode: "implement".to_string(),
+                authority: "operator".to_string(),
+            });
+            pack.action.next_safe_commands = vec![text.to_string()];
+            pack
+        }
+
+        let tmp = TempDir::new().expect("temp dir");
+        let mut project_pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some(tmp.path().display().to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: Some("scan-1".to_string()),
+        });
+        project_pack.action.next_safe_commands = vec!["PROJECT_KEEP".to_string()];
+        materialize_context_atlas(&project_pack, tmp.path(), None).expect("project atlas");
+
+        let mut scope_pack = ContextPack::empty(ProjectIdentity {
+            canonical_root: Some(tmp.path().display().to_string()),
+            branch: Some("main".to_string()),
+            commit: Some("abc1234".to_string()),
+            snapshot_id: Some("scan-1".to_string()),
+        });
+        scope_pack.scope = Some(ScopeReport {
+            selectors: vec!["path:src/kept".to_string()],
+            matched_files: 1,
+            empty: false,
+            fingerprint: "scope-kept".to_string(),
+            named_resolved_from: None,
+            resolved_selectors: Vec::new(),
+            selector_match_counts: Vec::new(),
+        });
+        scope_pack.task = Some(TaskReport {
+            text: "scope survives task retention".to_string(),
+            mode: "rank_within_scope".to_string(),
+            authority: "operator".to_string(),
+        });
+        let scope_id = materialize_context_atlas(&scope_pack, tmp.path(), None)
+            .expect("scope atlas")
+            .identity
+            .atlas_id;
+        assert!(
+            scope_id.starts_with("scope-"),
+            "scoped atlas must not be a task identity: {scope_id}"
+        );
+
+        let mut ids = Vec::new();
+        let mut last_stamp = String::new();
+        for n in 1..=5 {
+            let text = format!("retention-{n}");
+            let mut spins = 0;
+            let manifest = loop {
+                let manifest =
+                    materialize_context_atlas(&task_pack(tmp.path(), &text), tmp.path(), None)
+                        .expect("task atlas");
+                if last_stamp.is_empty() || manifest.generated_at.as_str() > last_stamp.as_str() {
+                    break manifest;
+                }
+                spins += 1;
+                assert!(spins < 20, "generated_at did not advance past {last_stamp}");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            assert!(
+                manifest.identity.atlas_id.starts_with("task-"),
+                "task write must use a task identity: {}",
+                manifest.identity.atlas_id
+            );
+            last_stamp = manifest.generated_at.clone();
+            ids.push(manifest.identity.atlas_id);
+        }
+
+        let atlas_root = atlas_dir_for_project(tmp.path());
+        let runs = atlas_root.join(CONTEXT_ATLAS_RUNS_DIR);
+        let task_dirs: Vec<String> = fs::read_dir(&runs)
+            .expect("runs dir")
+            .map(|entry| {
+                entry
+                    .expect("run entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with("task-"))
+            .collect();
+        assert!(
+            task_dirs.len() <= TASK_ATLAS_KEEP_LAST,
+            "task runs must collapse to {TASK_ATLAS_KEEP_LAST}, got {task_dirs:?}"
+        );
+        assert!(
+            runs.join(&ids[4]).is_dir(),
+            "newest task run must remain: {}",
+            ids[4]
+        );
+        assert!(
+            !runs.join(&ids[0]).exists(),
+            "oldest task run must be removed: {}",
+            ids[0]
+        );
+        assert!(runs.join("project").is_dir(), "project atlas must stay");
+        assert!(runs.join(&scope_id).is_dir(), "scope atlas must stay");
+        let project_core =
+            fs::read_to_string(runs.join("project").join("00-core-map.md")).expect("project card");
+        assert!(project_core.contains("PROJECT_KEEP"));
+
+        let catalog: ContextAtlasManifest = serde_json::from_str(
+            &fs::read_to_string(atlas_root.join("manifest.json")).expect("root catalog"),
+        )
+        .expect("root catalog parses");
+        for atlas in &catalog.atlases {
+            assert!(
+                runs.join(&atlas.identity.atlas_id).is_dir(),
+                "catalog names a removed run: {}",
+                atlas.identity.atlas_id
+            );
+        }
+        let catalog_ids: BTreeSet<&str> = catalog
+            .atlases
+            .iter()
+            .map(|atlas| atlas.identity.atlas_id.as_str())
+            .collect();
+        assert!(catalog_ids.contains("project"));
+        assert!(catalog_ids.contains(scope_id.as_str()));
+        assert!(catalog_ids.contains(ids[4].as_str()));
+        assert!(!catalog_ids.contains(ids[0].as_str()));
+        let catalog_tasks = catalog
+            .atlases
+            .iter()
+            .filter(|atlas| atlas.identity.atlas_id.starts_with("task-"))
+            .count();
+        assert_eq!(catalog_tasks, task_dirs.len());
+    }
+
+    /// loctree-feedback hak 2026-05-23 #3 regression: a fat JSON card body
     /// must be truncated to the per-card line cap and append a clearly
     /// labelled tail so the operator never reads a clipped card as
     /// canonical truth.
@@ -2743,7 +3095,7 @@ mod tests {
         );
     }
 
-    /// loctree-fail tail 2026-06-22 regression: an over-cap card body must keep
+    /// loctree-feedback tail 2026-06-22 regression: an over-cap card body must keep
     /// the complete payload around (for the sibling artifact) and embed an
     /// on-card marker pointing at that concrete file.
     #[test]
@@ -2859,7 +3211,7 @@ mod tests {
         );
     }
 
-    /// loctree-fail tail 2026-06-22 regression: the manifest must explicitly
+    /// loctree-feedback tail 2026-06-22 regression: the manifest must explicitly
     /// flag partial cards and name the concrete complete artifact, instead of
     /// silently quoting a line count for a clipped card.
     #[test]
@@ -3534,7 +3886,7 @@ mod tests {
                     "valid_from": "2026-07-12T10:00:00Z",
                     "refs": [{
                         "evidence_event_id": "ev1:x",
-                        "ref": "session:49a84e4c-f24d-4167-9f55-ae0f8123a66f#turn-42"
+                        "ref": "session:11111111-2222-4333-8444-555555555555#turn-42"
                     }]
                 },
                 {
@@ -3626,7 +3978,7 @@ mod tests {
         assert!(md.contains("\nsrc/types.rs\n"));
         assert!(
             md.contains(
-                "  ✓[V] 2026-07-12 · operator_confirmed · centralizacja shared types utrzymana; rozbicie odrzucone · session 49a84e4c §turn-42"
+                "  ✓[V] 2026-07-12 · operator_confirmed · centralizacja shared types utrzymana; rozbicie odrzucone · session 11111111 §turn-42"
             ),
             "hub thesis must follow the golden grammar: {md}"
         );
@@ -3735,6 +4087,18 @@ mod tests {
             md.contains("intent layer stale (snapshot moved (cache deadbee, local abc1234))"),
             "commit drift must surface as an explicit stale marker: {md}"
         );
+        let core = fs::read_to_string(atlas_dir.join("00-core-map.md")).expect("core card");
+        let risk = fs::read_to_string(atlas_dir.join("05-risk-register.md")).expect("risk card");
+        let manifest = fs::read_to_string(atlas_dir.join("manifest.json")).expect("manifest");
+        for surface in [&core, &risk, &manifest] {
+            assert!(
+                surface.contains("snapshot moved (cache deadbee, local abc1234)"),
+                "stale intent must propagate to entry/risk/manifest: {surface}"
+            );
+        }
+        assert!(core.contains("selected targets"));
+        assert!(core.contains("runtime execution: not measured"));
+        assert!(!risk.contains("no registered stale assumptions"));
         assert!(
             md.contains("✓[V] 2026-07-12 · operator_confirmed"),
             "stale layer still serves the last correct theses: {md}"

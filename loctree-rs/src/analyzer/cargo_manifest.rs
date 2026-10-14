@@ -262,6 +262,55 @@ fn workspace_deps_for(
     Ok(deps.into_iter().collect())
 }
 
+/// A `path = "../foo"` style dependency declared in a crate's own manifest
+/// (`[dependencies]` / `[dev-dependencies]` / `[build-dependencies]`).
+///
+/// G3: `resolve_cross_crate_import` only ever consulted `[workspace].members`,
+/// so a crate pulled in purely via a path dependency (wezterm-style: termwiz,
+/// mux, codec are never listed under `[workspace].members`) never resolved —
+/// `use codec::SetPaneZoomed;` stayed Unknown. This carries the identifier a
+/// `use` statement would reference (the dependency's key, hyphens turned to
+/// underscores — Cargo requires that same substitution for a valid Rust path)
+/// plus the resolved crate-root directory the path points at.
+#[derive(Clone, Debug)]
+pub struct PathDependency {
+    pub name: String,
+    pub crate_dir: PathBuf,
+}
+
+/// Parse every `path = "..."` dependency declared directly on a crate's own
+/// manifest (not the workspace root). Used as a fallback when a crate-ident
+/// doesn't match any `[workspace].members` entry.
+pub fn parse_path_dependencies(path: &Path) -> Vec<PathDependency> {
+    let manifest_path = manifest_path(path);
+    let Some(root) = manifest_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(value) = read_manifest(&manifest_path) else {
+        return Vec::new();
+    };
+
+    let mut deps = Vec::new();
+    for table_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        let Some(table) = value.get(table_name).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        for (key, entry) in table {
+            let Some(entry_table) = entry.as_table() else {
+                continue;
+            };
+            let Some(rel_path) = entry_table.get("path").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            deps.push(PathDependency {
+                name: key.replace('-', "_"),
+                crate_dir: root.join(rel_path),
+            });
+        }
+    }
+    deps
+}
+
 pub fn find_nearest_crate_manifest(path: &Path, root: &Path) -> Option<PathBuf> {
     let mut current = if path.is_file() {
         path.parent()?.to_path_buf()
@@ -362,5 +411,41 @@ name = "b"
             .find(|member| member.package_name == "a")
             .expect("crate a");
         assert_eq!(crate_a.intra_workspace_deps, vec!["b"]);
+    }
+
+    #[test]
+    fn g3_parses_path_dependency_not_listed_as_workspace_member() {
+        let dir = tempdir().expect("tempdir");
+        fs::create_dir_all(dir.path().join("crates/a/src")).expect("a");
+        fs::create_dir_all(dir.path().join("crates/b/src")).expect("b");
+        fs::write(
+            dir.path().join("crates/a/Cargo.toml"),
+            r#"[package]
+name = "a"
+
+[dependencies]
+codec = { path = "../codec-lib" }
+"#,
+        )
+        .expect("a manifest");
+        // Note: the dependency directory name ("codec-lib") deliberately
+        // differs from the Rust identifier ("codec") to prove we key off the
+        // dependency's manifest entry, not a directory-name guess.
+        fs::create_dir_all(dir.path().join("crates/codec-lib/src")).expect("codec-lib");
+        fs::write(
+            dir.path().join("crates/codec-lib/Cargo.toml"),
+            r#"[package]
+name = "codec"
+"#,
+        )
+        .expect("codec-lib manifest");
+
+        let deps = parse_path_dependencies(&dir.path().join("crates/a/Cargo.toml"));
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].name, "codec");
+        assert_eq!(
+            deps[0].crate_dir,
+            dir.path().join("crates/a").join("../codec-lib")
+        );
     }
 }

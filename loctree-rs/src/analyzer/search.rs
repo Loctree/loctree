@@ -396,7 +396,11 @@ fn normalize_query(query: &str) -> String {
 }
 
 /// Run unified search - returns all result types
-pub fn run_search(query: &str, analyses: &[FileAnalysis]) -> SearchResults {
+pub fn run_search(
+    query: &str,
+    analyses: &[FileAnalysis],
+    root: Option<&std::path::Path>,
+) -> SearchResults {
     // Normalize: "A B C" → "A|B|C" for consistent OR matching
     let query = normalize_query(query);
 
@@ -445,7 +449,7 @@ pub fn run_search(query: &str, analyses: &[FileAnalysis]) -> SearchResults {
 
     SearchResults {
         query: query.to_string(),
-        universe: IndexedUniverse::from_analyses(analyses),
+        universe: IndexedUniverse::from_analyses(analyses, root),
         symbol_matches,
         param_matches,
         semantic_matches,

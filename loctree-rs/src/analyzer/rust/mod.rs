@@ -10,10 +10,11 @@ mod usages;
 pub use imports::CrateModuleMap;
 
 // Imports from submodules
-use imports::parse_rust_brace_names;
+use imports::{parse_rust_brace_names, split_use_prefix_and_braces};
 use naming::exposed_command_name;
 use preprocess::{
     find_balanced_bracket, strip_cfg_attributes, strip_cfg_test_modules, strip_function_body_uses,
+    strip_string_spans,
 };
 use tauri::{extract_plugin_identifier, extract_plugin_name};
 use usages::{
@@ -608,26 +609,42 @@ pub(crate) fn analyze_rust_file(
 
         // Parse symbols from use statements like `use foo::{Bar, Baz}`
         if source.contains('{') && source.contains('}') {
-            let mut parts = source.splitn(2, '{');
-            let prefix = parts.next().unwrap_or("").trim().trim_end_matches("::");
-            let braces = parts.next().unwrap_or("").trim_end_matches('}').trim();
-            let names = parse_rust_brace_names(braces);
-            for (original, exported) in names {
-                imp.symbols.push(crate::types::ImportSymbol {
-                    name: original.clone(),
-                    alias: if original != exported {
-                        Some(exported)
-                    } else {
-                        None
-                    },
-                    is_default: false,
-                });
+            // H4-brace: match the FIRST `{` against its balanced closing `}`,
+            // not the LAST `}` in the string — `std::{fs, process::{Command,
+            // Stdio}}` has two closing braces, and the previous
+            // splitn(2,'{') + trim_end_matches('}') ate both, corrupting the
+            // nested group into `{Command` / `Stdio}` symbol fragments.
+            if let Some((prefix, braces)) = split_use_prefix_and_braces(source) {
+                let names = parse_rust_brace_names(braces);
+                for (original, exported) in names {
+                    imp.symbols.push(crate::types::ImportSymbol {
+                        name: original.clone(),
+                        alias: if original != exported {
+                            Some(exported)
+                        } else {
+                            None
+                        },
+                        is_default: false,
+                    });
+                }
+                // Set source to the prefix for better matching
+                imp.source = prefix.to_string();
             }
-            // Set source to the prefix for better matching
-            imp.source = prefix.to_string();
         } else {
-            // Single import like `use foo::Bar` or `use foo::*`
-            if let Some(last_segment) = source.rsplit("::").next() {
+            // Single import like `use foo::Bar`, `use foo::*`, or
+            // `use foo::Bar as Baz`. G4.1: split off the `as` alias BEFORE
+            // segment-splitting and BEFORE it becomes `imp.source` — the
+            // resolver takes `imp.source` verbatim (see
+            // `resolve_rust_import`), and a raw `home_unix as platform` is
+            // not a resolvable module path, silently dropping the edge.
+            let (path_part, alias) = match source.split_once(" as ") {
+                Some((path, alias)) => (path.trim(), Some(alias.trim().to_string())),
+                None => (source, None),
+            };
+            if alias.is_some() {
+                imp.source = path_part.to_string();
+            }
+            if let Some(last_segment) = path_part.rsplit("::").next() {
                 let last = last_segment.trim();
                 if last == "*" {
                     // Star import - add "*" as symbol to trigger star_used check
@@ -637,13 +654,13 @@ pub(crate) fn analyze_rust_file(
                         is_default: false,
                     });
                     // Also set source to the prefix path
-                    if let Some(prefix) = source.rsplit_once("::") {
+                    if let Some(prefix) = path_part.rsplit_once("::") {
                         imp.source = prefix.0.to_string();
                     }
                 } else if !last.is_empty() && last != "self" {
                     imp.symbols.push(crate::types::ImportSymbol {
                         name: last.to_string(),
-                        alias: None,
+                        alias,
                         is_default: false,
                     });
                 }
@@ -718,7 +735,7 @@ pub(crate) fn analyze_rust_file(
     // CrateModuleMap resolution + our strip pass-through, this emits the true
     // consumer edges so impact/slice/who-imports report the real importer set
     // (e.g. the CLI handler for watch.rs). Dupe guard prevents double-count.
-    // See loctree-fail.md:2900,3144 and AGENTS "fix the ENGINE".
+    // See loctree-feedback.md:2900,3144 and AGENTS "fix the ENGINE".
     for caps in regex_rust_use().captures_iter(content) {
         let source = caps
             .get(1)
@@ -813,18 +830,97 @@ pub(crate) fn analyze_rust_file(
         }
     }
 
+    // A3: a fixture/test string body (e.g. an r#"..."# literal holding a
+    // sample source file) can contain text that LOOKS like a real
+    // declaration (`pub fn hello() {}`). Scanning raw `content` registers it
+    // as a real export/local symbol and, downstream, a bogus
+    // enclosing_symbol. `strip_string_spans` blanks string/raw-string
+    // literal BODIES only, preserving line numbers, so the pub-decl loop and
+    // the local-symbol/enum-variant collectors below never see fixture text.
+    let string_stripped_content = strip_string_spans(content);
+
     // public items - process with proper kind detection
     // rust_pub_decl_regexes() returns [fn, struct, enum, trait, type, union] in order
     let kinds = ["function", "struct", "enum", "trait", "type", "union"];
-    for (regex, kind) in rust_pub_decl_regexes().iter().zip(kinds.iter()) {
-        for caps in regex.captures_iter(content) {
-            if let Some(name) = caps.get(1) {
-                let line = offset_to_line(content, name.start());
-                let name_str = name.as_str().to_string();
 
-                // Extract params only for functions
-                let params = if *kind == "function" {
-                    extract_rust_fn_params(content, name.end())
+    // N1 (round-2): members of `extern "C" { ... }` blocks match the pub-fn
+    // regex but are FFI declarations, not Rust functions with a testable body.
+    // Compute extern-block byte spans (string bodies are already blanked in
+    // `string_stripped_content`, so braces inside literals cannot unbalance
+    // the match) and tag those exports `kind: "extern"` so coverage layers
+    // can exclude them. `pub extern "C" fn foo() {}` (a real function with a
+    // body) does NOT match: after the ABI string comes `fn`, not `{`.
+    let extern_spans: Vec<(usize, usize)> = {
+        let bytes = string_stripped_content.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut spans = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = string_stripped_content[cursor..].find("extern") {
+            let kw = cursor + rel;
+            let kw_end = kw + "extern".len();
+            cursor = kw_end;
+            let bounded = (kw == 0 || !is_ident(bytes[kw - 1]))
+                && (kw_end >= bytes.len() || !is_ident(bytes[kw_end]));
+            if !bounded {
+                continue;
+            }
+            // Skip whitespace and an optional ABI string (`"C"` - its body is
+            // blanked by strip_string_spans, only the quotes remain).
+            let mut i = kw_end;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'"' {
+                if let Some(close) = string_stripped_content[i + 1..].find('"') {
+                    i += close + 2;
+                }
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+            if i >= bytes.len() || bytes[i] != b'{' {
+                continue; // `extern crate`, `extern fn`, ... - not a block
+            }
+            // Brace-match the block body.
+            let mut depth = 0i32;
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                spans.push((i, j));
+                cursor = j;
+            }
+        }
+        spans
+    };
+    let in_extern_block = |pos: usize| {
+        extern_spans
+            .iter()
+            .any(|(open, close)| pos > *open && pos < *close)
+    };
+
+    for (regex, kind) in rust_pub_decl_regexes().iter().zip(kinds.iter()) {
+        for caps in regex.captures_iter(&string_stripped_content) {
+            if let Some(name) = caps.get(1) {
+                let line = offset_to_line(&string_stripped_content, name.start());
+                let name_str = name.as_str().to_string();
+                let is_extern = *kind == "function" && in_extern_block(name.start());
+                let kind: &str = if is_extern { "extern" } else { kind };
+
+                // Extract params for functions (FFI externs declare them too)
+                let params = if kind == "function" || is_extern {
+                    extract_rust_fn_params(&string_stripped_content, name.end())
                 } else {
                     Vec::new()
                 };
@@ -855,8 +951,8 @@ pub(crate) fn analyze_rust_file(
     }
 
     let exported_names: HashSet<String> = analysis.exports.iter().map(|e| e.name.clone()).collect();
-    let mut locals = collect_rust_local_symbols(content, &exported_names);
-    locals.extend(collect_rust_enum_variants(content));
+    let mut locals = collect_rust_local_symbols(&string_stripped_content, &exported_names);
+    locals.extend(collect_rust_enum_variants(&string_stripped_content));
     locals.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.name.cmp(&b.name)));
     locals.dedup_by(|a, b| a.line == b.line && a.name == b.name);
     if !locals.is_empty() {
@@ -868,7 +964,14 @@ pub(crate) fn analyze_rust_file(
 
     collect_rust_signature_uses(&production_content, &mut analysis);
 
-    for caps in regex_event_const_rust().captures_iter(content) {
+    // H1-rust-events: run the event regexes against comment/cfg-test-stripped
+    // content so a doc comment (`/// window.emit("foo", ());`) or a
+    // `#[cfg(test)] mod tests { ... }` body stops producing real events.
+    // NOT string-stripped: a literal event name payload like `.emit("foo")`
+    // must stay intact for `resolve_event`'s literal-detection branch.
+    let event_scan_content = strip_comments(&strip_cfg_test_modules(content));
+
+    for caps in regex_event_const_rust().captures_iter(&event_scan_content) {
         if let (Some(name), Some(val)) = (caps.get(1), caps.get(2)) {
             analysis
                 .event_consts
@@ -899,6 +1002,19 @@ pub(crate) fn analyze_rust_file(
         // or have mixed case. Single lowercase words without separators are
         // more likely to be crate names (e.g., "gix", "tokio", "serde")
         if token.chars().all(|c| c.is_ascii_lowercase()) && token.len() <= 8 {
+            return true;
+        }
+
+        // H1-rust-events: bare ALL_CAPS identifiers (PORT, MAX_RETRIES, ...)
+        // are not string event names. By the time this closure runs,
+        // `resolve_event` already checked `analysis.event_consts` for an
+        // exact `const NAME: &str = "...";` match and found none — so an
+        // ALL_CAPS token here is some other constant/variable (often a
+        // non-str const, e.g. `const PORT: u16 = ...`), and
+        // `server.listen(PORT)` must not become a listener for event "PORT".
+        if token.chars().any(|c| c.is_ascii_alphabetic())
+            && token.chars().all(|c| !c.is_ascii_lowercase())
+        {
             return true;
         }
 
@@ -990,16 +1106,44 @@ pub(crate) fn analyze_rust_file(
         ))
     };
 
-    for caps in regex_event_emit_rust().captures_iter(content) {
+    // H1-rust-events: the Tauri emit surface is exactly these four methods.
+    // `regex_event_emit_rust` matches ANY `.emit[_a-z]*(` though, so a
+    // domain method like `self.emit_committed_apply_layout(committed)` also
+    // matches, and its bare-identifier argument (`committed`) is not a
+    // Tauri event — it just happens to look like one to the regex.
+    const CANONICAL_EMIT_METHODS: &[&str] = &["emit", "emit_to", "emit_all", "emit_filter"];
+
+    for caps in regex_event_emit_rust().captures_iter(&event_scan_content) {
         if let Some(target) = caps.name("target") {
             // Skip if resolve_event filters out this identifier
             if let Some((name, raw_name, source_kind, is_dynamic)) = resolve_event(target.as_str())
             {
+                let full_match = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                let method_name = full_match
+                    .trim_start_matches('.')
+                    .trim_start()
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                let is_canonical_method = CANONICAL_EMIT_METHODS.contains(&method_name);
+                // A non-canonical emit-like method is a domain method, not
+                // the Tauri emit surface — whatever its argument looks like.
+                // `self.emit_status("ready")` fabricated an event named
+                // "ready" when only identifier arguments were rejected
+                // (audit N06).
+                if !is_canonical_method {
+                    continue;
+                }
+
                 let payload = caps
                     .name("payload")
                     .map(|p| p.as_str().trim().trim_end_matches(')').trim().to_string())
                     .filter(|s| !s.is_empty());
-                let line = offset_to_line(content, caps.get(0).map(|m| m.start()).unwrap_or(0));
+                let line = offset_to_line(
+                    &event_scan_content,
+                    caps.get(0).map(|m| m.start()).unwrap_or(0),
+                );
                 event_emits.push(EventRef {
                     raw_name,
                     name,
@@ -1008,16 +1152,20 @@ pub(crate) fn analyze_rust_file(
                     awaited: false,
                     payload,
                     is_dynamic,
+                    receiver: None,
                 });
             }
         }
     }
-    for caps in regex_event_listen_rust().captures_iter(content) {
+    for caps in regex_event_listen_rust().captures_iter(&event_scan_content) {
         if let Some(target) = caps.name("target") {
             // Skip if resolve_event filters out this identifier
             if let Some((name, raw_name, source_kind, is_dynamic)) = resolve_event(target.as_str())
             {
-                let line = offset_to_line(content, caps.get(0).map(|m| m.start()).unwrap_or(0));
+                let line = offset_to_line(
+                    &event_scan_content,
+                    caps.get(0).map(|m| m.start()).unwrap_or(0),
+                );
                 event_listens.push(EventRef {
                     raw_name,
                     name,
@@ -1026,6 +1174,7 @@ pub(crate) fn analyze_rust_file(
                     awaited: false,
                     payload: None,
                     is_dynamic,
+                    receiver: None,
                 });
             }
         }
@@ -1062,6 +1211,7 @@ pub(crate) fn analyze_rust_file(
                 } else {
                     None
                 },
+                unconfirmed_import: false,
             });
         }
     }
@@ -1101,6 +1251,7 @@ pub(crate) fn analyze_rust_file(
                     } else {
                         None
                     },
+                    unconfirmed_import: false,
                 });
             }
         }
@@ -1160,6 +1311,10 @@ pub(crate) fn analyze_rust_file(
     analysis.event_emits = event_emits;
     analysis.event_listens = event_listens;
 
+    // Axum route registrations (H3a) — the detector scans the stripped
+    // event buffer so routes inside doc comments / #[cfg(test)] don't count.
+    analysis.routes = crate::semantic::rust::rust_routes::detect_axum_routes(&event_scan_content);
+
     // Detect Rust entry points using proper regex (not contains - avoids false positives in comments/strings)
     if regex_rust_fn_main().is_match(content) {
         analysis.entry_points.push("main".to_string());
@@ -1192,12 +1347,22 @@ pub(crate) fn analyze_rust_file(
     // as field types within the same file - they count as "local uses" of those types
     extract_struct_field_types(content, &mut analysis.local_uses);
 
+    // G9-harvest: `extract_identifier_usages` and `collect_identifier_mentions`
+    // are raw token scanners with no string-literal awareness (and only
+    // `collect_identifier_mentions` skips whole comment LINES — a `//!` doc
+    // comment sharing a line with code, or any string literal, still leaks
+    // through). Scan a comment+string-stripped, line-aligned twin of the
+    // full `content` instead: string-strip first (so a URL string's `//`
+    // can't be mistaken for a line comment by strip_comments), then strip
+    // comments. This is intentionally NOT `production_content` — we still
+    // need to scan function bodies for usages of exported symbols
+    // (constants, types, etc.), only with comments/strings scrubbed out.
+    let usage_scan_content = strip_comments(&string_stripped_content);
+
     // Detect identifiers used in expressions and variable declarations
     // This catches const/static usage like `create_buffer::<BUFFER_SIZE>()`
     // and type usage in let bindings like `let x: SomeType = ...`
-    // NOTE: Use full `content` here, not `production_content`, because we need to
-    // scan function bodies for usages of exported symbols (constants, types, etc.)
-    extract_identifier_usages(content, &mut analysis.local_uses);
+    extract_identifier_usages(&usage_scan_content, &mut analysis.local_uses);
 
     // Detect identifiers used as function arguments like `func(CONST_NAME)`
     // This catches const/static usage passed as arguments to functions
@@ -1206,7 +1371,7 @@ pub(crate) fn analyze_rust_file(
     // Fallback: treat any identifier mention (excluding keywords) as a local use.
     // This plugs gaps where complex patterns (const tables, enum variants, nested types)
     // might not be caught by the structured extractors above.
-    collect_identifier_mentions(content, &mut analysis.local_uses);
+    collect_identifier_mentions(&usage_scan_content, &mut analysis.local_uses);
 
     // Remove standard library/common types from local uses to avoid false positives
     // in same-file usage checks.
@@ -1219,7 +1384,12 @@ pub(crate) fn analyze_rust_file(
 
     if !analysis.local_uses.is_empty() {
         let usage_names: HashSet<String> = analysis.local_uses.iter().cloned().collect();
-        let lines: Vec<&str> = content.lines().collect();
+        // G9-harvest: scan the comment/string-stripped twin, not raw
+        // `content` — otherwise a token inside a `//!` doc comment or a
+        // string literal (e.g. `tagmap`'s `pdu`/`length` junk) becomes a
+        // SymbolUsage. Line numbers stay correct because both stripping
+        // passes preserve line boundaries.
+        let lines: Vec<&str> = usage_scan_content.lines().collect();
         const MAX_USAGES_PER_FILE: usize = 1500;
         let usages = collect_symbol_usages_from_lines(&lines, &usage_names, MAX_USAGES_PER_FILE);
         if !usages.is_empty() {
@@ -1499,6 +1669,56 @@ pub fn pub_plain_export() {}
         }
     }
 
+    /// N1 (round-2): members of an `extern "C" { ... }` block are FFI
+    /// declarations - they export with `kind == "extern"` so coverage layers
+    /// can exclude them from testable-export gaps. `pub extern "C" fn`
+    /// (a real function WITH a body) keeps `kind == "function"`.
+    #[test]
+    fn extern_block_members_export_as_extern_kind() {
+        let content = r#"
+extern "C" {
+    pub fn ax_copy_value(element: *const u8) -> i32;
+    pub fn ax_release(obj: *mut u8);
+}
+
+pub extern "C" fn exported_with_body() -> i32 { 42 }
+
+pub fn plain_fn() {}
+
+pub struct PlainStruct;
+"#;
+        let analysis = analyze_rust_file(content, "ffi.rs".to_string(), &[]);
+
+        for name in ["ax_copy_value", "ax_release"] {
+            let export = analysis
+                .exports
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} should be exported"));
+            assert_eq!(
+                export.kind, "extern",
+                "extern-block member {name} must be kind=extern"
+            );
+        }
+        for name in ["exported_with_body", "plain_fn"] {
+            let export = analysis
+                .exports
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} should be exported"));
+            assert_eq!(
+                export.kind, "function",
+                "{name} is a real function and must stay kind=function"
+            );
+        }
+        let strukt = analysis
+            .exports
+            .iter()
+            .find(|e| e.name == "PlainStruct")
+            .expect("struct should be exported");
+        assert_eq!(strukt.kind, "struct");
+    }
+
     #[test]
     fn w5_03_build_script_include_edges() {
         use crate::analyzer::resolvers::resolve_rust_import;
@@ -1714,6 +1934,219 @@ fn main() {
             has_edge_to_x,
             "scan_roots must produce graph edge to data/x.json: {:?}",
             ctx.graph_edges
+        );
+    }
+
+    #[test]
+    fn a3_raw_string_fixture_pub_fn_is_not_a_real_export_or_local() {
+        // A `pub fn hello() {}` embedded in a raw-string fixture literal
+        // (e.g. a test file holding a sample source) must never be treated
+        // as a real declaration by the raw-content pub-decl regex loop.
+        let content = r##"
+pub fn real() {}
+
+const FIXTURE: &str = r#"
+pub fn hello() {}
+"#;
+"##;
+        let analysis = analyze_rust_file(content, "sample.rs".to_string(), &[]);
+        assert!(
+            analysis.exports.iter().any(|e| e.name == "real"),
+            "real must be exported: {:?}",
+            analysis.exports
+        );
+        assert!(
+            !analysis.exports.iter().any(|e| e.name == "hello"),
+            "hello inside a raw-string fixture body must not be exported: {:?}",
+            analysis.exports
+        );
+        assert!(
+            !analysis.local_symbols.iter().any(|s| s.name == "hello"),
+            "hello inside a raw-string fixture body must not be a local symbol either: {:?}",
+            analysis.local_symbols
+        );
+    }
+
+    #[test]
+    fn g4_1_use_as_alias_splits_symbol_name_and_alias() {
+        let content = r#"
+use crate::os::home_unix as platform;
+"#;
+        let analysis = analyze_rust_file(content, "sample.rs".to_string(), &[]);
+        let imp = analysis
+            .imports
+            .iter()
+            .find(|i| i.source.contains("home_unix"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "import for crate::os::home_unix must exist: {:?}",
+                    analysis.imports
+                )
+            });
+        assert!(
+            !imp.source.contains(" as "),
+            "imp.source must not carry the raw ` as alias` suffix (breaks resolve_rust_import): {:?}",
+            imp.source
+        );
+        let sym = imp
+            .symbols
+            .iter()
+            .find(|s| s.name == "home_unix")
+            .unwrap_or_else(|| panic!("symbol name must be home_unix, got: {:?}", imp.symbols));
+        assert_eq!(sym.alias.as_deref(), Some("platform"));
+    }
+
+    #[test]
+    fn h4_brace_nested_use_group_has_no_brace_polluted_symbols() {
+        let content = r#"
+use std::{fs, process::{Command, Stdio}};
+"#;
+        let analysis = analyze_rust_file(content, "sample.rs".to_string(), &[]);
+        let imp = analysis
+            .imports
+            .iter()
+            .find(|i| i.source == "std")
+            .unwrap_or_else(|| panic!("import for std must exist: {:?}", analysis.imports));
+        let mut names: Vec<&str> = imp.symbols.iter().map(|s| s.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["Command", "Stdio", "fs"]);
+        assert!(
+            !names.iter().any(|n| n.contains(['{', '}'])),
+            "no import symbol name may contain a brace: {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn g9_doc_comment_and_string_literal_tokens_are_not_symbol_usages() {
+        let content = r#"//! mentions pdu_helper
+fn pdu_helper() {}
+
+fn caller() {
+    pdu_helper();
+}
+
+fn use_string() {
+    let s = "spawn_thing";
+    println!("{}", s);
+}
+
+fn spawn_thing() {}
+
+fn other() {
+    spawn_thing();
+}
+"#;
+        let analysis = analyze_rust_file(content, "sample.rs".to_string(), &[]);
+
+        // Real callsites must still register as SymbolUsage entries.
+        assert!(
+            analysis
+                .symbol_usages
+                .iter()
+                .any(|u| u.name == "pdu_helper" && u.context.contains("pdu_helper();")),
+            "real callsite for pdu_helper must remain a SymbolUsage: {:?}",
+            analysis.symbol_usages
+        );
+        assert!(
+            analysis
+                .symbol_usages
+                .iter()
+                .any(|u| u.name == "spawn_thing" && u.context.contains("spawn_thing();")),
+            "real callsite for spawn_thing must remain a SymbolUsage: {:?}",
+            analysis.symbol_usages
+        );
+
+        // A `//!` doc comment mentioning a name is not a usage site.
+        assert!(
+            !analysis
+                .symbol_usages
+                .iter()
+                .any(|u| u.context.starts_with("//!")),
+            "doc comment line must not produce a SymbolUsage: {:?}",
+            analysis.symbol_usages
+        );
+        // A string literal containing a name is not a usage site.
+        assert!(
+            !analysis
+                .symbol_usages
+                .iter()
+                .any(|u| u.context.contains("\"spawn_thing\"")),
+            "string literal must not produce a SymbolUsage: {:?}",
+            analysis.symbol_usages
+        );
+    }
+
+    #[test]
+    fn h1_non_canonical_emit_method_with_bare_ident_is_not_an_event() {
+        let content = r#"
+struct Layout;
+impl Layout {
+    fn emit_committed_apply_layout(&self, committed: bool) {}
+}
+fn apply(layout: &Layout, committed: bool) {
+    layout.emit_committed_apply_layout(committed);
+}
+"#;
+        let analysis = analyze_rust_file(content, "src/layout.rs".to_string(), &[]);
+        assert!(
+            analysis.event_emits.is_empty(),
+            "bare identifier arg to a non-canonical emit-like method must not become an event: {:?}",
+            analysis.event_emits
+        );
+    }
+
+    #[test]
+    fn h1_bare_all_caps_identifier_listen_arg_is_not_an_event() {
+        let content = r#"
+struct Server;
+impl Server {
+    fn listen(&self, port: u16) {}
+}
+fn start(server: &Server) {
+    const PORT: u16 = 8080;
+    server.listen(PORT);
+}
+"#;
+        let analysis = analyze_rust_file(content, "src/server.rs".to_string(), &[]);
+        assert!(
+            analysis.event_listens.is_empty(),
+            "bare ALL_CAPS identifier listen arg must not become an event: {:?}",
+            analysis.event_listens
+        );
+    }
+
+    #[test]
+    fn h1_doc_comment_emit_call_is_not_an_event() {
+        let content = r#"
+/// window.emit("foo", ());
+fn noop() {}
+"#;
+        let analysis = analyze_rust_file(content, "src/doc.rs".to_string(), &[]);
+        assert!(
+            analysis.event_emits.is_empty(),
+            "emit() call inside a doc comment must not become an event: {:?}",
+            analysis.event_emits
+        );
+    }
+    #[test]
+    fn non_canonical_emit_method_with_string_literal_is_not_an_event() {
+        // Audit N06: `self.emit_status("ready")` is a domain method, not the
+        // Tauri emit surface — a string-literal argument must not promote it.
+        let content = r#"
+struct S;
+impl S {
+    fn emit_status(&self, status: &str) {}
+    fn run(&self) {
+        self.emit_status("ready");
+    }
+}
+"#;
+        let analysis = analyze_rust_file(content, "src/s.rs".to_string(), &[]);
+        assert!(
+            analysis.event_emits.iter().all(|e| e.name != "ready"),
+            "emit_status(\"ready\") must not fabricate a Tauri event, got: {:?}",
+            analysis.event_emits
         );
     }
 }

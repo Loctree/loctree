@@ -1,5 +1,5 @@
 // swift-tools-version:5.9
-// Implicit-edge regression fixture (loctree-fail.md 2026-07-25, blinksh/blink).
+// Implicit-edge regression fixture (loctree-feedback.md 2026-07-25, blinksh/blink).
 //
 // Module layout matters: the whole defect exists because Swift files in ONE
 // target see each other without `import`. AgentKit is that single module

@@ -74,10 +74,43 @@ use crate::analyzer::cycles::{ClassifiedCycle, CycleClassification, find_cycles_
 use crate::analyzer::dead_parrots::DeadExport;
 use crate::analyzer::health_score::HealthMetrics;
 use crate::analyzer::twins::{
-    TwinCategory, categorize_twin, detect_exact_twins, filter_idiom_twins, find_dead_parrots,
-    omit_from_duplicate_groups,
+    ExactTwin, TwinCategory, categorize_twin, detect_exact_twins, filter_idiom_twins,
+    find_dead_parrots, omit_from_duplicate_groups,
 };
+use crate::semantic::SemanticFacts;
 use crate::snapshot::Snapshot;
+use crate::types::FileAnalysis;
+
+/// The one shape-evidence twin computation every surface must share.
+///
+/// `detect_exact_twins` finds exact-duplicate export groups; Layer 3 then
+/// drops the ones semantic analysis calls an idiom (two `usage` printers in
+/// two scripts, a shared constructor name a framework dictates, …). Every
+/// surface that reports on twins — `findings.rs`, `output.rs`,
+/// `analysis_reports.rs`, the CLI `analysis.rs` handlers — must apply BOTH
+/// steps over the SAME `files`/`include_tests` input, or the twin count
+/// drifts by which surface happened to skip the idiom filter or read a
+/// stale/partial file slice (F6: `detect_exact_twins` was called from 9+
+/// sites, each choosing its own `include_tests` and its own file slice —
+/// `findings.rs` read `scan_results.global_analyses` while this module read
+/// `snapshot.files`, two different views of what should be one sensor).
+///
+/// `semantic_facts` is `None` on a surface that genuinely has none computed
+/// yet at that pipeline stage (e.g. `output::process_root_context` runs
+/// before semantic facts exist) — the idiom filter is then correctly skipped
+/// rather than faked, matching what that surface already did before this
+/// converged the call sites.
+pub fn canonical_exact_twins(
+    files: &[FileAnalysis],
+    semantic_facts: Option<&SemanticFacts>,
+    include_tests: bool,
+) -> Vec<ExactTwin> {
+    let raw = detect_exact_twins(files, include_tests);
+    match semantic_facts {
+        Some(facts) => filter_idiom_twins(raw, facts),
+        None => raw,
+    }
+}
 
 /// What the canonical structural vector scores. Quoted by any surface that
 /// reports the number so a reader can tell two figures apart without reading
@@ -210,11 +243,8 @@ pub fn structural_defects(
     // W2-01: the same evidence that keeps a group out of `duplicate_groups`
     // keeps it out of the SMELL dimension. `text` on two SwiftUI views is a
     // name the framework dictates; scoring it as a smell scores the parser.
-    let exact_twins_raw = detect_exact_twins(&snapshot.files, false);
-    let exact_twins = match snapshot.semantic_facts.as_ref() {
-        Some(facts) => filter_idiom_twins(exact_twins_raw, facts),
-        None => exact_twins_raw,
-    };
+    let exact_twins =
+        canonical_exact_twins(&snapshot.files, snapshot.semantic_facts.as_ref(), false);
     let omitted: HashSet<&str> = exact_twins
         .iter()
         .filter(|twin| omit_from_duplicate_groups(twin))
@@ -367,5 +397,80 @@ mod tests {
         assert_eq!(metrics.missing_handlers, 0);
         assert_eq!(metrics.unregistered_handlers, 0);
         assert_eq!(metrics.unused_high_confidence, 0);
+    }
+
+    fn twin_export_file(path: &str, symbol: &str) -> FileAnalysis {
+        FileAnalysis {
+            path: path.to_string(),
+            exports: vec![crate::types::ExportSymbol {
+                name: symbol.to_string(),
+                kind: "function".to_string(),
+                export_type: "named".to_string(),
+                line: Some(1),
+                params: Vec::new(),
+                symbol_id: crate::types::SymbolIdV1::default(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// F6 — `canonical_exact_twins` is the one computation every twin-reading
+    /// surface must share, but `output::process_root_context` builds its
+    /// report-scoped `Snapshot` before semantic facts exist in that stage of
+    /// the pipeline (it sets `semantic_facts: None` explicitly). Routing that
+    /// surface through `canonical_exact_twins(&analyses, None, false)` must
+    /// not change its output: with no facts to filter idioms by, the shared
+    /// helper must degrade to exactly the raw `detect_exact_twins` result —
+    /// this pins that degrade-safely contract so the output.rs migration is
+    /// behavior-preserving.
+    #[test]
+    fn canonical_exact_twins_with_no_facts_matches_raw_detect_exact_twins() {
+        let files = vec![
+            twin_export_file("src/a.rs", "shared_fn"),
+            twin_export_file("src/b.rs", "shared_fn"),
+        ];
+
+        let raw = detect_exact_twins(&files, false);
+        let canonical = canonical_exact_twins(&files, None, false);
+
+        assert_eq!(canonical.len(), raw.len());
+        assert_eq!(
+            canonical.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+            raw.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        );
+    }
+    /// N13 (audit): every twins-reporting surface goes through
+    /// [`canonical_exact_twins`]. A direct `detect_exact_twins(` call
+    /// anywhere else re-opens the F6 drift this module exists to close.
+    #[test]
+    fn n13_no_surface_calls_detect_exact_twins_directly() {
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let allowed = ["analyzer/twins.rs", "analyzer/health_inputs.rs"];
+        let mut offenders = Vec::new();
+        for entry in walkdir::WalkDir::new(&src_root) {
+            let entry = entry.expect("walk src");
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|e| e.to_str()) != Some("rs")
+            {
+                continue;
+            }
+            let rel = entry
+                .path()
+                .strip_prefix(&src_root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if allowed.iter().any(|a| rel == *a) {
+                continue;
+            }
+            let content = std::fs::read_to_string(entry.path()).expect("read source");
+            if content.contains("detect_exact_twins(") {
+                offenders.push(rel);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "surfaces must call canonical_exact_twins, not detect_exact_twins directly: {offenders:?}"
+        );
     }
 }
