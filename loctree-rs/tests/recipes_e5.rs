@@ -204,3 +204,205 @@ fn g1_qualified_call_with_homonyms_resolves_via_qualifier() {
         "qualified call must never also guess the OTHER homonym exporter (perf.rs), got edges: {edges:#?}"
     );
 }
+
+fn rust_call_identity_fixture() -> TempDir {
+    let fixture = TempDir::new().expect("fixture");
+    for (path, source) in [
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = ['engine', 'lsp']\nresolver = '2'\n",
+        ),
+        (
+            "engine/Cargo.toml",
+            "[package]\nname = 'engine'\nversion = '0.1.0'\nedition = '2024'\n",
+        ),
+        (
+            "lsp/Cargo.toml",
+            "[package]\nname = 'lsp'\nversion = '0.1.0'\nedition = '2024'\n[dependencies]\nengine = { path = '../engine' }\n",
+        ),
+        (
+            "engine/src/lib.rs",
+            "pub mod semantic;\npub mod api;\npub mod other;\npub mod callers;\n",
+        ),
+        (
+            "engine/src/semantic.rs",
+            "pub struct Classifier;\npub fn classify() {}\n",
+        ),
+        (
+            "engine/src/api/mod.rs",
+            "pub mod nested;\npub mod worker;\n",
+        ),
+        (
+            "engine/src/api/nested.rs",
+            "pub fn leaf() {}\npub fn shared() {}\n",
+        ),
+        (
+            "engine/src/api/worker.rs",
+            "pub struct Worker;\nimpl Worker {\n    pub fn execute() {}\n}\n",
+        ),
+        (
+            "engine/src/other.rs",
+            "pub fn shared() {}\npub fn unique_wrong_namespace() {}\npub struct Other;\nimpl Other {\n    pub fn execute() {}\n}\n",
+        ),
+        (
+            "lsp/src/lib.rs",
+            "pub mod backend;\npub mod api;\npub mod callers;\n",
+        ),
+        (
+            "lsp/src/backend.rs",
+            "pub struct Backend;\nimpl Backend {\n    pub fn semantic() {}\n}\n",
+        ),
+        ("lsp/src/api/mod.rs", "pub mod nested;\n"),
+        (
+            "lsp/src/api/nested.rs",
+            "pub fn leaf() {}\npub fn shared() {}\n",
+        ),
+        (
+            "lsp/src/callers.rs",
+            "pub fn run() {\n    engine::api::nested::shared();\n    crate::api::nested::leaf();\n}\n",
+        ),
+        (
+            "engine/src/callers/mod.rs",
+            "pub mod mentions;\npub mod qualified;\npub mod aliases;\npub mod uncertain;\npub mod scoped;\npub mod ambiguous;\n",
+        ),
+        (
+            "engine/src/callers/mentions.rs",
+            r##"use crate::semantic::Classifier;
+// crate::backend::semantic();
+/* crate::backend::semantic(); */
+#[cfg_attr(any(), crate::backend::semantic())]
+pub fn mentions(_: Option<crate::semantic::Classifier>) {
+    let _ = "crate::backend::semantic()";
+    let _ = r#"crate::backend::semantic()"#;
+    crate::semantic::classify();
+}
+"##,
+        ),
+        (
+            "engine/src/callers/qualified.rs",
+            "pub fn run() {\n    crate::api::nested::leaf();\n    crate::api::nested::shared();\n    crate::api::worker::Worker::execute();\n}\n",
+        ),
+        (
+            "engine/src/callers/aliases.rs",
+            "use crate::api as renamed;\nuse crate::api::worker::Worker as Runner;\npub fn run() {\n    renamed::nested::leaf();\n    Runner::execute();\n}\n",
+        ),
+        (
+            "engine/src/callers/uncertain.rs",
+            "pub fn run() {\n    missing::semantic();\n    missing::unique_wrong_namespace();\n    crate::api::missing::unique_wrong_namespace();\n    crate::api::nested::Worker::execute();\n    foreign::python_only();\n    foreign::typescript_only();\n}\n",
+        ),
+        (
+            "engine/src/callers/scoped.rs",
+            "pub fn local_alias() {\n    use crate::api as renamed;\n    let _brace = '}';\n    renamed::nested::leaf();\n}\npub fn out_of_scope() {\n    renamed::worker::Worker::execute();\n}\n",
+        ),
+        (
+            "engine/src/callers/ambiguous.rs",
+            "use crate::api as renamed;\nuse crate::other as renamed;\npub fn ambiguous() {\n    renamed::nested::leaf();\n}\n",
+        ),
+        ("names.py", "def python_only():\n    pass\n"),
+        ("names.ts", "export function typescript_only() {}\n"),
+    ] {
+        let path = fixture.path().join(path);
+        std::fs::create_dir_all(path.parent().expect("fixture parent")).expect("fixture directory");
+        std::fs::write(path, source).expect("fixture source");
+    }
+    fixture
+}
+
+#[test]
+fn g1_module_mentions_do_not_fabricate_reverse_cross_crate_calls() {
+    let fixture = rust_call_identity_fixture();
+    let edges = snapshot_edges(fixture.path());
+    let caller = "engine/src/callers/mentions.rs";
+    let targets: Vec<_> = edges
+        .iter()
+        .filter(|e| edge_str(e, "from") == Some(caller))
+        .map(|e| edge_str(e, "to").expect("edge target"))
+        .collect();
+    assert!(
+        targets.contains(&"engine/src/semantic.rs"),
+        "real semantic dependency: {edges:#?}"
+    );
+    assert!(
+        !targets.contains(&"lsp/src/backend.rs"),
+        "module token is not Backend::semantic(): {edges:#?}"
+    );
+}
+
+#[test]
+fn g1_calls_resolve_exact_crate_module_and_receiver_identity() {
+    let fixture = rust_call_identity_fixture();
+    let edges = snapshot_edges(fixture.path());
+    for (caller, expected) in [
+        (
+            "engine/src/callers/qualified.rs",
+            vec!["engine/src/api/nested.rs", "engine/src/api/worker.rs"],
+        ),
+        (
+            "engine/src/callers/aliases.rs",
+            vec![
+                "engine/src/api/mod.rs",
+                "engine/src/api/nested.rs",
+                "engine/src/api/worker.rs",
+            ],
+        ),
+        (
+            "lsp/src/callers.rs",
+            vec!["engine/src/api/nested.rs", "lsp/src/api/nested.rs"],
+        ),
+    ] {
+        let mut targets: Vec<_> = edges
+            .iter()
+            .filter(|e| edge_str(e, "from") == Some(caller))
+            .map(|e| edge_str(e, "to").expect("edge target"))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        assert_eq!(
+            targets, expected,
+            "wrong target identity for {caller}: {edges:#?}"
+        );
+    }
+}
+
+#[test]
+fn g1_unresolved_namespaces_and_foreign_namesakes_stay_uncertain() {
+    let fixture = rust_call_identity_fixture();
+    let edges = snapshot_edges(fixture.path());
+    let targets: Vec<_> = edges
+        .iter()
+        .filter(|e| edge_str(e, "from") == Some("engine/src/callers/uncertain.rs"))
+        .collect();
+    assert!(
+        targets.is_empty(),
+        "unresolved calls must not guess exporters: {targets:#?}"
+    );
+}
+
+#[test]
+fn g1_function_local_module_alias_does_not_escape_its_scope() {
+    let fixture = rust_call_identity_fixture();
+    let edges = snapshot_edges(fixture.path());
+    let mut targets: Vec<_> = edges
+        .iter()
+        .filter(|e| {
+            edge_str(e, "from") == Some("engine/src/callers/scoped.rs")
+                && edge_str(e, "label") == Some("call")
+        })
+        .map(|e| edge_str(e, "to").expect("edge target"))
+        .collect();
+    targets.sort_unstable();
+    assert_eq!(targets, vec!["engine/src/api/nested.rs"], "{edges:#?}");
+}
+
+#[test]
+fn g1_ambiguous_module_alias_does_not_choose_a_global_exporter() {
+    let fixture = rust_call_identity_fixture();
+    let edges = snapshot_edges(fixture.path());
+    assert!(
+        !edges.iter().any(
+            |e| edge_str(e, "from") == Some("engine/src/callers/ambiguous.rs")
+                && edge_str(e, "label") == Some("call")
+        ),
+        "{edges:#?}"
+    );
+}

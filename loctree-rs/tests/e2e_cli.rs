@@ -1677,6 +1677,76 @@ mod diff_mode_new_features {
     }
 
     #[test]
+    fn diff_resolves_both_refs_and_excludes_dirty_worktree_from_explicit_target() {
+        let temp = create_diff_repo();
+        std::fs::write(
+            temp.path().join("src/dirty.ts"),
+            "export const dirty = 1;\n",
+        )
+        .expect("Git diff CLI fixture");
+        let output = loct()
+            .current_dir(temp.path())
+            .args(["diff", "--since", "HEAD~1", "--to", "HEAD", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).expect("Git diff CLI fixture");
+        assert!(
+            json["from_commit"]["hash"]
+                .as_str()
+                .expect("Git diff CLI fixture")
+                .len()
+                == 40
+        );
+        assert!(
+            json["to_commit"]["hash"]
+                .as_str()
+                .expect("Git diff CLI fixture")
+                .len()
+                == 40
+        );
+        assert_eq!(json["files"]["added"], serde_json::json!(["src/new.ts"]));
+        let output = loct()
+            .current_dir(temp.path())
+            .args(["diff", "--since", "HEAD", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let json: Value = serde_json::from_slice(&output).expect("Git diff CLI fixture");
+        assert!(json["to_commit"].is_null());
+        assert!(
+            json["files"]["added"]
+                .as_array()
+                .expect("Git diff CLI fixture")
+                .contains(&serde_json::json!("src/dirty.ts"))
+        );
+        loct()
+            .current_dir(temp.path())
+            .args(["diff", "--since", "missing-ref", "--json"])
+            .assert()
+            .failure();
+        loct()
+            .current_dir(temp.path())
+            .args([
+                "diff",
+                "--since",
+                "HEAD~1",
+                "--to",
+                "HEAD",
+                "--auto-scan-base",
+                "--problems-only",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("new_dead_exports"));
+    }
+
+    #[test]
     fn diff_help_shows_auto_scan_base_flag() {
         loctree()
             .args(["diff", "--help"])
@@ -1699,7 +1769,7 @@ mod diff_mode_new_features {
     }
 
     #[test]
-    fn diff_changed_files_summarizes_ref_to_head_without_snapshot_scan() {
+    fn diff_changed_files_summarizes_ref_to_worktree_without_snapshot_scan() {
         let temp = create_diff_repo();
 
         let output = loct()
@@ -1713,7 +1783,7 @@ mod diff_mode_new_features {
         let json: Value = serde_json::from_slice(&output).unwrap();
 
         assert_eq!(json["from"], "HEAD~1");
-        assert_eq!(json["to"], "HEAD");
+        assert_eq!(json["to"], "working-tree");
         assert_eq!(json["total"], 2);
         assert_eq!(json["changed_files"][0]["status"], "Modified");
         assert_eq!(json["changed_files"][0]["new_path"], "src/main.ts");
@@ -4629,6 +4699,123 @@ mod management_commands {
         );
     }
 
+    fn measurement_fixture() -> TempDir {
+        let temp = TempDir::new().expect("tree measurement fixture or output");
+        std::fs::write(temp.path().join("valid.py"), b"a=1\nb=2\n")
+            .expect("tree measurement fixture or output");
+        std::fs::write(temp.path().join("empty.txt"), b"")
+            .expect("tree measurement fixture or output");
+        std::fs::write(
+            temp.path().join("asset.png"),
+            b"\x89PNG\r\n\x1a\nreadable tail",
+        )
+        .expect("tree measurement fixture or output");
+        std::fs::write(
+            temp.path().join("invalid_utf8.rs"),
+            b"fn a() {}\n\xff\nfn b() {}\n",
+        )
+        .expect("tree measurement fixture or output");
+        temp
+    }
+
+    fn measurement_tree(root: &std::path::Path, args: &[&str]) -> Value {
+        let output = loctree()
+            .current_dir(root)
+            .args(["tree", "--json"])
+            .args(args)
+            .output()
+            .expect("tree measurement fixture or output");
+        assert!(output.status.success(), "{:?}", output);
+        serde_json::from_slice(&output.stdout).expect("tree measurement fixture or output")
+    }
+
+    #[test]
+    fn tree_measurement_keeps_all_physical_files_with_nullable_loc() {
+        let temp = measurement_fixture();
+        let result = measurement_tree(temp.path(), &["--loc", "0", "--summary", "20"]);
+        let entries = result["entries"]
+            .as_array()
+            .expect("tree measurement fixture or output");
+        assert_eq!(entries.len(), 4);
+        for (path, loc) in [
+            ("asset.png", Value::Null),
+            ("invalid_utf8.rs", Value::Null),
+            ("empty.txt", Value::from(0)),
+            ("valid.py", Value::from(2)),
+        ] {
+            let entry = entries
+                .iter()
+                .find(|e| e["path"] == path)
+                .expect("tree measurement fixture or output");
+            assert_eq!(entry["loc"], loc, "{path}");
+            assert_eq!(entry["isLarge"], !loc.is_null(), "{path}");
+        }
+        assert_eq!(result["summary"]["files"], 4);
+        assert_eq!(result["summary"]["filesWithLoc"], 2);
+        assert_eq!(result["summary"]["totalLoc"], 2);
+        let large = result["summary"]["largeFiles"]
+            .as_array()
+            .expect("tree measurement fixture or output");
+        assert_eq!(large.len(), 2);
+        assert_eq!(large[0]["path"], "valid.py");
+        assert_eq!(large[1]["path"], "empty.txt");
+
+        let top = measurement_tree(temp.path(), &["--loc", "0", "--top", "20"]);
+        assert_eq!(
+            top["entries"]
+                .as_array()
+                .expect("tree measurement fixture or output")
+                .len(),
+            2
+        );
+        assert_eq!(top["summary"], result["summary"]);
+    }
+
+    #[test]
+    fn tree_measurement_preserves_binary_only_directory_and_path_selection() {
+        let temp = TempDir::new().expect("tree measurement fixture or output");
+        std::fs::create_dir(temp.path().join("assets"))
+            .expect("tree measurement fixture or output");
+        std::fs::write(temp.path().join("assets/image.png"), b"\0binary\n")
+            .expect("tree measurement fixture or output");
+        let result = measurement_tree(temp.path(), &[]);
+        assert_eq!(
+            result["entries"]
+                .as_array()
+                .expect("tree measurement fixture or output")
+                .len(),
+            2
+        );
+        assert_eq!(result["entries"][0]["path"], "assets");
+        assert_eq!(result["entries"][1]["path"], "assets/image.png");
+        assert!(result["entries"][1]["loc"].is_null());
+        assert_eq!(result["summary"]["directories"], 1);
+        assert_eq!(result["summary"]["files"], 1);
+        assert_eq!(result["summary"]["filesWithLoc"], 0);
+        assert_eq!(result["summary"]["totalLoc"], 0);
+        assert!(
+            result["summary"]["largeFiles"]
+                .as_array()
+                .expect("tree measurement fixture or output")
+                .is_empty()
+        );
+
+        loctree()
+            .current_dir(temp.path())
+            .args(["tree", "--files", "--match", "image"])
+            .assert()
+            .success()
+            .stdout("assets/image.png\n");
+        loctree()
+            .current_dir(temp.path())
+            .args(["--ext", "rs", "--no-gitignore", "--json"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"files\": 0"));
+        let depth = measurement_tree(temp.path(), &["--depth", "0"]);
+        assert_eq!(depth["summary"]["files"], 0);
+    }
+
     // ----------------------------------------
     // Find Command Tests
     // ----------------------------------------
@@ -5796,6 +5983,105 @@ mod env_truth {
     }
 
     #[test]
+    fn dockerfile_lines_after_prior_continuations() {
+        let temp = TempDir::new().expect("temp Dockerfile root");
+        fs::write(temp.path().join("Dockerfile"), "FROM alpine\nRUN echo one \\\n    && echo two \\\n    && echo three\nENV DEMO_ALPHA=first\nENV DEMO_BETA=second \\\n    DEMO_GAMMA=third\nENV DEMO_DELTA=fourth\n").expect("write Dockerfile");
+        let assert = loct()
+            .current_dir(temp.path())
+            .args(["env-truth", "--json"])
+            .assert()
+            .success();
+        let value = json_value(&assert.get_output().stdout);
+        let declarations = value["declarations"].as_array().expect("declarations");
+        assert_eq!(declarations.len(), 4);
+        for (name, line) in [
+            ("DEMO_ALPHA", 5),
+            ("DEMO_BETA", 6),
+            ("DEMO_GAMMA", 6),
+            ("DEMO_DELTA", 8),
+        ] {
+            let decl = declarations
+                .iter()
+                .find(|d| d["name"] == name)
+                .expect("declaration");
+            let sources = decl["sources"].as_array().expect("sources");
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0]["path"], "Dockerfile");
+            assert_eq!(sources[0]["kind"], "dockerfile");
+            assert_eq!(sources[0]["line"], line);
+            assert_eq!(sources[0]["precedence_rank"], 40);
+        }
+    }
+
+    #[test]
+    fn dockerfile_continued_keys_keep_directive_start() {
+        let temp = TempDir::new().expect("temp Dockerfile root");
+        let lines = [
+            "# header",
+            "",
+            "FROM alpine",
+            "RUN echo one \\",
+            "    && echo two",
+            "LABEL demo=one \\",
+            "    other=two",
+            "# after continuations",
+            "",
+            "ENV\tALPHA=first \\",
+            "    BETA=\"two words\" \\",
+            "    GAMMA='three words'",
+            "ENV LEGACY four words",
+            "ENV EMPTY=",
+            "ENV LAST=fifth \\",
+            "    TAIL=sixth \\",
+        ];
+        // CRLF, ENV tab, quoted and legacy values, and an open continuation at EOF.
+        fs::write(temp.path().join("Dockerfile"), lines.join("\r\n")).expect("write Dockerfile");
+        let assert = loct()
+            .current_dir(temp.path())
+            .args(["env-truth", "--json"])
+            .assert()
+            .success();
+        let value = json_value(&assert.get_output().stdout);
+        let declarations = value["declarations"].as_array().expect("declarations");
+        assert_eq!(declarations.len(), 7);
+        for (name, line, expected_value) in [
+            ("ALPHA", 10, "first"),
+            ("BETA", 10, "two words"),
+            ("GAMMA", 10, "three words"),
+            ("LEGACY", 13, "four words"),
+            ("EMPTY", 14, ""),
+            ("LAST", 15, "fifth"),
+            ("TAIL", 15, "sixth"),
+        ] {
+            let decl = declarations
+                .iter()
+                .find(|d| d["name"] == name)
+                .expect("declaration");
+            let sources = decl["sources"].as_array().expect("sources");
+            assert_eq!(sources.len(), 1);
+            let source = &sources[0];
+            assert_eq!(source["line"], line);
+            assert_eq!(source["kind"], "dockerfile");
+            assert_eq!(source["precedence_rank"], 40);
+            let expected = if expected_value.is_empty() {
+                loctree::analyzer::env_truth::ValuePresence::Empty
+            } else {
+                loctree::analyzer::env_truth::ValuePresence::Plain {
+                    value_hash: <sha2::Sha256 as sha2::Digest>::digest(expected_value.as_bytes())
+                        .iter()
+                        .take(6)
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                }
+            };
+            assert_eq!(
+                source["value_present"],
+                serde_json::to_value(expected).expect("presence JSON")
+            );
+        }
+    }
+
+    #[test]
     fn json_emits_schema_and_declarations() {
         let temp = TempDir::new().unwrap();
         stage_env_drift(&temp, 30, 2);
@@ -6549,13 +6835,33 @@ mod occurrences_cli {
             suggestions
                 .iter()
                 .any(|s| s["command"] == "loct body 'action_handler_class' --json")
-                && suggestions
-                    .iter()
-                    .any(|s| s["command"] == "loct find 'action_handler_class' --json")
+                && suggestions.iter().any(|s| {
+                    s["command"] == "loct query where-symbol 'action_handler_class' --json"
+                })
                 && suggestions
                     .iter()
                     .any(|s| s["command"] == "loct slice 'src/onboarding/handlers.rs'"),
-            "suggested_next should point to body, literal parity, and a concrete slice"
+            "suggested_next should point to body, definition locations, and a concrete slice"
+        );
+        assert!(
+            suggestions
+                .iter()
+                .all(|s| s["command"] != "loct find 'action_handler_class' --json"),
+            "navigation should advance beyond the same literal query"
+        );
+        let find_output = loct()
+            .current_dir(temp.path())
+            .env("LOCT_CACHE_DIR", cache.path())
+            .args(["find", "action_handler_class", "--json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let find_json: Value = serde_json::from_slice(&find_output).expect("find JSON");
+        assert_eq!(
+            find_json["literal_matches"]["occurrences"], json["occurrences"],
+            "find and occurrences must preserve actual role and binding parity"
         );
     }
 

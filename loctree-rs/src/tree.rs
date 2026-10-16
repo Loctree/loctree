@@ -231,9 +231,11 @@ fn walk(
                 .as_ref()
                 .is_none_or(|set| set.contains(&ext));
             if matches_ext {
+                // Physical presence does not depend on whether LOC is measurable.
+                include_current = true;
+                collectors.stats.files += 1;
                 loc = count_lines(&path);
                 if let Some(value) = loc {
-                    collectors.stats.files += 1;
                     collectors.stats.files_with_loc += 1;
                     collectors.stats.total_loc += value;
                     if value >= ctx.options.loc_threshold {
@@ -247,7 +249,6 @@ fn walk(
                             loc: value,
                         });
                     }
-                    include_current = true;
                 }
             }
         }

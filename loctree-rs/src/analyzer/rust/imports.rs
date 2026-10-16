@@ -53,7 +53,7 @@ fn split_top_level_commas(raw: &str) -> Vec<&str> {
 /// a naive `.trim_end_matches('}')` on the tail after the first `{` eats
 /// both, corrupting the nested group into `{Command` / `Stdio` fragments
 /// (H4-brace). Returns `None` when the group is unbalanced.
-pub(super) fn split_use_prefix_and_braces(source: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_use_prefix_and_braces(source: &str) -> Option<(&str, &str)> {
     let open = source.find('{')?;
     let prefix = source[..open].trim().trim_end_matches("::");
     let mut depth: i32 = 0;
@@ -83,7 +83,7 @@ pub(super) fn split_use_prefix_and_braces(source: &str) -> Option<(&str, &str)> 
 /// last-segment semantics used for a plain nested path like `models::Visit`.
 /// Any item whose extracted name would still contain `{`/`}` (unbalanced or
 /// otherwise malformed input) is dropped rather than emitted (H4-brace).
-pub(super) fn parse_rust_brace_names(raw: &str) -> Vec<(String, String)> {
+pub(crate) fn parse_rust_brace_names(raw: &str) -> Vec<(String, String)> {
     split_top_level_commas(raw)
         .into_iter()
         .flat_map(|item| {

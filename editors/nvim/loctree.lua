@@ -120,24 +120,37 @@ if not configs.loctree then
 end
 
 -- Setup with your preferred on_attach and capabilities
-lspconfig.loctree.setup {
-  on_attach = function(client, bufnr)
-    -- Enable hover, go-to-definition, references
-    local opts = { noremap = true, silent = true, buffer = bufnr }
+local function loctree_on_attach(client, bufnr)
+  -- Diagnostics are pushed; code actions are advertised by loctree-lsp.
+  -- Hover/navigation/references belong to the native language server.
+  -- Generic mappings below are installed only when this client advertises them.
+  local opts = { noremap = true, silent = true, buffer = bufnr }
 
+  local caps = client.server_capabilities or {}
+  if caps.hoverProvider then
     vim.keymap.set('n', 'K', vim.lsp.buf.hover, opts)
+  end
+  if caps.definitionProvider then
     vim.keymap.set('n', 'gd', vim.lsp.buf.definition, opts)
+  end
+  if caps.referencesProvider then
     vim.keymap.set('n', 'gr', vim.lsp.buf.references, opts)
+  end
+  if caps.codeActionProvider then
     vim.keymap.set('n', '<leader>ca', vim.lsp.buf.code_action, opts)
+  end
 
-    -- Loctree-specific commands
-    vim.keymap.set('n', '<leader>lr', ':!loct<CR>', { desc = 'Loctree: Refresh' })
-    vim.keymap.set('n', '<leader>lh', ':!loct health<CR>', { desc = 'Loctree: Health' })
-    vim.keymap.set('n', '<leader>li', function()
-      local file = vim.fn.expand('%:.')
-      vim.cmd('!loct impact "' .. file .. '"')
-    end, { desc = 'Loctree: Impact' })
-  end,
+  -- Loctree-specific commands
+  vim.keymap.set('n', '<leader>lr', ':!loct<CR>', { desc = 'Loctree: Refresh' })
+  vim.keymap.set('n', '<leader>lh', ':!loct health<CR>', { desc = 'Loctree: Health' })
+  vim.keymap.set('n', '<leader>li', function()
+    local file = vim.fn.expand('%:.')
+    vim.cmd('!loct impact "' .. file .. '"')
+  end, { desc = 'Loctree: Impact' })
+end
+LoctreeRuntime.on_attach = loctree_on_attach
+lspconfig.loctree.setup {
+  on_attach = loctree_on_attach,
   capabilities = vim.lsp.protocol.make_client_capabilities(),
 }
 

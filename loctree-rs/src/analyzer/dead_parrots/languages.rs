@@ -1,7 +1,5 @@
 //! Language-specific checks for dead export detection
 
-use std::fs;
-
 use crate::types::FileAnalysis;
 
 pub(super) fn is_svelte_component_api(file_path: &str, export_name: &str) -> bool {
@@ -246,8 +244,8 @@ pub(super) fn is_python_dunder_method(export_name: &str) -> bool {
     export_name.starts_with("__") && export_name.ends_with("__")
 }
 
-pub(super) fn rust_has_known_derives(path: &str, keywords: &[&str]) -> bool {
-    let Ok(content) = fs::read_to_string(path) else {
+pub(super) fn rust_has_known_derives(content: Option<&str>, keywords: &[&str]) -> bool {
+    let Some(content) = content else {
         return false;
     };
     let lower = content.to_lowercase();

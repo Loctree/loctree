@@ -11,7 +11,7 @@ use crate::args::ParsedArgs;
 use crate::fs_utils::{GitIgnoreChecker, gather_files};
 use crate::snapshot::Snapshot;
 use crate::types::{
-    ColorMode, ExportIndex, FileAnalysis, ImportKind, Options, OutputMode, PayloadMap,
+    ColorMode, ExportIndex, FileAnalysis, ImportEntry, ImportKind, Options, OutputMode, PayloadMap,
 };
 
 use super::classify::is_dev_file;
@@ -124,10 +124,40 @@ struct SingleRootResult {
 /// Maximum number of roots to scan in parallel (bounded parallelism)
 const MAX_PARALLEL_ROOTS: usize = 4;
 
+/// Project known import semantics into the shared snapshot edge vocabulary.
+/// Type edges remain dependencies for navigation; runtime cycle consumers
+/// exclude them through `find_cycles_with_lazy`.
+pub(crate) fn import_edge_label(import: &ImportEntry) -> &'static str {
+    if import.is_mod_declaration {
+        "mod"
+    } else if import.is_type_checking || import.kind == ImportKind::Type {
+        "type_import"
+    } else if import.is_lazy {
+        "lazy_import"
+    } else {
+        match import.kind {
+            ImportKind::Static | ImportKind::SideEffect => "import",
+            ImportKind::Dynamic => "dynamic_import",
+            ImportKind::Type => unreachable!("type imports handled before lazy imports"),
+        }
+    }
+}
+
 pub fn scan_roots(cfg: ScanConfig<'_>) -> io::Result<ScanResults> {
+    scan_roots_with_cache(cfg, None)
+}
+
+/// Watch-owned, pre-finalization analyses, keyed by canonical root and file.
+/// Never seed this from a persisted snapshot: cross-file reduction mutates facts.
+pub(crate) type RawAnalysisCache = Mutex<HashMap<(PathBuf, PathBuf), FileAnalysis>>;
+
+pub(crate) fn scan_roots_with_cache(
+    cfg: ScanConfig<'_>,
+    raw_cache: Option<&RawAnalysisCache>,
+) -> io::Result<ScanResults> {
     // For single root, skip parallelization overhead
     if cfg.roots.len() <= 1 {
-        return scan_roots_sequential(cfg);
+        return scan_roots_sequential(cfg, raw_cache);
     }
 
     // Parallel scanning with bounded concurrency
@@ -139,7 +169,7 @@ pub fn scan_roots(cfg: ScanConfig<'_>) -> io::Result<ScanResults> {
         for chunk in cfg.roots.chunks(MAX_PARALLEL_ROOTS) {
             let handles: Vec<_> = chunk
                 .iter()
-                .map(|root_path| s.spawn(|| scan_single_root(root_path, &cfg)))
+                .map(|root_path| s.spawn(|| scan_single_root(root_path, &cfg, raw_cache)))
                 .collect();
 
             for (handle, root_path) in handles.into_iter().zip(chunk.iter()) {
@@ -262,7 +292,10 @@ pub fn scan_roots(cfg: ScanConfig<'_>) -> io::Result<ScanResults> {
 }
 
 /// Sequential scanning (original implementation, used for single root)
-fn scan_roots_sequential(cfg: ScanConfig<'_>) -> io::Result<ScanResults> {
+fn scan_roots_sequential(
+    cfg: ScanConfig<'_>,
+    raw_cache: Option<&RawAnalysisCache>,
+) -> io::Result<ScanResults> {
     let mut contexts: Vec<RootContext> = Vec::new();
     let mut global_fe_commands: CommandUsage = HashMap::new();
     let mut global_be_commands: CommandUsage = HashMap::new();
@@ -273,7 +306,7 @@ fn scan_roots_sequential(cfg: ScanConfig<'_>) -> io::Result<ScanResults> {
     let mut all_py_roots: Vec<String> = Vec::new();
 
     for root_path in cfg.roots.iter() {
-        let result = scan_single_root(root_path, &cfg)?;
+        let result = scan_single_root(root_path, &cfg, raw_cache)?;
 
         contexts.push(result.context);
         for (name, entries) in result.fe_commands {
@@ -336,6 +369,7 @@ fn path_matches_ignore(matchers: &crate::fs_utils::IgnoreMatchers, path: &std::p
 fn scan_single_root(
     root_path: &std::path::Path,
     cfg: &ScanConfig<'_>,
+    raw_cache: Option<&RawAnalysisCache>,
 ) -> io::Result<SingleRootResult> {
     let ignore_matchers =
         crate::fs_utils::build_ignore_matchers(&cfg.parsed.ignore_patterns, root_path);
@@ -538,49 +572,24 @@ fn scan_single_root(
             .unwrap_or_else(|_| file.to_string_lossy().to_string())
             .replace('\\', "/");
 
-        // Check if we can use cached analysis (mtime + size must both match)
-        let mut analysis = if let Some(cache) = cfg.cached_analyses {
-            if let Some(cached) = cache.get(&rel_path) {
-                let mtime_matches = cached.mtime > 0 && cached.mtime == current_mtime;
-                let size_matches = cached.size == current_size;
-                if mtime_matches && size_matches {
-                    // File unchanged - reuse cached analysis
-                    cached_hits += 1;
-                    cached.clone()
-                } else {
-                    // File changed - re-analyze
-                    fresh_scans += 1;
-                    match analyze_file(&file, &analyze_ctx) {
-                        Ok(mut a) => {
-                            a.mtime = current_mtime;
-                            a.size = current_size;
-                            a
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                            // Skip binary files or invalid UTF-8
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            } else {
-                // New file - analyze
-                fresh_scans += 1;
-                match analyze_file(&file, &analyze_ctx) {
-                    Ok(mut a) => {
-                        a.mtime = current_mtime;
-                        a.size = current_size;
-                        a
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                        // Skip binary files or invalid UTF-8
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+        let cache_key = (root_canon.clone(), file.clone());
+        let cached_raw = raw_cache.and_then(|cache| {
+            cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&cache_key).cloned())
+        });
+        let cached = cached_raw
+            .as_ref()
+            .or_else(|| cfg.cached_analyses.and_then(|cache| cache.get(&rel_path)));
+        // Watch invalidates event paths explicitly, including same-second,
+        // same-size edits. The stat check also catches changes outside a batch.
+        let mut analysis = if let Some(cached) = cached.filter(|cached| {
+            cached.mtime > 0 && cached.mtime == current_mtime && cached.size == current_size
+        }) {
+            cached_hits += 1;
+            cached.clone()
         } else {
-            // No cache - fresh scan
             fresh_scans += 1;
             match analyze_file(&file, &analyze_ctx) {
                 Ok(mut a) => {
@@ -595,6 +604,12 @@ fn scan_single_root(
                 Err(e) => return Err(e),
             }
         };
+        if let Some(cache) = raw_cache {
+            cache
+                .lock()
+                .map_err(|_| io::Error::other("raw analysis cache poisoned"))?
+                .insert(cache_key, analysis.clone());
+        }
         let abs_for_match = root_canon.join(&analysis.path);
         // Tag `.loctignore`-excluded files surfaced by `--include-ignored`.
         // Always reset (cache reuse must not carry a stale flag): only the
@@ -746,25 +761,7 @@ fn scan_single_root(
                     _ => None,
                 });
                 if let Some(target) = resolved {
-                    let label = if imp.is_mod_declaration {
-                        // Rust `mod foo;` declarations create parent->child module relationships
-                        // These are NOT import edges and should not contribute to cycle detection
-                        "mod"
-                    } else if imp.is_type_checking {
-                        "type_import"
-                    } else if imp.is_lazy {
-                        "lazy_import"
-                    } else {
-                        match imp.kind {
-                            ImportKind::Static | ImportKind::Type | ImportKind::SideEffect => {
-                                "import"
-                            }
-                            ImportKind::Dynamic => "dynamic_import",
-                        }
-                    };
-                    if label == "type_import" {
-                        continue;
-                    }
+                    let label = import_edge_label(imp);
                     // Use full paths for edges (slice module needs exact paths)
                     // Note: normalize_module_id strips /index suffix which breaks slice lookups
                     graph_edges.push((analysis.path.clone(), target, label.to_string()));
@@ -1047,17 +1044,8 @@ fn scan_single_root(
         }
     }
 
-    // G1: Rust path-qualified calls (`crate::foo::bar()`, `Type::method()`)
-    // never go through a `use` statement, so they never land in
-    // `analysis.imports` — only the leaf identifiers ("foo", "bar") land in
-    // `local_uses`/`symbol_usages` (rust/usages.rs::extract_path_qualified_calls).
-    // Without a `use`, the import-edge loop above never sees these callers,
-    // so `impact`/`slice` on the defining file miss them entirely. Turn
-    // unambiguous usages into `call` edges, mirroring the Swift
-    // implicit_symbol guard above: only fires when exactly one file in the
-    // whole scan exports that name (a common name with several exporters is
-    // a guess, not a fact — the same G8-class noise this file already fixed
-    // once for Swift).
+    // G1: Qualified Rust calls can bypass `use`. Require an actual callee
+    // leaf and its module/type owner; global name uniqueness is not identity.
     if cfg.collect_edges
         || (cfg.parsed.graph && options.report_path.is_some())
         || options.impact.is_some()
@@ -1068,62 +1056,30 @@ fn scan_single_root(
             .iter()
             .map(|(from, to, _)| (from.clone(), to.clone()))
             .collect();
-        // Only a Rust file can be the target of a Rust path-qualified call:
-        // counting exporters across every language let a lone Python `def
-        // widget()` claim a Rust caller (audit 2026-09-27, N02/P0).
-        let rust_paths: HashSet<&str> = analyses
+        let rust_files: HashMap<&str, &FileAnalysis> = analyses
             .iter()
             .filter(|a| a.language == "rs")
-            .map(|a| a.path.as_str())
+            .map(|a| (a.path.as_str(), a))
             .collect();
         let mut rust_call_edges: HashSet<(String, String)> = HashSet::new();
-        for analysis in &analyses {
-            if analysis.language != "rs" {
+        for analysis in rust_files.values() {
+            let file = root_canon.join(&analysis.path);
+            let Ok(content) = crate::fs_utils::read_to_string_within(&root_canon, &file) else {
                 continue;
-            }
-            for usage in &analysis.symbol_usages {
-                // `symbol_usages` holds every identifier mention, local
-                // variables included. Only a usage whose context shows the
-                // name as a `::` path segment is a path-qualified-call fact;
-                // anything else is a bare-name guess (audit N02).
-                if !path_qualified_in_context(&usage.context, &usage.name) {
-                    continue;
-                }
-                let Some(target_files) = export_index.get(&usage.name) else {
+            };
+            for (path, visible_imports) in super::rust::qualified_call_paths(&content) {
+                let Some(target) =
+                    rust_call_targets(&path, &visible_imports, analysis, &rust_files, &root_canon)
+                else {
                     continue;
                 };
-                let rust_targets: Vec<&String> = target_files
-                    .iter()
-                    .filter(|t| rust_paths.contains(t.as_str()))
-                    .collect();
-                let unambiguous = rust_targets.len() == 1;
-                for target in rust_targets {
-                    if target.as_str() == analysis.path {
-                        continue;
-                    }
-                    // Several same-language exporters: the qualifier right
-                    // before the leaf decides which file the call names —
-                    // `crate::diff::analyze()` is diff.rs even when perf.rs
-                    // also exports `analyze`. No matching qualifier, no fact.
-                    if !unambiguous {
-                        let Some(qualifier) = path_qualifier_before(&usage.context, &usage.name)
-                        else {
-                            continue;
-                        };
-                        if !module_path_matches(target, qualifier) {
-                            continue;
-                        }
-                    }
-                    if existing_edge_pairs.contains(&(analysis.path.clone(), target.clone())) {
-                        continue;
-                    }
-                    if rust_call_edges.insert((analysis.path.clone(), target.clone())) {
-                        graph_edges.push((
-                            analysis.path.clone(),
-                            target.clone(),
-                            "call".to_string(),
-                        ));
-                    }
+                if target == analysis.path
+                    || existing_edge_pairs.contains(&(analysis.path.clone(), target.clone()))
+                {
+                    continue;
+                }
+                if rust_call_edges.insert((analysis.path.clone(), target.clone())) {
+                    graph_edges.push((analysis.path.clone(), target, "call".to_string()));
                 }
             }
         }
@@ -1308,7 +1264,7 @@ fn scan_single_root(
     let tsconfig_summary = super::tsconfig::summarize_tsconfig(root_path, &analyses);
 
     // Log incremental scan stats if verbose
-    if options.verbose && cfg.cached_analyses.is_some() {
+    if options.verbose && (cfg.cached_analyses.is_some() || raw_cache.is_some()) {
         let total = cached_hits + fresh_scans;
         eprintln!(
             "[loctree][incremental] {} cached, {} fresh ({} total files)",
@@ -2240,82 +2196,168 @@ pub(crate) fn build_py_roots(root_canon: &Path, extra_roots: &[PathBuf]) -> Vec<
     roots
 }
 
-/// Build cascades (re-export chains) from analyses
-/// True when `name` appears in `context` as a segment of a `::` path
-/// (`name::…` or `…::name`), on identifier boundaries. This is the G1
-/// call-shape gate: a bare mention of the name never counts (audit N02).
-fn path_qualified_in_context(context: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
+/// Resolve only the source identities supported by the Rust import/module
+/// resolver and definition facts. Its tolerant import fallback is not enough:
+/// the entire namespace and (for associated calls) receiver must also agree.
+fn rust_call_targets(
+    call: &[String],
+    visible_imports: &[String],
+    caller: &FileAnalysis,
+    files: &HashMap<&str, &FileAnalysis>,
+    root: &Path,
+) -> Option<String> {
+    use super::resolvers::{find_rust_crate_root, is_declared_external_dependency};
+
+    fn module_parts(file: &Path, crate_root: &Path) -> Option<Vec<String>> {
+        let relative = file.strip_prefix(crate_root).ok()?;
+        let mut parts: Vec<String> = relative
+            .parent()?
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let stem = relative.file_stem()?.to_str()?;
+        if !matches!(stem, "lib" | "main" | "mod") {
+            parts.push(stem.to_string());
+        }
+        Some(parts)
     }
-    let bytes = context.as_bytes();
-    let mut from = 0;
-    while let Some(pos) = context[from..].find(name) {
-        let begin = from + pos;
-        let end = begin + name.len();
-        let before_boundary =
-            begin == 0 || !(bytes[begin - 1].is_ascii_alphanumeric() || bytes[begin - 1] == b'_');
-        let after_boundary =
-            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
-        if before_boundary && after_boundary {
-            let qualified_left = begin >= 2 && bytes[begin - 1] == b':' && bytes[begin - 2] == b':';
-            let qualified_right =
-                end + 1 < bytes.len() && bytes[end] == b':' && bytes[end + 1] == b':';
-            if qualified_left || qualified_right {
-                return true;
+
+    let file = root.join(&caller.path);
+    let crate_root =
+        find_rust_crate_root(&file).unwrap_or_else(|| file.parent().unwrap_or(root).to_path_buf());
+    let head = call.first()?;
+    let mut aliases = Vec::new();
+    for import in visible_imports {
+        if let Some((prefix, body)) = super::rust::split_use_prefix_and_braces(import) {
+            for (original, alias) in super::rust::parse_rust_brace_names(body) {
+                if &alias != head {
+                    continue;
+                }
+                // The legacy name index flattens nested brace groups; do not
+                // invent the namespace that it discarded.
+                if import.matches('{').count() != 1 || body.contains("::") {
+                    return None;
+                }
+                let mut path: Vec<String> = prefix.split("::").map(str::to_string).collect();
+                if original != "self" {
+                    path.push(original);
+                }
+                path.extend_from_slice(&call[1..]);
+                aliases.push(path);
+            }
+        } else {
+            let (source, alias) = import
+                .split_once(" as ")
+                .map(|(source, alias)| (source.trim(), alias.trim()))
+                .unwrap_or_else(|| {
+                    (
+                        import.as_str(),
+                        import.rsplit("::").next().unwrap_or(import),
+                    )
+                });
+            if alias != head {
+                continue;
+            }
+            let mut path: Vec<String> = source.split("::").map(|s| s.trim().to_string()).collect();
+            path.extend_from_slice(&call[1..]);
+            aliases.push(path);
+        }
+    }
+    aliases.sort();
+    aliases.dedup();
+    let path = match aliases.len() {
+        0 => call,
+        1 => &aliases[0],
+        _ => return None,
+    };
+    let head = path.first()?.as_str();
+    let mut owner_root = crate_root.clone();
+    let mut namespace = module_parts(&file, &crate_root)?;
+    let mut tail = path;
+    match head {
+        "crate" => {
+            namespace.clear();
+            tail = &path[1..];
+        }
+        "self" => tail = &path[1..],
+        "super" => {
+            while tail.first().is_some_and(|s| s == "super") {
+                namespace.pop()?;
+                tail = &tail[1..];
             }
         }
-        from = begin + 1;
+        _ if is_declared_external_dependency(head, &crate_root, root) => {
+            let entry = resolve_rust_import(head, &file, &crate_root, root)?;
+            owner_root = find_rust_crate_root(&root.join(entry))?;
+            namespace.clear();
+            tail = &path[1..];
+        }
+        _ => {}
     }
-    false
-}
-
-/// For `X::name` in `context`, return `X` — the path segment immediately
-/// qualifying `name`. Used to resolve same-language homonym exporters.
-fn path_qualifier_before<'a>(context: &'a str, name: &str) -> Option<&'a str> {
-    if name.is_empty() {
+    namespace.extend_from_slice(tail);
+    let leaf = namespace.pop()?;
+    let source = format!(
+        "crate::{}",
+        namespace
+            .iter()
+            .chain(std::iter::once(&leaf))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("::")
+    );
+    let target = resolve_rust_import(&source, &file, &owner_root, root).or_else(|| {
+        // Root-level functions/types have no module segment for the import
+        // resolver to consume. Only accept an indexed crate entry surface.
+        let entries: Vec<_> = ["lib.rs", "main.rs"]
+            .iter()
+            .filter_map(|name| {
+                owner_root
+                    .join(name)
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+            })
+            .filter(|p| files.contains_key(p.as_str()))
+            .collect();
+        (entries.len() == 1).then(|| entries[0].clone())
+    })?;
+    let definition = files.get(target.as_str())?;
+    let target_namespace = module_parts(&root.join(&target), &owner_root)?;
+    if namespace == target_namespace {
+        let functions: Vec<_> = definition
+            .exports
+            .iter()
+            .filter(|export| {
+                export.name == leaf
+                    && export.kind == "function"
+                    && !definition
+                        .impl_methods
+                        .iter()
+                        .any(|method| method.line == export.line)
+            })
+            .collect();
+        return (functions.len() == 1).then_some(target);
+    }
+    let receiver = namespace.pop()?;
+    if namespace != target_namespace {
         return None;
     }
-    let bytes = context.as_bytes();
-    let mut from = 0;
-    while let Some(pos) = context[from..].find(name) {
-        let begin = from + pos;
-        let end = begin + name.len();
-        let after_boundary =
-            end == bytes.len() || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
-        if after_boundary && begin >= 2 && bytes[begin - 1] == b':' && bytes[begin - 2] == b':' {
-            let qualifier_end = begin - 2;
-            let mut qualifier_start = qualifier_end;
-            while qualifier_start > 0
-                && (bytes[qualifier_start - 1].is_ascii_alphanumeric()
-                    || bytes[qualifier_start - 1] == b'_')
-            {
-                qualifier_start -= 1;
-            }
-            if qualifier_start < qualifier_end {
-                return Some(&context[qualifier_start..qualifier_end]);
-            }
-        }
-        from = begin + 1;
-    }
-    None
-}
-
-/// Does `target` (a root-relative file path) define the module named
-/// `qualifier`? `diff.rs` and `diff/mod.rs` both answer to `diff`.
-fn module_path_matches(target: &str, qualifier: &str) -> bool {
-    let path = std::path::Path::new(target);
-    let stem = path.file_stem().and_then(|s| s.to_str());
-    match stem {
-        Some("mod") | Some("lib") | Some("main") => {
-            path.parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                == Some(qualifier)
-        }
-        Some(stem) => stem == qualifier,
-        None => false,
-    }
+    let defines_receiver = definition
+        .exports
+        .iter()
+        .any(|e| e.name == receiver && matches!(e.kind.as_str(), "struct" | "enum" | "type"))
+        || definition
+            .local_symbols
+            .iter()
+            .any(|s| s.name == receiver && matches!(s.kind.as_str(), "struct" | "enum" | "type"));
+    let methods: Vec<_> = definition
+        .impl_methods
+        .iter()
+        .filter(|method| {
+            method.name == leaf && method.qualifier == receiver && method.trait_qualifier.is_none()
+        })
+        .collect();
+    (defines_receiver && methods.len() == 1).then_some(target)
 }
 
 fn build_cascades(analyses: &[FileAnalysis]) -> Vec<(String, String)> {
@@ -2335,32 +2377,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_qualified_gate_accepts_segments_and_rejects_bare_names() {
-        assert!(path_qualified_in_context(
-            "crate::diff::analyze(ctx)",
-            "analyze"
-        ));
-        assert!(path_qualified_in_context(
-            "crate::diff::analyze(ctx)",
-            "diff"
-        ));
-        assert!(!path_qualified_in_context("let widget = 1;", "widget"));
-        assert!(!path_qualified_in_context(
-            "crate::diff::analyzer(ctx)",
-            "analyze"
-        ));
+    fn path_qualified_gate_requires_a_call_leaf() {
+        assert_eq!(
+            super::super::rust::qualified_call_paths("crate::diff::analyze(ctx)")
+                .into_iter()
+                .map(|(path, _)| path)
+                .collect::<Vec<_>>(),
+            vec![vec!["crate", "diff", "analyze"]]
+        );
+        for non_call in [
+            "let widget = 1;",
+            "analyze(ctx)",
+            "use crate::diff::analyze;",
+            "let _: crate::diff::analyze;",
+            "#[crate::diff::analyze(ctx)]",
+            "// crate::diff::analyze(ctx)",
+            "\"crate::diff::analyze(ctx)\"",
+        ] {
+            assert!(
+                super::super::rust::qualified_call_paths(non_call).is_empty(),
+                "{non_call}"
+            );
+        }
     }
 
     #[test]
-    fn qualifier_before_returns_the_segment_naming_the_module() {
+    fn qualified_call_paths_preserve_namespace_and_receiver() {
         assert_eq!(
-            path_qualifier_before("crate::diff::analyze(ctx)", "analyze"),
-            Some("diff")
+            super::super::rust::qualified_call_paths(
+                "crate :: diff :: analyze::<Vec<u8>>() ; platform::Worker::run();\ncrate::diff::\nanalyze();"
+            ).into_iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![
+                vec!["crate", "diff", "analyze"],
+                vec!["platform", "Worker", "run"],
+                vec!["crate", "diff", "analyze"]
+            ]
         );
-        assert_eq!(path_qualifier_before("analyze(ctx)", "analyze"), None);
-        assert!(module_path_matches("app/diff.rs", "diff"));
-        assert!(module_path_matches("app/diff/mod.rs", "diff"));
-        assert!(!module_path_matches("app/perf.rs", "diff"));
     }
     use tempfile::tempdir;
 

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::classify::should_exclude_from_reports;
+use super::classify::{language_from_path, should_exclude_from_reports};
 use super::root_scan::normalize_module_id;
 
 /// Provenance check: a cycle whose every member lives under a test/fixture path.
@@ -37,22 +37,19 @@ pub enum CycleClassification {
     Unknown,
 }
 
-/// Compilability status of a cycle.
+/// Legacy wire classification of cycle evidence, not a compiler verdict.
 ///
-/// This classifies cycles by whether they would actually break compilation,
-/// addressing the false positive issue where "strict cycles" are reported
-/// as critical but compile successfully.
+/// Graph analysis does not execute, compile or typecheck the project. `structural`
+/// means coupling was observed and its execution outcome is unverified; it does
+/// not certify that the code compiles. The enum and serialized names are retained
+/// for compatibility. Graph topology alone never emits `breaking`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CycleCompilability {
-    /// Would fail compilation (runtime circular value dependencies).
-    /// Example: `const A = B + 1` and `const B = A + 1`
+    /// Reserved legacy failure bucket; never inferred from import topology.
     Breaking,
 
-    /// Graph cycle that compiles fine due to language semantics.
-    /// Examples:
-    /// - Rust mod/use separation (mod declares, use consumes)
-    /// - TypeScript cross-file references that resolve at runtime
+    /// Observed dependency cycle; compiler/runtime outcome is unverified.
     Structural,
 
     /// Not a true cycle - shared dependency diamond pattern.
@@ -72,15 +69,17 @@ impl CycleCompilability {
     pub fn icon(&self) -> &'static str {
         match self {
             CycleCompilability::Breaking => "[HIGH]",
-            CycleCompilability::Structural => "[LOW]",
+            CycleCompilability::Structural => "[REVIEW]",
             CycleCompilability::DiamondDependency => "[OK]",
         }
     }
 
     pub fn description(&self) -> &'static str {
         match self {
-            CycleCompilability::Breaking => "Direct mutual imports (high risk)",
-            CycleCompilability::Structural => "Reference pattern (low risk)",
+            CycleCompilability::Breaking => "Legacy failure bucket (not inferred from topology)",
+            CycleCompilability::Structural => {
+                "Dependency coupling; compiler/runtime outcome unverified"
+            }
             CycleCompilability::DiamondDependency => "Shared module, not a cycle",
         }
     }
@@ -107,7 +106,7 @@ impl CycleCompilability {
 impl CycleClassification {
     pub fn severity(&self) -> u8 {
         match self {
-            CycleClassification::HardBidirectional => 3,
+            CycleClassification::HardBidirectional => 2,
             CycleClassification::WildcardImport => 2,
             CycleClassification::CfgGated => 1,
             CycleClassification::ModuleSelfReference => 0,
@@ -135,8 +134,8 @@ impl CycleClassification {
             CycleClassification::HardBidirectional => "blocks decoupling",
             CycleClassification::WildcardImport => "implicit coupling",
             CycleClassification::CfgGated => "conditional, low impact",
-            CycleClassification::ModuleSelfReference => "Rust pattern, OK",
-            CycleClassification::TraitBased => "architectural, OK",
+            CycleClassification::ModuleSelfReference => "Rust module reference",
+            CycleClassification::TraitBased => "architectural coupling",
             CycleClassification::FanPattern => "not true cycle",
             CycleClassification::Unknown => "needs review",
         }
@@ -189,7 +188,7 @@ fn determine_compilability(
     edges: &[(String, String, String)],
 ) -> CycleCompilability {
     match classification {
-        // These patterns are known to compile fine
+        // These graph patterns provide no compiler/runtime verdict
         CycleClassification::ModuleSelfReference => CycleCompilability::Structural,
         CycleClassification::TraitBased => CycleCompilability::Structural,
         CycleClassification::CfgGated => CycleCompilability::Structural,
@@ -209,17 +208,8 @@ fn determine_compilability(
             }
         }
 
-        // Hard bidirectional needs deeper analysis before it can be called
-        // Breaking: a Rust mod/use split, a type-only edge set, or a hidden
-        // diamond are all structural/non-defect carve-outs. Once a cycle
-        // survives every carve-out, it IS the "one truth" this repo already
-        // uses elsewhere: `health_inputs::structural_defects` and
-        // `findings::classify_cycles` both call a surviving
-        // `HardBidirectional` cycle "breaking". Before this fix this arm
-        // always fell through to `Structural` regardless — `loct cycles`
-        // reported 0 breaking on a repository `findings.json` called 9.
-        // This is the one truth chosen for the disagreement: HardBidirectional
-        // that survives every structural carve-out => Breaking, everywhere.
+        // Mutual imports prove coupling, not a value-initialization failure.
+        // Absence of a mod/type/diamond carve-out is not failure evidence.
         CycleClassification::HardBidirectional => {
             if is_rust_mod_use_pattern(nodes, edges) {
                 return CycleCompilability::Structural;
@@ -233,11 +223,11 @@ fn determine_compilability(
                 return CycleCompilability::DiamondDependency;
             }
 
-            CycleCompilability::Breaking
+            CycleCompilability::Structural
         }
 
         CycleClassification::Unknown => {
-            // Unknown patterns default to structural since they compiled
+            // Unknown execution outcome: retain the structural evidence
             CycleCompilability::Structural
         }
     }
@@ -341,7 +331,7 @@ fn describe_cycle(
     compilability: &CycleCompilability,
     nodes: &[String],
 ) -> (String, String, Option<String>) {
-    let pattern = match classification {
+    let mut pattern = match classification {
         CycleClassification::ModuleSelfReference => "Rust mod/use separation".to_string(),
         CycleClassification::TraitBased => "Trait-based abstraction".to_string(),
         CycleClassification::CfgGated => "Conditional compilation (#[cfg])".to_string(),
@@ -357,10 +347,18 @@ fn describe_cycle(
         CycleClassification::Unknown => "Unknown pattern".to_string(),
     };
 
+    // Shared language helper, used only here. Safe and failing JS/Python cycles
+    // can have identical topology: this is a review hint, never a verdict.
+    let initialization_review = nodes
+        .iter()
+        .any(|node| matches!(language_from_path(node).as_str(), "js" | "ts" | "py"));
+    if *compilability != CycleCompilability::DiamondDependency {
+        pattern.push_str("; compiler/runtime outcome unverified");
+    }
     let risk = match compilability {
         CycleCompilability::Breaking => "high".to_string(),
         CycleCompilability::Structural => {
-            if nodes.len() > 5 {
+            if initialization_review || nodes.len() > 5 {
                 "medium".to_string()
             } else {
                 "low".to_string()
@@ -372,10 +370,13 @@ fn describe_cycle(
     let suggestion = match (classification, compilability) {
         (_, CycleCompilability::DiamondDependency) => None,
         (CycleClassification::ModuleSelfReference, _) => {
-            Some("Idiomatic Rust - no action needed".to_string())
+            Some("Review module coupling; compilation was not checked".to_string())
         }
         (CycleClassification::FanPattern, _) => {
-            Some("Good architecture - shared utilities are fine".to_string())
+            Some("Review shared dependency structure".to_string())
+        }
+        (_, CycleCompilability::Structural) if initialization_review => {
+            Some("Review initialization order and value access; this cycle may succeed or fail at runtime".to_string())
         }
         (CycleClassification::HardBidirectional, CycleCompilability::Structural) => {
             if nodes.len() > 5 {
@@ -523,9 +524,10 @@ pub fn find_cycles(edges: &[(String, String, String)]) -> Vec<Vec<String>> {
     let mut normalized_edges: Vec<(String, String)> = Vec::new();
 
     for (from, to, kind) in edges {
-        // Skip Rust `mod foo;` declarations - these create parent->child module relationships,
-        // not import edges. A parent declaring `mod child;` is NOT importing from child.
-        if kind == "mod" {
+        // Module declarations and erased type dependencies remain navigation
+        // relationships, but cannot close a runtime import cycle. Keep this
+        // fence here too: MCP/LSP use this walker without the lazy wrapper.
+        if kind == "mod" || kind == "type_import" {
             continue;
         }
         let norm_from = normalize_module_id(from).as_key();
@@ -749,11 +751,11 @@ pub fn print_cycles_classified(classified_cycles: &[ClassifiedCycle], json_outpu
     // Summary with risk levels
     println!("CYCLE RISK LEVELS:");
     println!(
-        "  HIGH (Bidirectional):  {} - Direct mutual imports (A <-> B)",
+        "  HIGH (Legacy failure): {} - Not inferred from graph topology",
         bidirectional
     );
     println!(
-        "  LOW (Structural):      {} - Module organization patterns",
+        "  REVIEW (Structural):   {} - Coupling; execution outcome unverified",
         structural
     );
     println!(
@@ -764,7 +766,9 @@ pub fn print_cycles_classified(classified_cycles: &[ClassifiedCycle], json_outpu
     if bidirectional == 0 {
         println!("\nNo high-risk circular imports detected.");
         if structural > 0 {
-            println!("  Structural cycles are low-risk organizational patterns.");
+            println!(
+                "  Review coupling and initialization order; no compiler/runtime check was run."
+            );
         }
     }
 }
@@ -1500,20 +1504,10 @@ mod tests {
             classified[0].classification,
             CycleClassification::HardBidirectional
         );
-        assert_eq!(classified[0].classification.severity(), 3);
+        assert_eq!(classified[0].classification.severity(), 2);
     }
 
-    /// F5 — cross-surface truth: a genuinely mutual pair (unrelated files,
-    /// no Rust mod/use split, no type-only edges, no diamond) must classify
-    /// as `Breaking`, not fall through to `Structural`. Before this fix,
-    /// `determine_compilability`'s hard-bidirectional arm had no reachable
-    /// `Breaking` arm at all (it always fell through to `Structural`), and
-    /// `is_rust_mod_use_pattern` additionally short-circuited on `kind ==
-    /// "import"` alone (the kind nearly every real edge carries) regardless
-    /// of any actual parent/child relationship — so `loct cycles` always
-    /// reported 0 breaking cycles while `findings.json` (which derived
-    /// "breaking" straight from the classification) reported the true count.
-    /// This is the one truth both surfaces must now agree on.
+    /// Graph-only classification must not promote mutual imports to failure.
     #[test]
     fn call_edges_never_form_cycles() {
         // G1 call edges densify the graph enough to make cycle enumeration
@@ -1529,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hard_bidirectional_compiles_to_breaking() {
+    fn test_hard_bidirectional_is_not_a_compilation_verdict() {
         use super::{CycleCompilability, find_cycles_classified};
         let edges = vec![
             ("a.rs".to_string(), "b.rs".to_string(), "import".to_string()),
@@ -1537,7 +1531,7 @@ mod tests {
         ];
         let classified = find_cycles_classified(&edges);
         assert_eq!(classified.len(), 1);
-        assert_eq!(classified[0].compilability, CycleCompilability::Breaking);
+        assert_eq!(classified[0].compilability, CycleCompilability::Structural);
     }
 
     #[test]
@@ -1708,7 +1702,7 @@ mod tests {
     #[test]
     fn test_severity_levels() {
         use super::CycleClassification;
-        assert_eq!(CycleClassification::HardBidirectional.severity(), 3);
+        assert_eq!(CycleClassification::HardBidirectional.severity(), 2);
         assert_eq!(CycleClassification::WildcardImport.severity(), 2);
         assert_eq!(CycleClassification::Unknown.severity(), 2);
         assert_eq!(CycleClassification::CfgGated.severity(), 1);
@@ -1718,7 +1712,7 @@ mod tests {
 
         assert_eq!(
             CycleClassification::HardBidirectional.severity_label(),
-            "high"
+            "medium"
         );
         assert_eq!(
             CycleClassification::WildcardImport.severity_label(),

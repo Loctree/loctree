@@ -16,7 +16,7 @@ pub use similarity::{
 };
 pub use types::*;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::snapshot::GraphEdge;
 use crate::types::FileAnalysis;
@@ -27,6 +27,7 @@ use crate::types::FileAnalysis;
 /// of patterns.
 struct CrowdContext {
     import_sets: HashMap<String, HashSet<String>>,
+    export_sets: HashMap<String, BTreeSet<String>>,
     counts: ImporterCounts,
 }
 
@@ -38,6 +39,20 @@ impl CrowdContext {
         };
         Self {
             import_sets: build_import_sets(files),
+            export_sets: files
+                .iter()
+                .map(|file| {
+                    let names = file
+                        .exports
+                        .iter()
+                        .map(|export| export.name.as_str())
+                        // Default/star markers are not shared named identities.
+                        .filter(|name| !matches!(*name, "" | "default" | "*"))
+                        .map(str::to_string)
+                        .collect();
+                    (file.path.clone(), names)
+                })
+                .collect(),
             counts,
         }
     }
@@ -61,7 +76,9 @@ pub fn detect_crowd_with_edges(
 
 fn detect_crowd_in_context(files: &[FileAnalysis], pattern: &str, ctx: &CrowdContext) -> Crowd {
     // 1. Find files matching the pattern by name
-    let matching_files = cluster_by_name(files, pattern);
+    let mut matching_files = cluster_by_name(files, pattern);
+    matching_files.sort();
+    matching_files.dedup();
 
     if matching_files.is_empty() {
         return Crowd {
@@ -117,13 +134,17 @@ fn detect_crowd_in_context(files: &[FileAnalysis], pattern: &str, ctx: &CrowdCon
         .collect();
 
     // Sort by importer count (most popular first)
-    members.sort_by_key(|b| std::cmp::Reverse(b.importer_count));
+    members.sort_by(|a, b| {
+        b.importer_count
+            .cmp(&a.importer_count)
+            .then_with(|| a.file.cmp(&b.file))
+    });
 
     // 5. Detect issues
-    let issues = detect_issues(&members, &similarities);
+    let issues = detect_issues(&members, &ctx.export_sets);
 
     // 6. Calculate crowd score
-    let score = calculate_crowd_score(&members, &issues);
+    let score = calculate_crowd_score(&issues);
 
     // 7. Infer context type
     let context_type = infer_context_type(pattern, &members);
@@ -140,74 +161,88 @@ fn detect_crowd_in_context(files: &[FileAnalysis], pattern: &str, ctx: &CrowdCon
 /// Detect issues in a crowd
 fn detect_issues(
     members: &[CrowdMember],
-    similarities: &[(String, String, f32)],
+    export_sets: &HashMap<String, BTreeSet<String>>,
 ) -> Vec<CrowdIssue> {
     let mut issues = Vec::new();
+    let mut by_path: Vec<_> = members.iter().collect();
+    by_path.sort_by_key(|member| &member.file);
 
-    if members.len() < 2 {
-        return issues;
-    }
-
-    // Check for usage asymmetry
-    if let Some(primary) = members.first() {
-        let underused: Vec<String> = members
-            .iter()
-            .skip(1)
-            .filter(|m| m.importer_count <= primary.importer_count / 3)
-            .map(|m| m.file.clone())
-            .collect();
-
-        if !underused.is_empty() {
-            issues.push(CrowdIssue::UsageAsymmetry {
-                primary: primary.file.clone(),
-                underused,
-            });
+    // Identity contract: exact, case-sensitive leaf stem, removing only the
+    // final extension. Keep namespace, platform and test suffixes intact.
+    let mut names: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, member) in by_path.iter().enumerate() {
+        if let Some(stem) = std::path::Path::new(&member.file)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+        {
+            names.entry(stem).or_default().push(i);
         }
     }
 
-    // Check for high similarity (potential duplicates)
-    let high_similarity_pairs: Vec<String> = similarities
-        .iter()
-        .filter(|(_, _, score)| *score > 0.6)
-        .map(|(a, b, _)| {
-            format!(
-                "{} ↔ {}",
-                a.rsplit('/').next().unwrap_or(a),
-                b.rsplit('/').next().unwrap_or(b)
-            )
-        })
-        .collect();
-
-    if !high_similarity_pairs.is_empty() {
-        issues.push(CrowdIssue::ExportOverlap {
-            files: high_similarity_pairs.clone(),
-            overlap: vec!["high import similarity".to_string()],
+    let mut peers = HashSet::new();
+    for group in names.into_values().filter(|group| group.len() >= 2) {
+        for (offset, &a) in group.iter().enumerate() {
+            for &b in &group[offset + 1..] {
+                peers.insert((a, b));
+            }
+        }
+        issues.push(CrowdIssue::NameCollision {
+            files: group.iter().map(|&i| by_path[i].file.clone()).collect(),
         });
     }
 
-    // Check for name collisions (files with very similar names)
-    let filenames: Vec<&str> = members
-        .iter()
-        .map(|m| m.file.rsplit('/').next().unwrap_or(&m.file))
-        .collect();
+    // Shared dependencies remain member similarity facts, never export evidence.
+    for (i, a) in by_path.iter().enumerate() {
+        for (j, b) in by_path.iter().enumerate().skip(i + 1) {
+            let (Some(left), Some(right)) = (export_sets.get(&a.file), export_sets.get(&b.file))
+            else {
+                continue;
+            };
+            let overlap: Vec<_> = left.intersection(right).cloned().collect();
+            if !overlap.is_empty() {
+                peers.insert((i, j));
+                issues.push(CrowdIssue::ExportOverlap {
+                    files: vec![a.file.clone(), b.file.clone()],
+                    overlap,
+                });
+            }
+        }
+    }
 
-    if members.len() >= 3 {
-        issues.push(CrowdIssue::NameCollision {
-            files: filenames.iter().map(|s| s.to_string()).collect(),
-        });
+    // Compare only evidenced peers. Popularity is neither authority nor proof
+    // of redundancy; the legacy underused field holds review candidates only.
+    let mut comparisons: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (i, a) in by_path.iter().enumerate() {
+        for (j, b) in by_path.iter().enumerate().skip(i + 1) {
+            if !peers.contains(&(i, j)) {
+                continue;
+            }
+            let (higher, lower) = if a.importer_count >= b.importer_count {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            if higher.importer_count >= 3 && lower.importer_count <= higher.importer_count / 3 {
+                comparisons
+                    .entry(higher.file.clone())
+                    .or_default()
+                    .push(lower.file.clone());
+            }
+        }
+    }
+    for (primary, mut underused) in comparisons {
+        underused.sort();
+        issues.push(CrowdIssue::UsageAsymmetry { primary, underused });
     }
 
     issues
 }
 
 /// Calculate crowd score (0-10, higher = more problematic)
-fn calculate_crowd_score(members: &[CrowdMember], issues: &[CrowdIssue]) -> f32 {
+fn calculate_crowd_score(issues: &[CrowdIssue]) -> f32 {
     let mut score = 0.0;
 
-    // More members = higher score
-    score += (members.len() as f32 - 1.0).min(3.0);
-
-    // More issues = higher score
+    // Score evidenced concerns, not the size of a functional association.
     score += issues.len() as f32 * 1.5;
 
     // Usage asymmetry adds to score

@@ -15,7 +15,7 @@ use super::context_commands::{
     parse_hotspots_command, parse_repo_view_command, parse_slice_command, parse_trace_command,
 };
 use super::helpers::{
-    SUBCOMMANDS, format_unknown_subcommand_error, is_jq_filter, parse_color_mode,
+    format_unknown_subcommand_error, is_jq_filter, is_subcommand, parse_color_mode,
     should_treat_unknown_as_subcommand,
 };
 use super::misc_commands::{
@@ -107,7 +107,7 @@ pub fn uses_new_syntax(args: &[String]) -> bool {
         if findings_alias {
             return true;
         }
-        return SUBCOMMANDS.contains(&arg.as_str())
+        return is_subcommand(arg)
             || Command::retired_command_message(arg).is_some()
             || is_jq_filter(arg)
             || should_treat_unknown_as_subcommand(args, arg);
@@ -313,8 +313,7 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
             _ => {
                 // Positional argument
                 if subcommand.is_none()
-                    && (SUBCOMMANDS.contains(&arg.as_str())
-                        || Command::retired_command_message(arg).is_some())
+                    && (is_subcommand(arg) || Command::retired_command_message(arg).is_some())
                 {
                     subcommand = Some(arg.clone());
                 } else if subcommand.is_none()
@@ -346,6 +345,10 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
     }
 
     if help_requested {
+        if subcommand.as_deref() == Some("help") && !remaining_args.is_empty() {
+            return parse_help_command(&remaining_args)
+                .map(|command| Some(ParsedCommand::new(command, global)));
+        }
         let help_command = if legacy_findings_alias {
             Some("findings".to_string())
         } else {
@@ -394,7 +397,10 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
         )));
     }
 
-    let mut command = match subcommand.as_deref() {
+    let canonical_subcommand = subcommand
+        .as_deref()
+        .map(|name| Command::canonical_subcommand(name).unwrap_or(name));
+    let mut command = match canonical_subcommand {
         None | Some("auto") => parse_auto_command(&remaining_args)?,
         Some("agent") => {
             let cmd = parse_auto_command(&remaining_args)?;
@@ -410,14 +416,14 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
         Some("scan") => parse_scan_command(&remaining_args)?,
         Some("watch") => parse_watch_command(&remaining_args)?,
         Some("tree") => parse_tree_command(&remaining_args)?,
-        Some("slice") | Some("s") => parse_slice_command(&remaining_args)?,
+        Some("slice") => parse_slice_command(&remaining_args)?,
         Some("context") => parse_context_command(&remaining_args)?,
         Some("repo-view") => parse_repo_view_command(&remaining_args)?,
-        Some("find") | Some("f") => parse_find_command(&remaining_args)?,
+        Some("find") => parse_find_command(&remaining_args)?,
         Some("occurrences") => parse_occurrences_command(&remaining_args)?,
         Some("findings") => parse_findings_command(&remaining_args)?,
-        Some("dead") | Some("unused") | Some("d") => parse_dead_command(&remaining_args)?,
-        Some("cycles") | Some("c") => parse_cycles_command(&remaining_args)?,
+        Some("dead") => parse_dead_command(&remaining_args)?,
+        Some("cycles") => parse_cycles_command(&remaining_args)?,
         Some("trace") => parse_trace_command(&remaining_args)?,
         Some("commands") => parse_commands_command(&remaining_args)?,
         Some("events") => parse_events_command(&remaining_args)?,
@@ -431,13 +437,14 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
         Some("report") => parse_report_command(&remaining_args)?,
         Some("prism") => parse_prism_command(&remaining_args)?,
         Some("help") => parse_help_command(&remaining_args)?,
-        Some("query") | Some("q") => parse_query_command(&remaining_args)?,
+        Some("query") => parse_query_command(&remaining_args)?,
         Some("body") => parse_body_command(&remaining_args)?,
-        Some("impact") | Some("i") => parse_impact_command(&remaining_args)?,
+        Some("impact") => parse_impact_command(&remaining_args)?,
         Some("diff") => parse_diff_command(&remaining_args)?,
+        Some("history") => super::output_commands::parse_history_command(&remaining_args)?,
         Some("crowd") => parse_crowd_command(&remaining_args)?,
         Some("tagmap") => parse_tagmap_command(&remaining_args)?,
-        Some("twins") | Some("t") => parse_twins_command(&remaining_args)?,
+        Some("twins") => parse_twins_command(&remaining_args)?,
         Some("suppress") => parse_suppress_command(&remaining_args)?,
         Some("suppressions") => parse_suppressions_command(&remaining_args)?,
         Some("sniff") => {
@@ -456,11 +463,11 @@ pub fn parse_command(args: &[String]) -> Result<Option<ParsedCommand>, String> {
                 .expect("retired zombie message")
                 .to_string());
         }
-        Some("health") | Some("h") => parse_health_command(&remaining_args)?,
+        Some("health") => parse_health_command(&remaining_args)?,
         Some("audit") => parse_audit_command(&remaining_args)?,
         Some("doctor") => parse_doctor_command(&remaining_args)?,
-        Some("env-truth") | Some("envtruth") => parse_env_truth_command(&remaining_args)?,
-        Some("plan") | Some("p") => parse_plan_command(&remaining_args)?,
+        Some("env-truth") => parse_env_truth_command(&remaining_args)?,
+        Some("plan") => parse_plan_command(&remaining_args)?,
         Some("cache") => parse_cache_command(&remaining_args)?,
         Some("prune-old-artifacts") => parse_prune_old_artifacts_command(&remaining_args)?,
         Some("snapshot-path") => parse_snapshot_path_command(&remaining_args)?,

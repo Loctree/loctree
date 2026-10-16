@@ -31,3 +31,18 @@ assert(configured.command == realpath, 'configured runtime must win')
 assert(configured.source == 'configured', 'configured runtime source must be explicit')
 
 vim.fn.delete(root, 'rf')
+
+-- Exercise the real setup callback without replacing native navigation maps.
+local original_set = vim.keymap.set
+local mapped = {}
+vim.keymap.set = function(_, key, _) mapped[key] = true end
+LoctreeRuntime.on_attach({ server_capabilities = { codeActionProvider = true } }, 1)
+assert(mapped['<leader>ca'], 'advertised code action mapping missing')
+assert(not mapped.K and not mapped.gd and not mapped.gr, 'unadvertised navigation must stay native')
+mapped = {}
+LoctreeRuntime.on_attach({ server_capabilities = {
+  hoverProvider = true, definitionProvider = true, referencesProvider = true,
+} }, 1)
+assert(mapped.K and mapped.gd and mapped.gr, 'advertised generic mappings missing')
+assert(not mapped['<leader>ca'], 'unadvertised code actions must not be mapped')
+vim.keymap.set = original_set

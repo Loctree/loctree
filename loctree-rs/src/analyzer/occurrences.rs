@@ -2538,7 +2538,108 @@ pub fn scan_text_with(
             });
         }
     }
+    reclassify_source_roles(path, text, &mut out);
     out
+}
+
+/// Reuse the shared source AST for import and declaration boundaries that a
+/// single line cannot prove. Only hit-bearing files are parsed; error spans
+/// retain a qualified lexical fallback instead of claiming a definition or field.
+fn reclassify_source_roles(path: &str, text: &str, occurrences: &mut [LiteralOccurrence]) {
+    if occurrences.is_empty() {
+        return;
+    }
+    static PARSERS: std::sync::LazyLock<loctree_ast::Parsers> =
+        std::sync::LazyLock::new(loctree_ast::Parsers::new_default);
+    let Ok(parsed) = PARSERS.parse_path(std::path::Path::new(path), text.as_bytes()) else {
+        return;
+    };
+    let mut offset = 0;
+    let lines: Vec<_> = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = offset;
+            offset += line.len();
+            (start, line)
+        })
+        .collect();
+    for occ in occurrences {
+        if matches!(
+            occ.occurrence_kind,
+            OccurrenceKind::ClassToken
+                | OccurrenceKind::CssProperty
+                | OccurrenceKind::CustomProperty
+                | OccurrenceKind::DataAttribute
+        ) {
+            continue;
+        }
+        let Some((offset, line)) = lines.get(occ.line.saturating_sub(1)) else {
+            continue;
+        };
+        let Some((column, _)) = line.char_indices().nth(occ.column.saturating_sub(1)) else {
+            continue;
+        };
+        let start = offset + column;
+        let end = start + occ.matched_text.len();
+        let Some(leaf) = parsed
+            .tree
+            .root_node()
+            .descendant_for_byte_range(start, end)
+        else {
+            continue;
+        };
+        let exact_identifier = matches!(leaf.kind(), "identifier" | "type_identifier")
+            && leaf.byte_range() == (start..end);
+        let mut node = Some(leaf);
+        let mut proven_kind = None;
+        while let Some(current) = node {
+            match current.kind() {
+                "comment" => {
+                    proven_kind = Some(OccurrenceKind::Comment);
+                    break;
+                }
+                "string_fragment" | "string_content" | "string" => {
+                    proven_kind = Some(OccurrenceKind::StringLiteral);
+                    break;
+                }
+                "ERROR" => {
+                    proven_kind = Some(OccurrenceKind::Identifier);
+                    break;
+                }
+                "import_statement" | "import_from_statement" => {
+                    proven_kind = Some(if exact_identifier && !current.has_error() {
+                        OccurrenceKind::ImportLike
+                    } else {
+                        OccurrenceKind::Identifier
+                    });
+                    break;
+                }
+                "type_annotation" => {
+                    proven_kind = Some(OccurrenceKind::Identifier);
+                    break;
+                }
+                "type_alias_declaration"
+                    if !current.has_error()
+                        && current
+                            .child_by_field_name("name")
+                            .is_some_and(|name| name.byte_range() == (start..end)) =>
+                {
+                    occ.occurrence_kind = OccurrenceKind::Identifier;
+                    occ.match_role = MatchRole::Definition;
+                    occ.confidence = MatchConfidence::High;
+                    break;
+                }
+                // Expressions inside interpolated strings are still code.
+                "interpolation" | "template_substitution" => break,
+                _ => node = current.parent(),
+            }
+        }
+        if let Some(kind) = proven_kind {
+            occ.occurrence_kind = kind;
+            occ.match_role = MatchRole::from_occurrence_kind(kind);
+            occ.confidence = match_confidence(kind, occ.match_role);
+        }
+    }
 }
 
 /// Scan a set of (path, content) pairs for literal occurrences of `ident`
@@ -2715,6 +2816,7 @@ pub fn scan_text_regex(path: &str, text: &str, re: &regex::Regex) -> Vec<Literal
             });
         }
     }
+    reclassify_source_roles(path, text, &mut out);
     out
 }
 
@@ -3389,6 +3491,8 @@ struct SnapshotOccurrenceIndex {
     definition_candidates: Vec<SymbolAnchor>,
     local_bindings: std::collections::HashMap<String, Vec<SymbolAnchor>>,
     imports: std::collections::HashMap<String, SymbolAnchor>,
+    import_sites:
+        std::collections::HashMap<String, std::collections::BTreeMap<usize, Option<SymbolAnchor>>>,
     enclosing: std::collections::HashMap<String, Vec<SymbolAnchor>>,
     /// `FileAnalysis::language` per snapshot path. Used to gate the global
     /// same-name-uniqueness fallback in [`Self::resolve_occurrence`] so a
@@ -3402,7 +3506,7 @@ struct SnapshotOccurrenceIndex {
     edge_targets: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// `(occurrence_file, qualifier_identifier) -> target_file` for path-qualified
     /// call sites (`diff::analyze(x)` in a file with `mod diff;`). Built once
-    /// from every file's imports (including Rust `mod` declarations) via
+    /// from the queried sites' imports (including Rust `mod` declarations) via
     /// [`rust_import_target_path`] so [`Self::qualified_definition`] can narrow
     /// `definition_candidates` to the qualifier's own module before falling
     /// back to global same-name uniqueness (A2).
@@ -3506,17 +3610,41 @@ impl SnapshotOccurrenceIndex {
             });
         }
 
+        let mut queried_qualifiers: std::collections::HashMap<
+            &str,
+            std::collections::HashSet<String>,
+        > = std::collections::HashMap::new();
+        for occ in occurrences {
+            if let Some(column) = context_match_column(&occ.context, occ.column, &occ.matched_text)
+                && let Some(qualifier) = qualifier_before(&occ.context, column)
+            {
+                queried_qualifiers
+                    .entry(occ.file.as_str())
+                    .or_default()
+                    .insert(qualifier);
+            }
+        }
         let mut imports = std::collections::HashMap::new();
+        let mut import_sites: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<usize, Option<SymbolAnchor>>,
+        > = std::collections::HashMap::new();
         let mut qualifier_targets: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::new();
         for file in &snapshot.files {
             for import in &file.imports {
-                // Every symbol this import introduces (a `use` binding, or the
-                // declared identifier of a `mod x;`) can act as a `<qualifier>::`
-                // prefix at a call site; index all of them regardless of
-                // whether they happen to also mention `query` by name.
-                if let Some(target_path) = rust_import_target_path(snapshot, &file.path, import) {
+                // Resolve only qualifiers this query can consume, not every
+                // import in the snapshot through the Rust module fallback.
+                if let Some(qualifiers) = queried_qualifiers.get(file.path.as_str())
+                    && import.symbols.iter().any(|symbol| {
+                        qualifiers.contains(symbol.alias.as_deref().unwrap_or(&symbol.name))
+                    })
+                    && let Some(target_path) = rust_import_target_path(snapshot, &file.path, import)
+                {
                     for symbol in &import.symbols {
+                        if !qualifiers.contains(symbol.alias.as_deref().unwrap_or(&symbol.name)) {
+                            continue;
+                        }
                         let qualifier = symbol.alias.clone().unwrap_or_else(|| symbol.name.clone());
                         qualifier_targets
                             .entry((file.path.clone(), qualifier))
@@ -3524,10 +3652,22 @@ impl SnapshotOccurrenceIndex {
                     }
                 }
 
-                if !import_mentions(import, query) {
-                    continue;
+                let definition = import_mentions(import, query)
+                    .then(|| resolve_import_definition(snapshot, file, import, query))
+                    .flatten();
+                if let Some(line) = import.line {
+                    // A proven import hit belongs to its own declaration, not
+                    // the first same-name import elsewhere in the file. Keep
+                    // unresolved declarations as barriers; same-line clauses
+                    // cannot be distinguished by snapshot line facts alone.
+                    import_sites
+                        .entry(file.path.clone())
+                        .or_default()
+                        .entry(line)
+                        .and_modify(|site| *site = None)
+                        .or_insert_with(|| definition.clone());
                 }
-                if let Some(def) = resolve_import_definition(snapshot, file, import, query) {
+                if let Some(def) = definition {
                     imports.entry(file.path.clone()).or_insert(def);
                 }
             }
@@ -3553,6 +3693,7 @@ impl SnapshotOccurrenceIndex {
             definition_candidates,
             local_bindings,
             imports,
+            import_sites,
             enclosing,
             languages,
             edge_targets,
@@ -3596,7 +3737,12 @@ impl SnapshotOccurrenceIndex {
                         .cloned()
                 }),
             MatchRole::LocalBinding => None,
-            MatchRole::Import => self.imports.get(&occ.file).cloned(),
+            MatchRole::Import => self
+                .import_sites
+                .get(&occ.file)
+                .and_then(|sites| sites.range(..=occ.line).next_back())
+                .map(|(_, definition)| definition.clone())
+                .unwrap_or_else(|| self.imports.get(&occ.file).cloned()),
             MatchRole::Reference | MatchRole::Mutation | MatchRole::FieldEmission => self
                 .qualified_definition(occ)
                 .or_else(|| self.local_binding_before(occ))
@@ -3920,6 +4066,12 @@ fn resolve_import_definition(
         .and_then(|path| snapshot_path_for(snapshot, path))
         .or_else(|| rust_import_target_path(snapshot, &file.path, import));
     let target_path = target_path?;
+    let query = import
+        .symbols
+        .iter()
+        .find(|symbol| symbol.alias.as_deref() == Some(query))
+        .map(|symbol| symbol.name.as_str())
+        .unwrap_or(query);
     export_anchor(snapshot, &target_path, query)
         .or_else(|| reexport_anchor(snapshot, &target_path, query))
         .or_else(|| unique_module_export_anchor(snapshot, &target_path, query))
@@ -4359,6 +4511,101 @@ mod tests {
         // Non-ASCII prefix forces the char-based fallback; the reported column
         // remains a 1-based char column, not a byte offset.
         assert_eq!(occurrences_in_line("zażółć alpha", "alpha"), vec![8]);
+    }
+
+    #[test]
+    fn imported_type_before_default_value_is_not_a_mutation() {
+        let source = "import type { AgentSession } from './session';\nfunction load(source: AgentSession = this.session) {}\nAgentSession = replacement;\n";
+        let hits = scan_text("consumer.ts", source, "AgentSession");
+        assert_eq!(hits[0].match_role, MatchRole::Import);
+        assert_eq!(hits[1].match_role, MatchRole::Reference);
+        assert_eq!(hits[1].confidence, MatchConfidence::Medium);
+        assert_eq!(hits[2].match_role, MatchRole::Mutation);
+    }
+
+    #[test]
+    fn runtime_import_roles_are_not_field_emissions() {
+        let hits = scan_text(
+            "bench/event-fanout.bench.ts",
+            "import { AgentSession } from '../session/agent-session';\n",
+            "AgentSession",
+        );
+        assert_eq!(hits[0].match_role, MatchRole::Import);
+    }
+
+    #[test]
+    fn typescript_import_roles_do_not_masquerade_as_definitions_or_fields() {
+        let regex = regex::Regex::new("AgentSession").expect("literal import regex");
+        for source in [
+            "import {\n  type AgentSession,\n} from './session';\n",
+            "import { AgentSession } from './session';\n",
+            "import type {\n  AgentSession as Session,\n} from './session';\n",
+            "import { type AgentSession as Session } from './session';\n",
+            "import {\r\n  /* 🧪 */ type AgentSession,\r\n} from './session';\r\n",
+        ] {
+            let hits = scan_text("consumer.ts", source, "AgentSession");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].match_role, MatchRole::Import, "{source}");
+            assert_eq!(hits[0].occurrence_kind, OccurrenceKind::ImportLike);
+            assert_eq!(hits[0].confidence, MatchConfidence::High);
+            assert_eq!(
+                scan_text_regex("consumer.ts", source, &regex)[0].match_role,
+                MatchRole::Import,
+                "regex shares source-role evidence"
+            );
+        }
+
+        let source = "export class AgentSession {}\nexport type Session = AgentSession;\nconst event = { AgentSession };\nAgentSession = replacement;\n// type AgentSession,\nconst label = 'AgentSession';\n";
+        let hits = scan_text("session.ts", source, "AgentSession");
+        assert_eq!(
+            hits.iter().map(|hit| hit.match_role).collect::<Vec<_>>(),
+            vec![
+                MatchRole::Definition,
+                MatchRole::Reference,
+                MatchRole::FieldEmission,
+                MatchRole::Mutation,
+                MatchRole::Comment,
+                MatchRole::StringLiteral,
+            ]
+        );
+        assert_eq!(
+            scan_text("session.ts", source, "Session")[0].match_role,
+            MatchRole::Definition
+        );
+    }
+
+    #[test]
+    fn import_roles_preserve_python_controls_and_non_code_boundaries() {
+        let source = "from session import (\n    AgentSession as Session,\n)\nclass AgentSession:\n    pass\nAgentSession = replacement\n# AgentSession\nlabel = 'AgentSession'\n";
+        let hits = scan_text("consumer.py", source, "AgentSession");
+        assert_eq!(
+            hits.iter().map(|hit| hit.match_role).collect::<Vec<_>>(),
+            vec![
+                MatchRole::Import,
+                MatchRole::Definition,
+                MatchRole::Mutation,
+                MatchRole::Comment,
+                MatchRole::StringLiteral
+            ]
+        );
+
+        let source = "import {\n  /* type AgentSession,\n     AgentSession */\n  type AgentSession,\n} from './AgentSession';\nconst event = { AgentSession };\n";
+        let hits = scan_text("consumer.ts", source, "AgentSession");
+        assert_eq!(
+            hits.iter().map(|hit| hit.match_role).collect::<Vec<_>>(),
+            vec![
+                MatchRole::Comment,
+                MatchRole::Comment,
+                MatchRole::Import,
+                MatchRole::StringLiteral,
+                MatchRole::FieldEmission
+            ]
+        );
+        for source in ["import { type AgentSession,\n", "type AgentSession,\n"] {
+            let malformed = scan_text("consumer.ts", source, "AgentSession");
+            assert_eq!(malformed[0].match_role, MatchRole::Reference);
+            assert_eq!(malformed[0].confidence, MatchConfidence::Medium);
+        }
     }
 
     #[test]
@@ -5320,6 +5567,75 @@ mod tests {
         assert!(
             shell_hit.resolved_definition.is_none(),
             "a same-named Python def must not resolve a shell assignment without a shared language or import edge"
+        );
+    }
+
+    #[test]
+    fn qualifier_index_is_bounded_to_queried_sites() {
+        let import = |source: &str, name: &str, resolved: Option<&str>| {
+            serde_json::json!({
+                "line": 1, "source": source, "source_raw": source,
+                "kind": "Static", "resolved_path": resolved, "is_bare": true,
+                "symbols": [{"name": name, "alias": null, "is_default": false}],
+                "resolution": "Unknown", "is_type_checking": false, "raw_path": source
+            })
+        };
+        let export = serde_json::json!({
+            "name": "analyze", "kind": "function", "export_type": "named", "line": 1
+        });
+        let mut used_import = import("mod::used", "used", None);
+        used_import["symbols"][0]["alias"] = serde_json::json!("renamed");
+        let snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+            "metadata": {},
+            "files": [
+                {"path": "src/main.rs", "language": "rust", "imports": [
+                    used_import,
+                    import("mod::unused", "unused", None)
+                ]},
+                {"path": "src/used.rs", "language": "rust", "exports": [export]},
+                {"path": "src/unused.rs", "language": "rust", "exports": [export]},
+                {"path": "web/client.ts", "language": "ts", "imports": [
+                    import("helper", "analyze", Some("web/helper.ts"))
+                ]},
+                {"path": "web/helper.ts", "language": "ts", "exports": [export]},
+                {"path": "web/helper.rs", "language": "rust", "exports": [export]}
+            ]
+        }))
+        .expect("mixed-language snapshot deserializes");
+        let results = scan_files(
+            [
+                ("src/main.rs", "fn run() { renamed::analyze(); }\n"),
+                ("web/client.ts", "analyze();\n"),
+            ],
+            "analyze",
+        );
+        let index = SnapshotOccurrenceIndex::new(&snapshot, "analyze", &results.occurrences);
+        assert_eq!(
+            index.qualifier_targets.len(),
+            1,
+            "unqueried Rust modules and unqualified TypeScript imports need no qualifier lookup"
+        );
+        let qualified = results
+            .occurrences
+            .iter()
+            .find(|occ| occ.file == "src/main.rs")
+            .expect("qualified Rust call is present");
+        assert_eq!(
+            index
+                .qualified_definition(qualified)
+                .expect("the queried qualifier still resolves")
+                .file,
+            "src/used.rs"
+        );
+        assert_eq!(
+            index.imports["web/client.ts"].file, "web/helper.ts",
+            "ordinary imports retain their existing resolved target"
+        );
+        let unqualified = scan_files([("web/client.ts", "analyze();\n")], "analyze");
+        assert!(
+            SnapshotOccurrenceIndex::new(&snapshot, "analyze", &unqualified.occurrences)
+                .qualifier_targets
+                .is_empty()
         );
     }
 

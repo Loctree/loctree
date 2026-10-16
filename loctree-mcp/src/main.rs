@@ -51,7 +51,7 @@ use signals::{ignore_sigpipe, install_panic_hook, safe_stderr_log};
 
 use loctree::analyzer::classify::{detect_language, detect_language_from_filename};
 use loctree::analyzer::crowd::detect_crowd_with_edges;
-use loctree::analyzer::cycles::find_cycles;
+use loctree::analyzer::cycles::{ClassifiedCycle, find_cycles};
 use loctree::analyzer::dead_parrots::{DeadFilterConfig, find_dead_exports};
 use loctree::analyzer::occurrences::{
     FileScope, OccurrenceResults, ReportOptions, ScanOptions, enrich_with_snapshot,
@@ -64,7 +64,7 @@ use loctree::analyzer::search::{literal_fuzzy_suggestions, run_search};
 use loctree::analyzer::suppression_inventory::{
     SilencerKind, inventory as silencer_inventory, resolve_ignore_globs,
 };
-use loctree::analyzer::twins::{detect_exact_twins, twin_action};
+use loctree::analyzer::twins::{TwinSources, detect_exact_twins_with_sources, twin_action};
 use loctree::atlas::{
     ContextOptions, atlas_dir_for_project, compose_context_pack_from_snapshot,
     materialize_context_atlas, render_context_markdown,
@@ -80,10 +80,8 @@ use loctree::impact::{ImpactOptions, analyze_impact};
 use loctree::metrics::{repository_metrics, top_hubs_by_importers_direct};
 use loctree::query::{query_where_symbol, query_who_imports};
 use loctree::slicer::{HolographicSlice, SliceConfig};
-use loctree::snapshot::{
-    AcquireOptions, Snapshot, SnapshotReusePolicy, SnapshotRootStrategy, acquire_snapshot,
-    normalize_roots_for_scope_compare,
-};
+use loctree::snapshot::{Snapshot, normalize_roots_for_scope_compare};
+use loctree::tagmap::{collect_tagmap_facts, tagmap_matches, tagmap_normalize};
 
 // ============================================================================
 // Tool Parameter Types - All tools have optional `project` parameter
@@ -177,26 +175,6 @@ fn default_project() -> String {
     std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string())
-}
-
-/// Strip a term to lowercase alphanumerics so `public-entry`, `public_entry`,
-/// and `PublicEntry` all collapse to one comparable key for tagmap recall.
-fn tagmap_normalize(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-/// Match a snapshot fact against a tagmap keyword, first on raw lowercase
-/// substring and then on the separator-stripped form, so a dashed query still
-/// recalls an underscored symbol.
-fn tagmap_matches(value: &str, keyword_lower: &str, keyword_normalized: &str) -> bool {
-    let value_lower = value.to_ascii_lowercase();
-    value_lower.contains(keyword_lower)
-        || (!keyword_normalized.is_empty()
-            && tagmap_normalize(&value_lower).contains(keyword_normalized))
 }
 
 /// Apply the caller's `file` narrowing through the shared occurrence scope
@@ -671,6 +649,9 @@ struct DiffParams {
     force_no_git: bool,
     /// Snapshot path or git ref to compare from (for example HEAD~1).
     since: String,
+    /// Target snapshot path or git ref; omitted means fresh working tree.
+    #[serde(default)]
+    to: Option<String>,
     /// Include generated/vendored/template exports in symbol changes.
     #[serde(default)]
     include_artifacts: bool,
@@ -895,46 +876,6 @@ fn scan_regex_occurrences(
     Ok(matches)
 }
 
-/// Materialize a throwaway worktree at `reference`, scan it, then remove the
-/// worktree — this is how `diff` gets a base snapshot without disturbing the
-/// live checkout. A cleanup failure is reported even when the scan succeeded,
-/// so a leaked worktree is never silent.
-fn snapshot_at_git_ref(project: &Path, reference: &str) -> Result<(Snapshot, String), String> {
-    let repo = GitRepo::discover(project).map_err(|err| err.to_string())?;
-    let commit = repo
-        .get_commit_info(reference)
-        .map_err(|err| err.to_string())?;
-    let temp = tempfile::TempDir::new().map_err(|err| err.to_string())?;
-    let worktree = temp.path().join("loctree-mcp-diff-base");
-    repo.create_worktree(reference, &worktree)
-        .map_err(|err| err.to_string())?;
-
-    let acquired = acquire_snapshot(
-        std::slice::from_ref(&worktree),
-        SnapshotReusePolicy::Strict,
-        &AcquireOptions {
-            fresh: true,
-            quiet: true,
-            print_scan_summary: false,
-            strategy: SnapshotRootStrategy::Exact,
-            ..Default::default()
-        },
-    )
-    .map_err(|err| err.to_string());
-    let cleanup = repo
-        .remove_worktree(&worktree)
-        .map_err(|err| err.to_string());
-
-    match (acquired, cleanup) {
-        (Ok(snapshot), Ok(())) => Ok((snapshot, commit.hash)),
-        (Err(scan), Ok(())) => Err(scan),
-        (Ok(_), Err(cleanup)) => Err(format!("diff worktree cleanup failed: {cleanup}")),
-        (Err(scan), Err(cleanup)) => Err(format!(
-            "diff base scan failed: {scan}; cleanup also failed: {cleanup}"
-        )),
-    }
-}
-
 /// Freshness policy carried into every `get_snapshot` call: refuse to scan,
 /// refuse a stale snapshot, force a rescan, and whether a non-git root is
 /// acceptable.
@@ -979,8 +920,11 @@ const CONTEXT_DEADLINE_ENV: &str = "LOCT_MCP_CONTEXT_DEADLINE_SECS";
 /// to 90s. Zero and unparseable values fall back too, so a typo cannot disable
 /// the deadline.
 fn context_deadline() -> std::time::Duration {
-    let secs = std::env::var(CONTEXT_DEADLINE_ENV)
-        .ok()
+    context_deadline_from_value(std::env::var(CONTEXT_DEADLINE_ENV).ok().as_deref())
+}
+
+fn context_deadline_from_value(value: Option<&str>) -> std::time::Duration {
+    let secs = value
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(90);
@@ -1011,8 +955,11 @@ const CONTEXT_MARKDOWN_BUDGET_DEFAULT: usize = 38_000;
 /// 2,000 are rejected because a tiny budget would shred the pack into pages too
 /// small to be useful.
 fn context_markdown_budget() -> usize {
-    std::env::var(CONTEXT_MARKDOWN_BUDGET_ENV)
-        .ok()
+    context_markdown_budget_from_value(std::env::var(CONTEXT_MARKDOWN_BUDGET_ENV).ok().as_deref())
+}
+
+fn context_markdown_budget_from_value(value: Option<&str>) -> usize {
+    value
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n >= 2_000)
         .unwrap_or(CONTEXT_MARKDOWN_BUDGET_DEFAULT)
@@ -1787,8 +1734,11 @@ impl LoctreeServer {
                 return Ok(snapshot);
             } else if load_options.fail_stale {
                 anyhow::bail!(
-                    "Snapshot is stale for {} and fail_stale=true",
-                    project.display()
+                    "Snapshot is stale for {} and fail_stale=true (analysis generation {:?}, expected {:?}, compatible={}). Run 'loct scan' to refresh.",
+                    project.display(),
+                    snapshot.metadata.analysis_generation,
+                    loctree::snapshot::ANALYSIS_GENERATION,
+                    snapshot.analysis_is_compatible()
                 );
             } else if load_options.no_scan {
                 debug!(
@@ -2025,6 +1975,7 @@ impl LoctreeServer {
             "core_loc": loc,
             "dependencies": 0,
             "consumers": 0,
+            "consumer_coverage": loctree::slicer::ConsumerCoverage::default(),
             "snapshot_exclusion": exclusion_note,
             "files": [{
                 "path": rel,
@@ -2364,7 +2315,12 @@ impl LoctreeServer {
             .collect();
         let cycles = find_cycles(&edges);
 
-        let twins = detect_exact_twins(&snapshot.files, false);
+        let twins = detect_exact_twins_with_sources(
+            &snapshot.files,
+            false,
+            None,
+            &mut TwinSources::for_request(&snapshot, std::path::Path::new(&project)),
+        );
 
         let top_hubs = top_hubs_by_importers_direct(&snapshot, 5);
 
@@ -2578,6 +2534,7 @@ impl LoctreeServer {
             "core_loc": slice.stats.core_loc,
             "dependencies": slice.stats.deps_files,
             "consumers": slice.stats.consumers_files,
+            "consumer_coverage": slice.consumer_coverage,
             "files": files,
             "core_symbols": slice.core_symbols,
             "authority_labels": slice.authority_labels,
@@ -2784,120 +2741,11 @@ impl LoctreeServer {
                 })
                 .collect();
 
-            // 2) indexed code facts matching keyword in symbols, imports,
-            // usages, and literals. This is intentionally literal-only:
-            // tagmap should recall terms already present in the snapshot,
-            // not perform semantic enrichment.
-            let mut fact_matches = Vec::new();
-            'files: for file in &snapshot.files {
-                for export in &file.exports {
-                    if tagmap_matches(&export.name, &keyword_lower, &keyword_normalized)
-                        || tagmap_matches(&export.kind, &keyword_lower, &keyword_normalized)
-                        || tagmap_matches(&export.export_type, &keyword_lower, &keyword_normalized)
-                    {
-                        fact_matches.push(serde_json::json!({
-                            "kind": "export",
-                            "file": file.path,
-                            "name": export.name,
-                            "symbol_kind": export.kind,
-                            "line": export.line
-                        }));
-                    }
-                    if fact_matches.len() >= params.limit {
-                        break 'files;
-                    }
-                }
-
-                for local in &file.local_symbols {
-                    if tagmap_matches(&local.name, &keyword_lower, &keyword_normalized)
-                        || tagmap_matches(&local.kind, &keyword_lower, &keyword_normalized)
-                        || tagmap_matches(&local.context, &keyword_lower, &keyword_normalized)
-                    {
-                        fact_matches.push(serde_json::json!({
-                            "kind": "local-symbol",
-                            "file": file.path,
-                            "name": local.name,
-                            "symbol_kind": local.kind,
-                            "line": local.line,
-                            "context": local.context
-                        }));
-                    }
-                    if fact_matches.len() >= params.limit {
-                        break 'files;
-                    }
-                }
-
-                for usage in &file.symbol_usages {
-                    if tagmap_matches(&usage.name, &keyword_lower, &keyword_normalized)
-                        || tagmap_matches(&usage.context, &keyword_lower, &keyword_normalized)
-                    {
-                        fact_matches.push(serde_json::json!({
-                            "kind": "symbol-usage",
-                            "file": file.path,
-                            "name": usage.name,
-                            "line": usage.line,
-                            "context": usage.context
-                        }));
-                    }
-                    if fact_matches.len() >= params.limit {
-                        break 'files;
-                    }
-                }
-
-                for import in &file.imports {
-                    if tagmap_matches(&import.source, &keyword_lower, &keyword_normalized)
-                        || tagmap_matches(&import.source_raw, &keyword_lower, &keyword_normalized)
-                        || import.resolved_path.as_ref().is_some_and(|path| {
-                            tagmap_matches(path, &keyword_lower, &keyword_normalized)
-                        })
-                    {
-                        fact_matches.push(serde_json::json!({
-                            "kind": "import-source",
-                            "file": file.path,
-                            "source": import.source,
-                            "source_raw": import.source_raw,
-                            "line": import.line
-                        }));
-                    }
-                    if fact_matches.len() >= params.limit {
-                        break 'files;
-                    }
-
-                    for symbol in &import.symbols {
-                        if tagmap_matches(&symbol.name, &keyword_lower, &keyword_normalized)
-                            || symbol.alias.as_ref().is_some_and(|alias| {
-                                tagmap_matches(alias, &keyword_lower, &keyword_normalized)
-                            })
-                        {
-                            fact_matches.push(serde_json::json!({
-                                "kind": "import-symbol",
-                                "file": file.path,
-                                "name": symbol.name,
-                                "alias": symbol.alias,
-                                "source": import.source,
-                                "line": import.line
-                            }));
-                        }
-                        if fact_matches.len() >= params.limit {
-                            break 'files;
-                        }
-                    }
-                }
-
-                for literal in &file.string_literals {
-                    if tagmap_matches(&literal.value, &keyword_lower, &keyword_normalized) {
-                        fact_matches.push(serde_json::json!({
-                            "kind": "string-literal",
-                            "file": file.path,
-                            "value": literal.value,
-                            "line": literal.line
-                        }));
-                    }
-                    if fact_matches.len() >= params.limit {
-                        break 'files;
-                    }
-                }
-            }
+            // 2) Rank and deduplicate the complete shared fact universe first.
+            let mut fact_matches = collect_tagmap_facts(&snapshot.files, keyword);
+            let fact_count = fact_matches.len();
+            let facts_omitted = fact_count.saturating_sub(params.limit);
+            fact_matches.truncate(params.limit);
 
             // 3) crowd analysis
             let crowd = detect_crowd_with_edges(&snapshot.files, keyword, &snapshot.edges);
@@ -2947,7 +2795,8 @@ impl LoctreeServer {
                         "matches": matching_files
                     },
                     "facts": {
-                        "count": fact_matches.len(),
+                        "count": fact_count,
+                        "omitted_by_limit": if facts_omitted > 0 { Some(facts_omitted) } else { None },
                         "matches": fact_matches
                     },
                     "crowd": {
@@ -3425,46 +3274,41 @@ impl LoctreeServer {
             return json_error("diff requires git history; force_no_git is not supported");
         }
 
-        let current = match self
-            .get_snapshot(
-                &project,
-                SnapshotLoadOptions {
-                    fresh: true,
-                    force_no_git: false,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(err) => return json_error(err),
-        };
-
         let base_project = project.clone();
         let since = params.since.clone();
-        let (base, from_commit) =
-            match tokio::task::spawn_blocking(move || snapshot_at_git_ref(&base_project, &since))
-                .await
-            {
-                Ok(Ok(value)) => value,
-                Ok(Err(err)) => return json_error(err),
-                Err(err) => return json_error(format!("diff worker failed: {err}")),
-            };
-
+        let target = params.to.clone();
+        let acquired = tokio::task::spawn_blocking(move || {
+            loctree::git_snapshot::resolve_pair(&base_project, &since, target.as_deref())
+        })
+        .await;
+        let (base, current) = match acquired {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => return json_error(err),
+            Err(err) => return json_error(format!("diff worker failed: {err}")),
+        };
         let repo = match GitRepo::discover(&project) {
             Ok(repo) => repo,
             Err(err) => return json_error(err),
         };
-        let changed_files = repo
-            .changed_files(&params.since, "HEAD")
-            .unwrap_or_default();
-        let to_commit = repo.get_commit_info("HEAD").ok();
-        let from_info = repo.get_commit_info(&params.since).ok();
+        let changed_files = if let Some(from) = &base.commit {
+            let changes = match &current.commit {
+                Some(to) => repo.changed_files(&from.hash, &to.hash),
+                None if params.to.is_none() => repo.changed_files_in_worktree(&from.hash),
+                None => Ok(vec![]),
+            };
+            match changes {
+                Ok(files) => files,
+                Err(err) => return json_error(err),
+            }
+        } else {
+            vec![]
+        };
+        let from_commit = base.commit.as_ref().map(|commit| commit.hash.clone());
         let diff = SnapshotDiff::compare_fenced(
-            &base,
-            &current,
-            from_info,
-            to_commit,
+            &base.snapshot,
+            &current.snapshot,
+            base.commit,
+            current.commit,
             &changed_files,
             params.include_artifacts,
         );
@@ -3476,7 +3320,7 @@ impl LoctreeServer {
                 "project": project.display().to_string(),
                 "since": params.since,
                 "from_commit": from_commit,
-                "current_snapshot": current.authority_report(&project),
+                "current_snapshot": current.snapshot.authority_report(&project),
                 "diff": diff,
             }),
         )
@@ -3863,11 +3707,15 @@ impl LoctreeServer {
                                 "to": to,
                                 "symbols_crossed": sym
                             }),
-                            "break at weakest link",
+                            {
+                                let cycle = ClassifiedCycle::new(chain.clone(), &edges);
+                                format!("{}; {}", cycle.compilability.description(),
+                                    cycle.suggestion.as_deref().unwrap_or("Review coupling before refactoring"))
+                            },
                         ),
                         None => (
                             serde_json::json!(null),
-                            "graph anomaly: all chain edges have symbols_crossed == 0; verify analyzer edges",
+                            "graph anomaly: all chain edges have symbols_crossed == 0; verify analyzer edges".to_string(),
                         ),
                     };
 
@@ -3914,7 +3762,12 @@ impl LoctreeServer {
                 }
                 _ => Vec::new(),
             };
-            let mut twins = detect_exact_twins(&snapshot.files, false);
+            let mut twins = detect_exact_twins_with_sources(
+                &snapshot.files,
+                false,
+                None,
+                &mut TwinSources::for_request(&snapshot, std::path::Path::new(&project)),
+            );
             loctree::analyzer::twins::order_twins_for_page(&mut twins);
             loctree::analyzer::twins::retain_twin_classes(&mut twins, &class_filter);
 
@@ -4801,6 +4654,18 @@ async fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diff_params_accept_historical_target_and_keep_default_worktree() {
+        let current: super::DiffParams =
+            serde_json::from_value(serde_json::json!({"since":"HEAD~1"}))
+                .expect("default diff parameters");
+        assert!(current.to.is_none());
+        let historical: super::DiffParams =
+            serde_json::from_value(serde_json::json!({"since":"v1", "to":"v2"}))
+                .expect("historical diff parameters");
+        assert_eq!(historical.to.as_deref(), Some("v2"));
+    }
+
     use std::fs;
     use std::path::Path;
 
@@ -4984,43 +4849,32 @@ mod tests {
         assert_eq!(diagnostic.authority, "refused");
     }
 
-    /// Single env-sensitive test for context_deadline() — consolidated to
-    /// avoid the parallel race that would happen if these three branches
-    /// ran as independent #[test]s mutating the same process-global env var.
+    /// Parse explicit values without changing the process environment.
     #[test]
     fn context_deadline_env_matrix() {
-        // SAFETY: this is the only test that touches CONTEXT_DEADLINE_ENV;
-        // all scenarios run sequentially inside a single test function so
-        // there is no race with another #[test] reading the variable.
-        crate::test_env::remove_var(CONTEXT_DEADLINE_ENV);
         assert_eq!(
-            context_deadline(),
+            context_deadline_from_value(None),
             std::time::Duration::from_secs(90),
             "default applies when env var is unset"
         );
 
-        crate::test_env::set_var(CONTEXT_DEADLINE_ENV, "30");
         assert_eq!(
-            context_deadline(),
+            context_deadline_from_value(Some("30")),
             std::time::Duration::from_secs(30),
             "valid override is honored"
         );
 
-        crate::test_env::set_var(CONTEXT_DEADLINE_ENV, "0");
         assert_eq!(
-            context_deadline(),
+            context_deadline_from_value(Some("0")),
             std::time::Duration::from_secs(90),
             "zero falls back to default"
         );
 
-        crate::test_env::set_var(CONTEXT_DEADLINE_ENV, "not-a-number");
         assert_eq!(
-            context_deadline(),
+            context_deadline_from_value(Some("not-a-number")),
             std::time::Duration::from_secs(90),
             "garbage falls back to default"
         );
-
-        crate::test_env::remove_var(CONTEXT_DEADLINE_ENV);
     }
 
     #[test]
@@ -5183,6 +5037,87 @@ pub fn public_entry() {
             receipt["snapshot"]["roots"][0].as_str(),
             Some(scanned.path().to_str().expect("utf8 temp path"))
         );
+    }
+
+    #[tokio::test]
+    async fn slice_consumer_coverage_survives_tool_serialization() {
+        for (barrel, unrelated, expected_status) in [
+            ("export { a as alias } from './target';", "", "modeled"),
+            (
+                "export { a as alias } from './target';",
+                "export { missing } from './absent';",
+                "modeled",
+            ),
+            (
+                "export * from './target'; export { missing } from './absent';",
+                "",
+                "partial",
+            ),
+        ] {
+            let project = TempDir::new().expect("project");
+            for (path, source) in [
+                ("target.ts", "export const a = 1;"),
+                ("barrel.ts", barrel),
+                (
+                    "user.ts",
+                    "import { alias, a } from './barrel'; console.log(alias, a);",
+                ),
+                ("unrelated.ts", unrelated),
+            ] {
+                fs::write(project.path().join(path), source).expect("fixture source");
+            }
+            let server = LoctreeServer::new();
+            let output = server
+                .slice(Parameters(SliceParams {
+                    project: project.path().display().to_string(),
+                    force_no_git: true,
+                    file: "target.ts".to_string(),
+                    consumers: true,
+                    depth: Some(1),
+                    rescan: false,
+                }))
+                .await;
+            let value: Value = serde_json::from_str(&output).expect("slice tool JSON");
+            let coverage = &value["consumer_coverage"];
+            assert_eq!(coverage["status"], expected_status, "{output}");
+            assert_eq!(coverage["compiler_complete"], false);
+            assert!(
+                value["files"]
+                    .as_array()
+                    .expect("files")
+                    .iter()
+                    .any(|row| row["path"] == "user.ts" && row["depth"] == 2),
+                "{output}"
+            );
+            let diagnostics = coverage["diagnostics"].as_array().expect("diagnostics");
+            if barrel.contains("absent") || !unrelated.is_empty() {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|row| row["reason"] == "unresolved_reexports"
+                            && row["scope"] == "snapshot_global"
+                            && row["count"] == 1),
+                    "{output}"
+                );
+            }
+            if barrel.contains("export *") {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .any(|row| row["reason"] == "wildcard_reexports"
+                            && row["scope"] == "target_reachable"
+                            && row["count"] == 1),
+                    "{output}"
+                );
+            } else {
+                assert!(
+                    diagnostics
+                        .iter()
+                        .all(|row| row["scope"] == "snapshot_global"),
+                    "{output}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -5560,6 +5495,101 @@ pub fn public_entry() {
                 seen.insert(key.clone()),
                 "duplicate cycle chain {key}: {output}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn tagmap_first_page_prefers_identity_and_collapses_context() {
+        let project = tempfile::TempDir::new().expect("tagmap fixture");
+        for (name, source) in [
+            (
+                "aaa_context.py",
+                include_str!("../../loctree-rs/tests/fixtures/tagmap_discovery/aaa_context.py"),
+            ),
+            (
+                "bbb_import.py",
+                include_str!("../../loctree-rs/tests/fixtures/tagmap_discovery/bbb_import.py"),
+            ),
+            (
+                "zzz_owner.py",
+                include_str!("../../loctree-rs/tests/fixtures/tagmap_discovery/zzz_owner.py"),
+            ),
+        ] {
+            fs::write(project.path().join(name), source).expect("write tagmap fixture");
+        }
+        let server = LoctreeServer::new();
+        for (keyword, limit) in [
+            ("glyph", 2),
+            ("lunar-key", 1),
+            ("GLYPH-ENGINE", 1),
+            ("RenderGlyph", 1),
+            ("notpresentatall987", 1),
+            ("glyph", 0),
+        ] {
+            let output = server
+                .find(Parameters(FindParams {
+                    project: project.path().display().to_string(),
+                    force_no_git: true,
+                    name: keyword.to_string(),
+                    mode: "tagmap".to_string(),
+                    limit,
+                    lang: None,
+                    exported_only: false,
+                    dead_only: false,
+                    min_score: None,
+                    similar: None,
+                    file: None,
+                    whole_token: false,
+                    no_generated: false,
+                    group_by_file: false,
+                    count_only: false,
+                    offset: 0,
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&output).expect("tagmap JSON");
+            let facts = value["facts"]["matches"].as_array().expect("facts");
+            let snapshot = server
+                .get_snapshot(
+                    project.path(),
+                    SnapshotLoadOptions {
+                        force_no_git: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("fixture snapshot");
+            let expected = collect_tagmap_facts(&snapshot.files, keyword);
+            assert_eq!(value["facts"]["count"], expected.len());
+            assert_eq!(
+                facts,
+                &expected.iter().take(limit).cloned().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                value["facts"]["omitted_by_limit"].as_u64().unwrap_or(0),
+                expected.len().saturating_sub(limit) as u64
+            );
+            match keyword {
+                "glyph" if limit > 0 => {
+                    assert!(
+                        facts.iter().any(|f| f["name"] == "glyph_engine"),
+                        "{output}"
+                    );
+                    assert!(
+                        facts
+                            .iter()
+                            .any(|f| f["kind"] == "import-source" || f["kind"] == "import-symbol"),
+                        "{output}"
+                    );
+                }
+                "lunar-key" => {
+                    assert_eq!(value["facts"]["count"], 1, "{output}");
+                    assert_eq!(facts[0]["kind"], "symbol-usage-context");
+                    assert_eq!(facts[0]["confidence"], "low");
+                }
+                "GLYPH-ENGINE" => assert_eq!(facts[0]["name"], "glyph_engine"),
+                "RenderGlyph" => assert_eq!(facts[0]["kind"], "import-symbol"),
+                _ => assert!(facts.is_empty(), "{output}"),
+            }
         }
     }
 
@@ -6432,56 +6462,38 @@ pub fn page() {
         assert!(value.get("read_cards_hint").is_none());
     }
 
-    /// Single env-sensitive test for context_markdown_budget() — consolidated to
-    /// avoid the parallel race that would occur if multiple #[test]s mutated the
-    /// same process-global env var.
+    /// Parse explicit values without changing the process environment.
     #[test]
     fn context_markdown_budget_env_matrix() {
-        // SAFETY: this is the only test that touches CONTEXT_MARKDOWN_BUDGET_ENV;
-        // all scenarios run sequentially inside this single test function, so
-        // there is no race with another #[test] reading the variable.
-        crate::test_env::remove_var(CONTEXT_MARKDOWN_BUDGET_ENV);
         assert_eq!(
-            context_markdown_budget(),
+            context_markdown_budget_from_value(None),
             CONTEXT_MARKDOWN_BUDGET_DEFAULT,
             "default applies when env var is unset"
         );
 
-        // Use a value ABOVE the default so a concurrent context() call (e.g.
-        // context_format_markdown_returns_pill) just sees a larger single page
-        // from this test's transient env mutation — the getter logic is
-        // identical regardless of the magnitude.
-        crate::test_env::set_var(CONTEXT_MARKDOWN_BUDGET_ENV, "60000");
         assert_eq!(
-            context_markdown_budget(),
+            context_markdown_budget_from_value(Some("60000")),
             60_000,
             "valid override is honored"
         );
 
-        // Below the 2_000 floor is rejected (a tiny budget would shred the pack
-        // into uselessly small pages).
-        crate::test_env::set_var(CONTEXT_MARKDOWN_BUDGET_ENV, "1500");
         assert_eq!(
-            context_markdown_budget(),
+            context_markdown_budget_from_value(Some("1500")),
             CONTEXT_MARKDOWN_BUDGET_DEFAULT,
             "sub-floor value is rejected and falls back to the default"
         );
 
-        crate::test_env::set_var(CONTEXT_MARKDOWN_BUDGET_ENV, "0");
         assert_eq!(
-            context_markdown_budget(),
+            context_markdown_budget_from_value(Some("0")),
             CONTEXT_MARKDOWN_BUDGET_DEFAULT,
             "zero is rejected and falls back to the default"
         );
 
-        crate::test_env::set_var(CONTEXT_MARKDOWN_BUDGET_ENV, "not-a-number");
         assert_eq!(
-            context_markdown_budget(),
+            context_markdown_budget_from_value(Some("not-a-number")),
             CONTEXT_MARKDOWN_BUDGET_DEFAULT,
             "non-numeric is rejected and falls back to the default"
         );
-
-        crate::test_env::remove_var(CONTEXT_MARKDOWN_BUDGET_ENV);
     }
 
     #[test]
@@ -6736,6 +6748,56 @@ pub fn page() {
         let value: Value = serde_json::from_str(&output).expect("error should be json-safe");
 
         assert!(value["error"].as_str().unwrap().contains("no_scan=true"));
+    }
+
+    #[tokio::test]
+    async fn incompatible_generation_is_stale_in_memory_and_fail_stale_refuses() {
+        let project = fixture_project();
+        let server = LoctreeServer::new();
+        let mut snapshot = Snapshot::new(vec![project.path().display().to_string()]);
+        snapshot.metadata.analysis_generation = "future-generation".into();
+        snapshot
+            .save(project.path())
+            .expect("persist incompatible facts");
+        let mut params = params_for(project.path());
+        params.no_scan = true;
+        params.no_aicx = true;
+        let stale: Value =
+            serde_json::from_str(&server.context(Parameters(params)).await).expect("stale JSON");
+        assert_eq!(stale["receipt"]["snapshot"]["analysis_compatible"], false);
+        assert_eq!(stale["receipt"]["snapshot"]["staleness"]["stale"], true);
+        assert_eq!(stale["data"]["risk"]["stale_snapshot"], true);
+        assert_ne!(stale["data"]["risk"]["snapshot_health"], "fresh");
+        let mut strict = params_for(project.path());
+        strict.no_scan = true;
+        strict.fail_stale = true;
+        let refused: Value =
+            serde_json::from_str(&server.context(Parameters(strict)).await).expect("refusal JSON");
+        assert!(
+            refused["error"]
+                .as_str()
+                .expect("error")
+                .contains("analysis generation")
+        );
+        assert!(
+            refused["error"]
+                .as_str()
+                .expect("error")
+                .contains("loct scan")
+        );
+        // The same resident obsolete snapshot must be rebuilt by an ordinary read.
+        let fresh = server
+            .get_snapshot(
+                project.path(),
+                SnapshotLoadOptions {
+                    force_no_git: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("default upgrade");
+        assert!(fresh.analysis_is_compatible());
+        assert!(!fresh.files.is_empty());
     }
 
     #[test]
@@ -7192,24 +7254,5 @@ pub fn page() {
              explicitly (free-tier scope OR paid-tier Wave 7+ delta). \
              Found: {description_line}"
         );
-    }
-}
-
-/// Test-only environment mutation — the one audited `unsafe` for
-/// `std::env::set_var` / `remove_var` in this binary. Callers must be
-/// serialised with every other test touching the same variables.
-#[cfg(test)]
-mod test_env {
-    use std::ffi::OsStr;
-
-    pub(crate) fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
-        // SAFETY: test-only; callers are serialised, so no other thread
-        // observes the environment while it changes.
-        unsafe { std::env::set_var(key, value) }
-    }
-
-    pub(crate) fn remove_var<K: AsRef<OsStr>>(key: K) {
-        // SAFETY: as for `set_var`.
-        unsafe { std::env::remove_var(key) }
     }
 }

@@ -8,9 +8,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use loctree::analyzer::cycles::find_cycles;
+use loctree::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
 use loctree::analyzer::dead_parrots::{DeadFilterConfig, find_dead_exports};
-use loctree::analyzer::twins::{ExactTwin, detect_exact_twins};
+use loctree::analyzer::twins::{ExactTwin, TwinSources, detect_exact_twins_with_sources};
 use loctree::fs_utils::load_loctignore_dead_ok_globs;
 use loctree::snapshot::Snapshot;
 use tokio::sync::RwLock;
@@ -160,7 +160,7 @@ impl SnapshotState {
 
     /// Get exact twins involving a specific file.
     ///
-    /// Uses `detect_exact_twins()` from the twins module and filters the results
+    /// Uses the shared root-aware twin detector and filters the results
     /// to twins where at least one location matches `file_path`.
     pub async fn twins_for_file(&self, file_path: &str) -> Vec<ExactTwin> {
         let guard = self.inner.read().await;
@@ -168,20 +168,25 @@ impl SnapshotState {
             return Vec::new();
         };
 
-        detect_exact_twins(&loaded.snapshot.files, false)
-            .into_iter()
-            .filter(|twin| {
-                twin.locations.iter().any(|loc| {
-                    loc.file_path.ends_with(file_path) || file_path.ends_with(&loc.file_path)
-                })
+        detect_exact_twins_with_sources(
+            &loaded.snapshot.files,
+            false,
+            None,
+            &mut TwinSources::for_request(&loaded.snapshot, &loaded.workspace_root),
+        )
+        .into_iter()
+        .filter(|twin| {
+            twin.locations.iter().any(|loc| {
+                loc.file_path.ends_with(file_path) || file_path.ends_with(&loc.file_path)
             })
-            .collect()
+        })
+        .collect()
     }
 
     /// Get cycles involving a specific file using Tarjan's SCC algorithm.
     ///
-    /// Uses `find_cycles()` from the cycles module — finds all strongly connected
-    /// components, not just bidirectional edges.
+    /// Uses the canonical strict/lazy classifier. Node count is not a failure
+    /// verdict; structural cycles retain their unverified execution outcome.
     pub async fn cycles_for_file(&self, file_path: &str) -> Vec<CycleInfo> {
         let guard = self.inner.read().await;
         let Some(loaded) = guard.as_ref() else {
@@ -195,22 +200,28 @@ impl SnapshotState {
             .map(|e| (e.from.clone(), e.to.clone(), e.label.clone()))
             .collect();
 
-        let cycles = find_cycles(&edges);
+        let (strict, lazy) = find_cycles_classified_with_lazy(&edges);
+        let cycles = strict
+            .into_iter()
+            .map(|cycle| {
+                let kind = match cycle.compilability {
+                    CycleCompilability::Breaking => "breaking",
+                    CycleCompilability::Structural => "structural",
+                    CycleCompilability::DiamondDependency => "diamond",
+                };
+                (cycle.nodes, kind)
+            })
+            .chain(lazy.into_iter().map(|cycle| (cycle.nodes, "lazy")));
         let normalized_target = normalize_path(file_path);
 
         cycles
-            .into_iter()
-            .filter_map(|files| {
+            .filter_map(|(files, kind)| {
                 let current_file = files
                     .iter()
                     .find(|f| paths_match(&normalize_path(f), &normalized_target))
                     .cloned()?;
 
-                let cycle_type = if files.len() == 2 {
-                    "bidirectional".to_string()
-                } else {
-                    format!("{}-way cycle", files.len())
-                };
+                let cycle_type = kind.to_string();
 
                 let import_line = find_cycle_import_line(
                     &loaded.snapshot.files,
@@ -653,6 +664,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_rejects_obsolete_analysis_generation_without_hydrating_file_facts() {
+        let temp = TempDir::new().expect("project");
+        let root = temp.path();
+        let mut snapshot = Snapshot::new(vec![root.display().to_string()]);
+        snapshot.files = vec![FileAnalysis {
+            path: "lib.rs".into(),
+            exports: vec![build_export("obsolete", 1)],
+            ..Default::default()
+        }];
+        snapshot.metadata.analysis_generation.clear();
+        write_snapshot(root, &snapshot);
+        let path = Snapshot::snapshot_path(root);
+        let before = std::fs::read(&path).expect("snapshot bytes");
+        let state = SnapshotState::new();
+        let error = state
+            .load(root)
+            .await
+            .expect_err("must reject old semantics");
+        assert!(error.to_string().contains("analysis generation"));
+        assert!(!state.is_loaded().await);
+        assert_eq!(std::fs::read(path).expect("unchanged snapshot"), before);
+        cleanup_cache(root);
+    }
+
+    #[tokio::test]
     async fn snapshot_load_releases_unused_allocator_pages_after_swap() {
         static RECLAIMS: AtomicUsize = AtomicUsize::new(0);
 
@@ -733,7 +769,7 @@ mod tests {
 
         let cycles = state.cycles_for_file("src/a.rs").await;
         assert_eq!(cycles.len(), 1);
-        assert_eq!(cycles[0].cycle_type, "bidirectional");
+        assert_eq!(cycles[0].cycle_type, "structural");
         assert_eq!(cycles[0].import_line, Some(12));
 
         cleanup_cache(root);
@@ -758,6 +794,17 @@ mod tests {
             },
         ];
 
+        std::fs::create_dir_all(root.join("src")).expect("src");
+        std::fs::write(
+            root.join("src/a.rs"),
+            format!("{}pub fn TwinFn() {{}}\n", "\n".repeat(9)),
+        )
+        .expect("owned a");
+        std::fs::write(
+            root.join("src/b.rs"),
+            format!("{}pub fn TwinFn() {{}}\n", "\n".repeat(19)),
+        )
+        .expect("owned b");
         write_snapshot(root, &snapshot);
 
         let state = SnapshotState::new();
@@ -767,6 +814,15 @@ mod tests {
         assert_eq!(twins.len(), 1);
         assert_eq!(twins[0].name, "TwinFn");
 
+        std::fs::write(
+            root.join("src/a.rs"),
+            format!("{}// owned comment\n", "\n".repeat(9)),
+        )
+        .expect("owned comment");
+        assert!(
+            state.twins_for_file("src/a.rs").await.is_empty(),
+            "LSP seam must read its workspace, not process cwd"
+        );
         cleanup_cache(root);
     }
 

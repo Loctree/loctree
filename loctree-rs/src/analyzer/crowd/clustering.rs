@@ -63,7 +63,7 @@ pub fn detect_name_patterns(files: &[crate::types::FileAnalysis]) -> Vec<String>
         .into_iter()
         .filter(|(_, count)| *count >= 3)
         .collect();
-    patterns.sort_by_key(|b| std::cmp::Reverse(b.1));
+    patterns.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     patterns.into_iter().map(|(word, _)| word).collect()
 }

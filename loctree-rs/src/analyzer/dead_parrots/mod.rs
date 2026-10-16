@@ -50,6 +50,7 @@ pub struct ShadowExportFile {
 
 // Submodules
 pub mod filters;
+mod hatch;
 mod languages;
 pub mod output;
 pub mod search;
@@ -212,6 +213,18 @@ pub fn find_dead_exports(
     high_confidence: bool,
     open_base: Option<&str>,
     config: DeadFilterConfig,
+) -> Vec<DeadExport> {
+    find_dead_exports_with_sources(analyses, high_confidence, open_base, config, None)
+}
+
+// The canonical twin census includes dead parrots. Its derive evidence must
+// use the same owned source boundary, never the raw display path from cwd.
+fn find_dead_exports_with_sources(
+    analyses: &[FileAnalysis],
+    high_confidence: bool,
+    open_base: Option<&str>,
+    config: DeadFilterConfig,
+    mut sources: Option<&mut super::twins::TwinSources>,
 ) -> Vec<DeadExport> {
     let example_globset = if config.library_mode && !config.example_globs.is_empty() {
         let mut builder = globset::GlobSetBuilder::new();
@@ -656,7 +669,9 @@ pub fn find_dead_exports(
             // Rust-specific heuristics: skip common macro-derived public types and CLI args
             let rust_macro_marked = is_rust_file
                 && rust_has_known_derives(
-                    &analysis.path,
+                    sources
+                        .as_deref_mut()
+                        .and_then(|sources| sources.read(&analysis.path)),
                     &[
                         "serialize",
                         "deserialize",
@@ -1101,7 +1116,13 @@ pub fn compute_dead_truth_with(
     config: DeadFilterConfig,
     high_confidence: bool,
 ) -> DeadTruth {
-    let raw = find_dead_exports(&snapshot.files, high_confidence, None, config);
+    let raw = find_dead_exports_with_sources(
+        &snapshot.files,
+        high_confidence,
+        None,
+        config,
+        Some(&mut super::twins::TwinSources::for_snapshot(snapshot)),
+    );
 
     let mut suppression = SuppressionCounts::default();
     let candidates = match snapshot.semantic_facts.as_ref() {
@@ -1627,6 +1648,7 @@ pub fn cross_check_dead_exports(
 
     // --- Entry-point fence ---------------------------------------------------
     let entrypoint_paths = filters::runtime_entrypoint_paths(snapshot);
+    let hatch_entrypoints = hatch::runtime_entrypoint_symbols(snapshot);
     let mut probe_cache: HashMap<String, bool> = HashMap::new();
     let mut is_entrypoint_file = |file: &str| -> bool {
         let norm = norm_rel_path(file);
@@ -1721,7 +1743,12 @@ pub fn cross_check_dead_exports(
             );
         }
 
-        if is_entrypoint_file(&candidate.file) {
+        let hatch_entrypoint =
+            hatch_entrypoints.contains(&(cand_norm.clone(), candidate.symbol.clone()));
+        if hatch_entrypoint {
+            notes.push("Hatch custom build hook: statically configured runtime registration (possibly conditional or ambiguous)".to_string());
+        }
+        if hatch_entrypoint || is_entrypoint_file(&candidate.file) {
             candidate.entrypoint = true;
             // Manifest/framework dispatch is positive reachability evidence.
             // It does not prove every declaration in the owner file is live,

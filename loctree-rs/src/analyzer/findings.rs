@@ -169,9 +169,9 @@ pub struct FindingsDistSummary {
 /// Cycle counts by classification
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CycleCounts {
-    /// Hard bidirectional cycles (breaking)
+    /// Legacy failure bucket; not inferred from graph topology
     pub breaking: usize,
-    /// Structural cycles (compilable but smelly)
+    /// Dependency coupling with an unverified compiler/runtime outcome
     pub structural: usize,
     /// Diamond dependencies
     pub diamond: usize,
@@ -447,10 +447,11 @@ impl Findings {
         // sensor is exactly the kind of drift `canonical_exact_twins` exists
         // to close: every surface now reads the same file set through the
         // same gate.
-        let exact_twins = crate::analyzer::health_inputs::canonical_exact_twins(
+        let exact_twins = crate::analyzer::health_inputs::canonical_exact_twins_with_sources(
             &snapshot.files,
             snapshot.semantic_facts.as_ref(),
             false,
+            &mut crate::analyzer::twins::TwinSources::for_snapshot(snapshot),
         );
 
         // Annotate duplicate groups with the twin shape-evidence class
@@ -592,13 +593,8 @@ fn is_make_file_path(path: &str) -> bool {
 
 /// Classify cycles into breaking/structural/diamond/lazy.
 ///
-/// F5/F6 one-truth fix: this used to derive `cycle_type` straight from
-/// `cycle.classification` (`HardBidirectional => "breaking"`), while
-/// `cycles::determine_compilability` computed a SEPARATE `compilability`
-/// verdict that never actually reached `Breaking` — so `loct cycles`
-/// (grouped by compilability) always said 0 breaking while `findings.json`
-/// (this function) said N. Reading `cycle.compilability` here means both
-/// surfaces now report the exact same field.
+/// All projections read the canonical cycle evidence owner. `structural` is
+/// unverified coupling, not a certificate that compilation or execution succeeds.
 fn classify_cycles(
     strict: &[ClassifiedCycle],
     lazy: &[Vec<String>],
@@ -1302,15 +1298,7 @@ mod tests {
         }
     }
 
-    /// F5/F6 — cross-surface parity. A genuinely mutual (hard-bidirectional,
-    /// non-mod/use, non-diamond) two-node cycle must be called "breaking" by
-    /// BOTH the `loct cycles` compilability surface and the `findings.json`
-    /// surface. Before this cut, `cycles::determine_compilability` never
-    /// reached `Breaking` for a hard-bidirectional cycle (it always fell
-    /// through to `Structural`), while `classify_cycles` here derived
-    /// "breaking" straight from the `HardBidirectional` classification — 0
-    /// vs N on the same repository. Both now read the same
-    /// `ClassifiedCycle::compilability` field.
+    /// Mutual imports remain visible without promoting topology to failure.
     #[test]
     fn cycles_surface_and_findings_surface_agree_on_breaking_count() {
         use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
@@ -1326,8 +1314,8 @@ mod tests {
             .filter(|c| c.compilability == CycleCompilability::Breaking)
             .count();
         assert_eq!(
-            cycles_surface_breaking, 1,
-            "a genuine hard-bidirectional pair must classify as Breaking"
+            cycles_surface_breaking, 0,
+            "mutual imports alone do not establish a compiler/runtime failure"
         );
 
         let mut snapshot = Snapshot::new(vec![".".to_string()]);
@@ -1383,7 +1371,13 @@ mod tests {
         let file_a = twin_export_file("src/a.rs", "shared_fn");
         let file_b = twin_export_file("src/b.rs", "shared_fn");
 
-        let mut snapshot = Snapshot::new(vec![".".to_string()]);
+        let root = tempfile::tempdir().expect("owned twin sources");
+        std::fs::create_dir(root.path().join("src")).expect("source directory");
+        for file in ["src/a.rs", "src/b.rs"] {
+            std::fs::write(root.path().join(file), "pub fn shared_fn() {}\n")
+                .expect("owned source");
+        }
+        let mut snapshot = Snapshot::new(vec![root.path().display().to_string()]);
         snapshot.files.push(file_a.clone());
         snapshot.files.push(file_b);
 

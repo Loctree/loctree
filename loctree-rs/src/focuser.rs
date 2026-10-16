@@ -373,10 +373,16 @@ impl HolographicFocus {
         } else {
             normalized_target.clone()
         };
-        let suggested_next = suggested_next_for_symbols(
-            format!("loct focus {}", shell_quote(&display_target)),
+        // Move from module context to a concrete file instead of repeating this focus.
+        let first_core = core.first().expect("non-empty core checked above");
+        let mut suggested_next = suggested_next_for_symbols(
+            format!("loct slice {}", shell_quote(&first_core.path)),
             &core_symbols,
         );
+        if let Some(step) = suggested_next.last_mut() {
+            step.reason =
+                "inspect one core file's dependencies and consumers within this module".to_string();
+        }
 
         Some(Self {
             target: display_target,
@@ -533,6 +539,7 @@ mod tests {
         Snapshot {
             metadata: SnapshotMetadata {
                 schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_string(),
+                analysis_generation: crate::snapshot::ANALYSIS_GENERATION.to_string(),
                 generated_at: "2025-01-01T00:00:00Z".to_string(),
                 roots: vec!["/test".to_string()],
                 languages: ["typescript".to_string()].into_iter().collect(),
@@ -640,6 +647,18 @@ mod tests {
         assert_eq!(focus.target, "src/features/settings");
         assert_eq!(focus.stats.core_files, 3);
         assert_eq!(focus.stats.core_loc, 250); // 20 + 150 + 80
+        assert!(
+            focus.suggested_next.iter().any(|step| {
+                step.command == "loct slice 'src/features/settings/SettingsList.tsx'"
+            })
+        );
+        assert!(
+            !focus
+                .suggested_next
+                .iter()
+                .any(|step| { step.command.starts_with("loct focus ") }),
+            "focus must advance exploration instead of suggesting itself"
+        );
     }
 
     #[test]

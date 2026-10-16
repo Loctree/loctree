@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,7 +36,7 @@ use crate::analyzer::ast_js::CommandDetectionConfig;
 // `svg` is deliberately NOT here: it is text/XML that rg matches literally, so
 // treating it as binary made `find --literal/--regex` under-report versus rg
 // (W2-02 adversarial probe). It rides the scan-only resource path instead.
-const BINARY_EXTENSIONS: &[&str] = &[
+pub(crate) const BINARY_EXTENSIONS: &[&str] = &[
     "dat", "bz2", "gz", "zip", "tar", "tgz", "pack", "png", "jpg", "jpeg", "gif", "bmp", "ico",
     "webp", "woff", "woff2", "ttf", "eot", "otf", "exe", "dll", "so", "dylib", "node", "wasm",
     "bin", "o", "a", "lib", "pyc", "pyo", "pdf", "doc", "docx", "xls", "xlsx", "mp3", "mp4", "avi",
@@ -246,7 +251,7 @@ pub(crate) struct AnalyzeContext<'a> {
 /// inside `scan` (rather than threading the value through `AnalyzeContext`) so
 /// every existing call site stays compatible while Stage 1 is opt-in.
 fn ts_parser_strategy_active() -> bool {
-    if let Ok(env) = std::env::var("LOCTREE_PARSER") {
+    if let Ok(env) = env::var("LOCTREE_PARSER") {
         return matches!(
             env.trim().to_ascii_lowercase().as_str(),
             "ts" | "tree-sitter" | "treesitter"

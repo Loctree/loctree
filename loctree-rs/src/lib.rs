@@ -154,6 +154,9 @@ pub mod args;
 /// Loads `.loctree/config.toml` for project-specific settings like custom Tauri command macros.
 pub mod config;
 
+/// Shared literal tagmap evidence collection and ranking for CLI and MCP.
+pub mod tagmap;
+
 /// Suppression system for false positives.
 ///
 /// Allows marking findings as "reviewed and OK" so they don't appear in subsequent runs.
@@ -291,6 +294,7 @@ pub mod colors;
 /// println!("HEAD: {}", head);
 /// ```
 pub mod git;
+pub mod git_snapshot;
 
 /// Snapshot comparison engine for temporal analysis.
 ///
@@ -387,8 +391,7 @@ pub mod symbols;
 /// to empty results when the binary is missing — see [`aicx::AicxClient`].
 pub mod aicx;
 
-/// Test-only environment mutation, consolidated so the crate carries a single
-/// audited `unsafe` for `std::env::set_var` / `remove_var`.
+/// Test-scoped configuration overrides; never mutates the process environment.
 #[cfg(test)]
 pub(crate) mod test_env;
 

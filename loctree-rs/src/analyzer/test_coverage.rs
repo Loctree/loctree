@@ -67,7 +67,9 @@ pub struct TestCoverageReport {
     pub test_file_count: usize,
     /// Number of production files found
     pub prod_file_count: usize,
-    /// Overall coverage percentage (0.0-100.0)
+    /// Structurally covered callable exports / eligible callable exports
+    /// (0.0-100.0). Zero also represents an empty eligible universe; this
+    /// measures import/inline-test evidence, never runtime execution.
     pub coverage_percent: f32,
 }
 
@@ -104,9 +106,9 @@ pub fn analyze_test_coverage(snapshot: &Snapshot) -> TestCoverageReport {
 
     // Calculate overall coverage percentage.
     // N1 (round-2): both sides of the ratio count only testable export kinds
-    // (function/method). Types, consts, re-exports and FFI externs have no
-    // behavior to cover; counting them in the denominator type-inflated the
-    // percentage.
+    // (function/method, including parser spellings def/func). Types, consts,
+    // re-exports and FFI externs have no behavior to cover; counting them in
+    // the denominator type-inflated the percentage.
     let mut total_exports = 0usize;
     let mut covered_exports = 0usize;
     for file in &prod_files {

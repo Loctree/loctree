@@ -7,9 +7,10 @@
 //! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::focuser::{FocusConfig, HolographicFocus};
 use crate::impact::{ImpactOptions, analyze_impact};
@@ -106,7 +107,14 @@ pub fn parse_target_layout_spec(spec: &str) -> Result<HashMap<Layer, String>, St
             )
         })?;
 
-        map.insert(layer, value.to_string());
+        if !portable_relative_path(value) {
+            return Err(format!(
+                "Invalid --target-layout path '{value}': use a portable relative path without traversal"
+            ));
+        }
+        if map.insert(layer, value.to_string()).is_some() {
+            return Err(format!("Duplicate layer '{key}' in --target-layout"));
+        }
     }
 
     if map.is_empty() {
@@ -220,7 +228,16 @@ pub struct RefactorPhase {
     pub git_script: String,
 }
 
-/// Complete refactor plan for a directory.
+/// A kept file whose relocation is not justified or not supported.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnresolvedCandidate {
+    pub source: String,
+    pub layer: Layer,
+    pub proposed_target: Option<String>,
+    pub reason: String,
+}
+
+/// Complete refactor plan, including candidates that are not authorized moves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefactorPlan {
     /// Target directory that was analyzed
@@ -235,6 +252,15 @@ pub struct RefactorPlan {
     pub phases: Vec<RefactorPhase>,
     /// Statistics
     pub stats: PlanStats,
+    /// Physical repository root required by the guarded script.
+    #[serde(default)]
+    pub repository_root: String,
+    /// Exact source, manifest and compiler content covered by the contract.
+    #[serde(default)]
+    pub source_hashes: HashMap<String, String>,
+    /// Kept files and the missing evidence or unsupported contract.
+    #[serde(default)]
+    pub unresolved: Vec<UnresolvedCandidate>,
 }
 
 // ============================================================================
@@ -243,7 +269,7 @@ pub struct RefactorPlan {
 
 /// Detect the architectural layer of a file based on path heuristics.
 pub fn detect_layer(file_path: &str) -> Layer {
-    let path_lower = file_path.to_lowercase();
+    let path_lower = format!("/{}", file_path.to_lowercase());
 
     // Test files
     if path_lower.contains("/test/")
@@ -454,18 +480,31 @@ pub fn detect_needed_shims(snapshot: &Snapshot, moves: &[Move]) -> Vec<Shim> {
     let mut shims = Vec::new();
 
     for mv in moves {
-        if mv.direct_consumers > 3 {
+        {
             // Build list of symbols from file's exports
             let symbols: Vec<String> = snapshot
                 .files
                 .iter()
                 .find(|f| f.path == mv.source)
-                .map(|f| f.exports.iter().map(|e| e.name.clone()).collect())
+                .map(|f| {
+                    f.exports
+                        .iter()
+                        .map(|e| {
+                            if e.export_type == "default" {
+                                "default".to_string()
+                            } else {
+                                e.name.clone()
+                            }
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
 
             if !symbols.is_empty() {
                 // Generate re-export code based on file type
-                let code = generate_shim_code(&mv.source, &mv.target, &symbols);
+                let Some(code) = generate_shim_code(&mv.source, &mv.target, &symbols) else {
+                    continue;
+                };
 
                 shims.push(Shim {
                     old_path: mv.source.clone(),
@@ -482,7 +521,7 @@ pub fn detect_needed_shims(snapshot: &Snapshot, moves: &[Move]) -> Vec<Shim> {
 }
 
 /// Generate re-export shim code based on file extension.
-fn generate_shim_code(old_path: &str, new_path: &str, symbols: &[String]) -> String {
+fn generate_shim_code(old_path: &str, new_path: &str, symbols: &[String]) -> Option<String> {
     let ext = Path::new(old_path)
         .extension()
         .and_then(|e| e.to_str())
@@ -492,33 +531,16 @@ fn generate_shim_code(old_path: &str, new_path: &str, symbols: &[String]) -> Str
     let relative_path = calculate_relative_import(old_path, new_path);
 
     match ext {
-        "ts" | "tsx" | "js" | "jsx" | "mjs" => {
-            if symbols.len() <= 5 {
-                format!(
-                    "// Shim for backward compatibility\nexport {{ {} }} from '{}';",
-                    symbols.join(", "),
-                    relative_path
-                )
-            } else {
-                format!(
-                    "// Shim for backward compatibility\nexport * from '{}';",
-                    relative_path
-                )
+        "ts" | "js" | "mjs" if !symbols.is_empty() => {
+            let mut code =
+                format!("// Shim for backward compatibility\nexport * from '{relative_path}';\n");
+            if symbols.iter().any(|s| s == "default") {
+                code.push_str(&format!("export {{ default }} from '{relative_path}';\n"));
             }
+            Some(code)
         }
-        "rs" => {
-            format!(
-                "// Shim for backward compatibility\npub use {}::*;",
-                relative_path.replace('/', "::")
-            )
-        }
-        "py" => {
-            format!(
-                "# Shim for backward compatibility\nfrom {} import *",
-                relative_path.replace('/', ".")
-            )
-        }
-        _ => format!("// TODO: Create re-export shim pointing to {}", new_path),
+        // Filesystem paths are not Rust module paths or Python package names.
+        _ => None,
     }
 }
 
@@ -548,9 +570,10 @@ fn calculate_relative_import(from: &str, to: &str) -> String {
     }
     result.push_str(&downs.join("/"));
 
-    // Remove extension for import
-    if let Some(pos) = result.rfind('.') {
-        result.truncate(pos);
+    // TypeScript's emitted ESM module uses .js; Node requires the extension.
+    if result.ends_with(".ts") {
+        result.truncate(result.len() - 3);
+        result.push_str(".js");
     }
 
     result
@@ -586,12 +609,34 @@ pub fn order_moves(moves: &mut [Move]) {
 
 /// Generate a refactor plan for a target directory.
 ///
-/// Returns `None` if no files need reorganization.
+/// Returns `None` only when the target has no represented files.
 pub fn generate_refactor_plan(
     snapshot: &Snapshot,
     target_dir: &str,
     target_layout: Option<&HashMap<Layer, String>>,
 ) -> Option<RefactorPlan> {
+    let repository_root = snapshot
+        .metadata
+        .roots
+        .first()
+        .and_then(|root| std::fs::canonicalize(root).ok());
+    let relative_target;
+    let target_dir = if Path::new(target_dir).is_absolute() {
+        let root = repository_root.as_ref()?;
+        relative_target = std::fs::canonicalize(target_dir)
+            .ok()?
+            .strip_prefix(root)
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        if relative_target.is_empty() {
+            "."
+        } else {
+            &relative_target
+        }
+    } else {
+        target_dir
+    };
     // Get holographic focus for the target directory
     let config = FocusConfig {
         include_consumers: true,
@@ -618,6 +663,9 @@ pub fn generate_refactor_plan(
     // Generate moves
     let impact_opts = ImpactOptions::default();
     let mut moves: Vec<Move> = Vec::new();
+    let mut unresolved = Vec::new();
+    let mut source_hashes = HashMap::new();
+    let base_dir = &focus.target;
     let mut layer_before: HashMap<String, usize> = HashMap::new();
     let mut layer_after: HashMap<String, usize> = HashMap::new();
 
@@ -627,65 +675,85 @@ pub fn generate_refactor_plan(
             .entry(current_layer.display_name().to_string())
             .or_default() += 1;
 
-        // Analyze impact for this file
-        let impact = analyze_impact(snapshot, &file.path, &impact_opts);
-
-        // Determine target layer
-        let target_layer = if current_layer == Layer::Unknown {
-            // Try to infer from content or neighbors
-            infer_target_layer(&file.path, snapshot)
-        } else {
-            current_layer
-        };
+        let target_layer = current_layer;
 
         *layer_after
             .entry(target_layer.display_name().to_string())
             .or_default() += 1;
 
-        // Only create a move if layer changed or file is misplaced
-        let needs_move =
-            current_layer == Layer::Unknown || !file.path.contains(current_layer.canonical_dir());
+        let target_path = build_target_path(&file.path, target_layer, target_layout, base_dir);
+        let analysis = snapshot
+            .files
+            .iter()
+            .find(|f| f.path == file.path)
+            .expect("focused file belongs to snapshot");
+        let contract = relocation_contract(
+            snapshot,
+            analysis,
+            &target_path,
+            target_layout,
+            repository_root.as_deref(),
+        );
+        match contract {
+            Err(reason) => {
+                unresolved.push(UnresolvedCandidate {
+                    source: file.path.clone(),
+                    layer: current_layer,
+                    proposed_target: target_layout
+                        .and_then(|layout| layout.get(&current_layer))
+                        .map(|_| target_path),
+                    reason,
+                });
+            }
+            Ok(hashes) => {
+                let impact = analyze_impact(snapshot, &file.path, &impact_opts);
+                let in_cycle = files_in_cycles.contains(file.path.as_str());
+                let risk = calculate_risk(
+                    impact.direct_consumers.len(),
+                    impact.transitive_consumers.len(),
+                    file.loc,
+                    in_cycle,
+                );
 
-        if needs_move {
-            let in_cycle = files_in_cycles.contains(file.path.as_str());
-            let risk = calculate_risk(
-                impact.direct_consumers.len(),
-                impact.transitive_consumers.len(),
-                file.loc,
-                in_cycle,
-            );
+                let reason = "Explicit layout; same-package literal ESM module; topology and old-path exports preserved".to_string();
+                let verify_cmd = format!("loct impact {}", target_path);
 
-            // Build target path
-            let target_path =
-                build_target_path(&file.path, target_layer, target_layout, target_dir);
+                let affected_files: Vec<String> = impact
+                    .direct_consumers
+                    .iter()
+                    .map(|e| e.file.clone())
+                    .collect();
 
-            let reason = build_move_reason(current_layer, target_layer, in_cycle);
-            let verify_cmd = format!("loct impact {}", target_path);
-
-            let affected_files: Vec<String> = impact
-                .direct_consumers
-                .iter()
-                .map(|e| e.file.clone())
-                .collect();
-
-            moves.push(Move {
-                source: file.path.clone(),
-                target: target_path,
-                current_layer,
-                target_layer,
-                risk,
-                direct_consumers: impact.direct_consumers.len(),
-                transitive_consumers: impact.transitive_consumers.len(),
-                loc: file.loc,
-                reason,
-                verify_cmd,
-                affected_files,
-            });
+                source_hashes.extend(hashes);
+                moves.push(Move {
+                    source: file.path.clone(),
+                    target: target_path,
+                    current_layer,
+                    target_layer,
+                    risk,
+                    direct_consumers: impact.direct_consumers.len(),
+                    transitive_consumers: impact.transitive_consumers.len(),
+                    loc: file.loc,
+                    reason,
+                    verify_cmd,
+                    affected_files,
+                });
+            }
         }
     }
 
-    if moves.is_empty() {
-        return None;
+    // Reject the entire conflicting set rather than picking a random winner.
+    let conflicts = move_conflicts(&moves);
+    if !conflicts.is_empty() {
+        for mv in moves.drain(..) {
+            unresolved.push(UnresolvedCandidate {
+                source: mv.source,
+                layer: mv.current_layer,
+                proposed_target: Some(mv.target),
+                reason: conflicts.join("; "),
+            });
+        }
+        source_hashes.clear();
     }
 
     // Order moves by risk
@@ -719,34 +787,410 @@ pub fn generate_refactor_plan(
         cyclic_groups,
         phases,
         stats,
+        repository_root: repository_root
+            .map(|root| root.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        source_hashes,
+        unresolved,
     })
 }
 
-/// Infer target layer from file content and neighbors.
-fn infer_target_layer(file_path: &str, snapshot: &Snapshot) -> Layer {
-    // Check what the file imports
-    let imports: Vec<&str> = snapshot
-        .edges
-        .iter()
-        .filter(|e| e.from == file_path)
-        .map(|e| e.to.as_str())
-        .collect();
+fn portable_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && path
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"_-. /@+".contains(&c))
+        && !path.contains("//")
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+        && Path::new(path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+}
 
-    // Count layers of imported files
-    let mut layer_counts: HashMap<Layer, usize> = HashMap::new();
-    for imp in imports {
-        let layer = detect_layer(imp);
-        if layer != Layer::Unknown {
-            *layer_counts.entry(layer).or_default() += 1;
+fn protected_path(path: &str) -> bool {
+    path.split('/').any(|part| {
+        part.starts_with('.')
+            || matches!(
+                part.to_ascii_lowercase().as_str(),
+                "node_modules"
+                    | "vendor"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "assets"
+                    | "fixtures"
+                    | "fixture"
+                    | "tests"
+                    | "test"
+                    | "__tests__"
+                    | "public"
+                    | "static"
+                    | "resources"
+                    | "locales"
+                    | "templates"
+                    | "migrations"
+            )
+    }) || matches!(
+        Path::new(path).file_stem().and_then(|s| s.to_str()),
+        Some("index" | "main" | "__init__" | "__main__" | "lib" | "mod")
+    )
+}
+
+fn package_boundary(root: &Path, path: &str) -> Option<PathBuf> {
+    root.join(path)
+        .parent()?
+        .ancestors()
+        .take_while(|p| p.starts_with(root))
+        .find(|p| {
+            [
+                "package.json",
+                "Cargo.toml",
+                "pyproject.toml",
+                "__init__.py",
+            ]
+            .iter()
+            .any(|name| p.join(name).exists())
+        })
+        .map(Path::to_path_buf)
+}
+
+fn inspect_move_path(root: &Path, path: &str, destination: bool) -> Result<(), String> {
+    let mut current = root.to_path_buf();
+    let parts: Vec<_> = path.split('/').collect();
+    for (index, part) in parts.iter().enumerate() {
+        if current.is_dir() {
+            for entry in std::fs::read_dir(&current).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.eq_ignore_ascii_case(part)
+                    && (name != *part || destination && index + 1 == parts.len())
+                {
+                    return Err(format!(
+                        "Existing or case-colliding path: {}",
+                        entry.path().display()
+                    ));
+                }
+            }
+        }
+        current.push(part);
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && (metadata.file_type().is_symlink() || index + 1 < parts.len() && !metadata.is_dir())
+        {
+            return Err(format!(
+                "Symlink or non-directory ancestor: {}",
+                current.display()
+            ));
         }
     }
+    Ok(())
+}
 
-    // Return most common layer, or Infra as default
-    layer_counts
+// Deliberately bounded: no imports, functions, runtime effects or location-sensitive
+// expressions. Reuse the source parser rather than infer safety from graph silence.
+fn literal_esm_module(source: &str, path: &str) -> bool {
+    use oxc_ast::ast::{Declaration, Expression, Statement, VariableDeclarationKind};
+    let allocator = oxc_allocator::Allocator::default();
+    let Ok(source_type) = oxc_span::SourceType::from_path(path) else {
+        return false;
+    };
+    let parsed = oxc_parser::Parser::new(&allocator, source, source_type).parse();
+    parsed.errors.is_empty()
+        && parsed.program.hashbang.is_none()
+        && parsed.program.directives.is_empty()
+        && !parsed.program.body.is_empty()
+        && parsed.program.body.iter().all(|statement| {
+            let Statement::ExportNamedDeclaration(export) = statement else {
+                return false;
+            };
+            let Some(Declaration::VariableDeclaration(declaration)) = &export.declaration else {
+                return false;
+            };
+            declaration.kind == VariableDeclarationKind::Const
+                && declaration.declarations.iter().all(|declarator| {
+                    declarator.id.get_binding_identifier().is_some()
+                        && matches!(
+                            declarator.init,
+                            Some(
+                                Expression::NumericLiteral(_)
+                                    | Expression::StringLiteral(_)
+                                    | Expression::BooleanLiteral(_)
+                                    | Expression::NullLiteral(_)
+                                    | Expression::BigIntLiteral(_)
+                            )
+                        )
+                })
+        })
+}
+
+fn relocation_contract(
+    snapshot: &Snapshot,
+    file: &crate::types::FileAnalysis,
+    target: &str,
+    layout: Option<&HashMap<Layer, String>>,
+    root: Option<&Path>,
+) -> Result<HashMap<String, String>, String> {
+    let layer = detect_layer(&file.path);
+    if protected_path(&file.path)
+        || file.is_test
+        || file.is_generated
+        || file.resource_kind.is_some()
+        || !file.entry_points.is_empty()
+        || snapshot
+            .metadata
+            .entrypoints
+            .iter()
+            .any(|e| e.path == file.path)
+    {
+        return Err(
+            "Kept: package/runtime identity, resource, fixture or generated surface".into(),
+        );
+    }
+    if layer == Layer::Unknown {
+        return Err("Unknown layer: path and neighbor heuristics do not justify relocation".into());
+    }
+    if layout.and_then(|l| l.get(&layer)).is_none() {
+        return Err("Candidate only: no explicit target layout for this layer".into());
+    }
+    if file.path == target {
+        return Err("Kept: already within the requested destination".into());
+    }
+    if !portable_relative_path(&file.path)
+        || !portable_relative_path(target)
+        || protected_path(target)
+    {
+        return Err(
+            "Unsupported path: require portable relative paths and unprotected destination".into(),
+        );
+    }
+    if !matches!(
+        Path::new(&file.path).extension().and_then(|s| s.to_str()),
+        Some("ts" | "js" | "mjs")
+    ) {
+        return Err("Unsupported relocation/shim contract: Rust/Python modules and other languages stay in place".into());
+    }
+    let root = root.ok_or("Repository root unavailable; cannot verify filesystem identity")?;
+    let boundary = package_boundary(root, &file.path);
+    if boundary.is_none() || boundary != package_boundary(root, target) {
+        return Err("Package boundary is missing or would change".into());
+    }
+    let package = boundary.expect("verified package boundary");
+    let manifest_path = package.join("package.json");
+    let manifest_source = std::fs::read_to_string(&manifest_path)
+        .map_err(|_| "Unsupported ESM contract: package.json is required")?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_source)
+        .map_err(|_| "Unsupported ESM contract: package.json must be valid JSON")?;
+    if manifest["type"] != "module" {
+        return Err("Unsupported ESM contract: require package.json type=module".into());
+    }
+    let mut inputs = vec![(manifest_path, manifest_source)];
+    if file.path.ends_with(".ts") {
+        let config_path = package.join("tsconfig.json");
+        let config_source = std::fs::read_to_string(&config_path)
+            .map_err(|_| "Unsupported TypeScript contract: explicit tsconfig.json ESM emission scope required")?;
+        let config: serde_json::Value = serde_json::from_str(&config_source).map_err(
+            |_| "Unsupported TypeScript contract: JSONC/extended configurations are not translated",
+        )?;
+        verify_typescript_emission(&config, root, &package, &file.path, target)?;
+        inputs.push((config_path, config_source));
+    }
+    inspect_move_path(root, &file.path, false)?;
+    inspect_move_path(root, target, true)?;
+    let source = std::fs::read_to_string(root.join(&file.path))
+        .map_err(|e| format!("Source unavailable: {e}"))?;
+    if !file.imports.is_empty()
+        || !file.reexports.is_empty()
+        || !file.dynamic_imports.is_empty()
+        || file.exports.is_empty()
+        || file.exports.iter().any(|e| e.export_type != "named")
+        || snapshot.edges.iter().any(|e| e.from == file.path)
+        || !literal_esm_module(&source, &file.path)
+    {
+        return Err("Unsupported relocation contract: only literal-export ESM leaves; dependencies/runtime expressions require import and asset rewriting".into());
+    }
+    inputs.push((root.join(&file.path), source));
+    Ok(inputs
         .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(layer, _)| layer)
-        .unwrap_or(Layer::Infra)
+        .map(|(path, content)| {
+            (
+                path.strip_prefix(root)
+                    .expect("contract input within root")
+                    .to_string_lossy()
+                    .into_owned(),
+                Sha256::digest(content.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            )
+        })
+        .collect())
+}
+
+fn verify_typescript_emission(
+    config: &serde_json::Value,
+    root: &Path,
+    package: &Path,
+    source: &str,
+    target: &str,
+) -> Result<(), String> {
+    let unsupported = || {
+        "Unsupported TypeScript contract: require a simple explicit ESM emitting tsconfig with rootDir, outDir and include covering both paths; native/noEmit, extended/project-reference and nested scopes are withheld".to_string()
+    };
+    let options = &config["compilerOptions"];
+    let module = options["module"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let root_dir = options["rootDir"].as_str().ok_or_else(unsupported)?;
+    let out_dir = options["outDir"].as_str().ok_or_else(unsupported)?;
+    if config.get("extends").is_some()
+        || config.get("references").is_some()
+        || options.get("moduleSuffixes").is_some()
+        || options.get("rootDirs").is_some()
+        || options.get("outFile").is_some()
+        || options["noEmit"] == true
+        || options["emitDeclarationOnly"] == true
+        || !matches!(
+            module.as_str(),
+            "nodenext" | "node16" | "esnext" | "es2022" | "es2020" | "es2015"
+        )
+        || root_dir != "." && !portable_relative_path(root_dir)
+        || !portable_relative_path(out_dir)
+    {
+        return Err(unsupported());
+    }
+    let includes = config["include"].as_array().ok_or_else(unsupported)?;
+    let matches = |patterns: &[serde_json::Value], relative: &Path| -> Result<bool, String> {
+        for pattern in patterns {
+            let raw = pattern.as_str().ok_or_else(unsupported)?;
+            let pattern = raw.strip_prefix("./").unwrap_or(raw);
+            let pattern = if !pattern.contains(['*', '?', '[', '{'])
+                && Path::new(pattern).extension().is_none()
+            {
+                format!("{pattern}/**")
+            } else {
+                pattern.to_string()
+            };
+            let glob = globset::GlobBuilder::new(&pattern)
+                .literal_separator(true)
+                .build()
+                .map_err(|_| unsupported())?;
+            if glob.compile_matcher().is_match(relative) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    for path in [source, target] {
+        let full = root.join(path);
+        let relative = full.strip_prefix(package).map_err(|_| unsupported())?;
+        if !full.starts_with(package.join(root_dir))
+            || full.starts_with(package.join(out_dir))
+            || !matches(includes, relative)?
+            || config["exclude"]
+                .as_array()
+                .is_some_and(|patterns| matches(patterns, relative).unwrap_or(true))
+            || full
+                .parent()
+                .expect("file parent")
+                .ancestors()
+                .take_while(|p| *p != package)
+                .any(|p| p.join("tsconfig.json").exists())
+        {
+            return Err(unsupported());
+        }
+    }
+    Ok(())
+}
+
+fn move_conflicts(moves: &[Move]) -> Vec<String> {
+    let endpoints: Vec<_> = moves
+        .iter()
+        .flat_map(|mv| [&mv.source, &mv.target])
+        .map(|p| p.to_ascii_lowercase())
+        .collect();
+    let mut issues = Vec::new();
+    for (i, left) in endpoints.iter().enumerate() {
+        for right in &endpoints[i + 1..] {
+            if left == right
+                || left.starts_with(&format!("{right}/"))
+                || right.starts_with(&format!("{left}/"))
+            {
+                issues.push(format!("Conflicting move paths (duplicate, case, cycle or ancestor overlap): {left} / {right}"));
+            }
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
+}
+
+/// One execution contract for all renderers, including multi-target bundles.
+pub fn execution_blockers(plans: &[RefactorPlan]) -> Vec<String> {
+    let moves: Vec<_> = plans.iter().flat_map(|p| p.moves.clone()).collect();
+    let mut issues = move_conflicts(&moves);
+    let root = plans
+        .first()
+        .map(|p| p.repository_root.as_str())
+        .unwrap_or("");
+    for plan in plans {
+        if !plan.moves.is_empty() && (root.is_empty() || plan.repository_root != root) {
+            issues.push("Missing or inconsistent repository roots".into());
+        }
+        if plan
+            .source_hashes
+            .keys()
+            .any(|path| !portable_relative_path(path))
+        {
+            issues.push("Unsupported contract input path".into());
+        }
+        let phased: Vec<_> = plan.phases.iter().flat_map(|p| &p.moves).collect();
+        if serde_json::to_value(&phased).ok() != serde_json::to_value(&plan.moves).ok() {
+            issues.push("Phases do not match the canonical moves".into());
+        }
+        for mv in &plan.moves {
+            if !portable_relative_path(&mv.source)
+                || !portable_relative_path(&mv.target)
+                || protected_path(&mv.source)
+                || protected_path(&mv.target)
+            {
+                issues.push(format!("Unsupported move path: {}", mv.source));
+            }
+            if mv.current_layer == Layer::Unknown || mv.current_layer != mv.target_layer {
+                issues.push(format!("Unjustified layer translation: {}", mv.source));
+            }
+            if Path::new(&mv.source).extension() != Path::new(&mv.target).extension() {
+                issues.push(format!("Unsupported extension translation: {}", mv.source));
+            }
+            if !plan
+                .source_hashes
+                .get(&mv.source)
+                .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                issues.push(format!("Missing source contract hash: {}", mv.source));
+            }
+            let shim = plan
+                .shims
+                .iter()
+                .find(|s| s.old_path == mv.source && s.new_path == mv.target);
+            if !shim.is_some_and(|s| {
+                generate_shim_code(&s.old_path, &s.new_path, &s.symbols).as_ref() == Some(&s.code)
+            }) {
+                issues.push(format!(
+                    "Unsupported or missing compatibility shim: {}",
+                    mv.source
+                ));
+            }
+        }
+        if plan.shims.len() != plan.moves.len() {
+            issues.push("Compatibility shims must match moves one-to-one".into());
+        }
+    }
+    issues.sort();
+    issues.dedup();
+    issues
 }
 
 /// Build target path for a file move.
@@ -756,47 +1200,24 @@ fn build_target_path(
     custom_layout: Option<&HashMap<Layer, String>>,
     base_dir: &str,
 ) -> String {
-    let filename = Path::new(source)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(source);
-
-    let layer_dir = custom_layout
-        .and_then(|m| m.get(&layer))
-        .map(|s| s.as_str())
-        .unwrap_or_else(|| layer.canonical_dir());
-
-    format!(
-        "{}/{}/{}",
-        base_dir.trim_end_matches('/'),
-        layer_dir,
-        filename
-    )
-}
-
-/// Build reason string for a move.
-fn build_move_reason(current: Layer, target: Layer, in_cycle: bool) -> String {
-    let mut parts = Vec::new();
-
-    if current == Layer::Unknown {
-        parts.push(format!("Unclassified → {}", target.display_name()));
-    } else if current != target {
-        parts.push(format!(
-            "{} → {}",
-            current.display_name(),
-            target.display_name()
-        ));
-    }
-
-    if in_cycle {
-        parts.push("In cycle".to_string());
-    }
-
-    if parts.is_empty() {
-        "Misplaced file".to_string()
+    let Some(layer_dir) = custom_layout.and_then(|m| m.get(&layer)) else {
+        return source.to_string();
+    };
+    let base = if base_dir == "." {
+        Path::new("")
     } else {
-        parts.join(", ")
+        Path::new(base_dir)
+    };
+    if Path::new(source).starts_with(base.join(layer_dir)) {
+        return source.to_string();
     }
+    let relative = Path::new(source)
+        .strip_prefix(base)
+        .unwrap_or(Path::new(source));
+    base.join(layer_dir)
+        .join(relative)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Build execution phases from ordered moves.
@@ -839,17 +1260,10 @@ fn build_phases(moves: &[Move]) -> Vec<RefactorPhase> {
 
 /// Build git script for a set of moves.
 fn build_git_script(moves: &[Move]) -> String {
-    let mut lines: Vec<String> = Vec::new();
-
-    for mv in moves {
-        // Ensure parent directory exists
-        if let Some(parent) = Path::new(&mv.target).parent() {
-            lines.push(format!("mkdir -p {}", parent.display()));
-        }
-        lines.push(format!("git mv {} {}", mv.source, mv.target));
-    }
-
-    lines.join("\n")
+    format!(
+        "# {} move(s): use the full guarded --script output, --dry first.\n# Standalone phase commands are withheld: preflight and compatibility shims are required.",
+        moves.len()
+    )
 }
 
 // ============================================================================
@@ -859,6 +1273,16 @@ fn build_git_script(moves: &[Move]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_and_python_filesystem_paths_are_not_module_shims() {
+        for (old, new) in [
+            ("src/utils/a.rs", "src/infra/utils/a.rs"),
+            ("one/utils.py", "infra/one/utils.py"),
+        ] {
+            assert!(generate_shim_code(old, new, &["value".into()]).is_none());
+        }
+    }
 
     #[test]
     fn test_detect_layer_ui() {
@@ -918,13 +1342,13 @@ mod tests {
     #[test]
     fn test_calculate_relative_import_same_dir() {
         let result = calculate_relative_import("src/utils/a.ts", "src/utils/b.ts");
-        assert_eq!(result, "./b");
+        assert_eq!(result, "./b.js");
     }
 
     #[test]
     fn test_calculate_relative_import_parent_dir() {
         let result = calculate_relative_import("src/components/Button.tsx", "src/utils/format.ts");
-        assert_eq!(result, "../utils/format");
+        assert_eq!(result, "../utils/format.js");
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use loctree::slicer::{HolographicSlice, SliceConfig, SliceFile};
+use loctree::slicer::{ConsumerCoverage, HolographicSlice, SliceConfig, SliceFile};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,8 @@ pub struct SliceResponse {
     pub deps: Paginated<Vec<SliceFileEntry>>,
     /// Files that import the target (when `consumers: true`).
     pub consumers: Paginated<Vec<SliceFileEntry>>,
+    /// Consumer modeling limits, preserved on every page.
+    pub consumer_coverage: ConsumerCoverage,
     /// Total file count across all returned layers.
     pub total_files: usize,
     /// Total LOC across all returned layers.
@@ -116,6 +118,7 @@ impl SliceResponse {
             )?,
             total_files: slice.stats.total_files,
             total_loc: slice.stats.total_loc,
+            consumer_coverage: slice.consumer_coverage.clone(),
         })
     }
 

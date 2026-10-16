@@ -27,14 +27,13 @@ pub fn parse_dockerfile(path: &Path, root: &Path, base_rank: u8) -> Vec<(String,
     // Collapse line-continuations so `ENV X=1 \\` joins with the next line.
     let collapsed = collapse_continuations(&raw);
     let mut out = Vec::new();
-    for (idx, line) in collapsed.iter().enumerate() {
+    for (line_no, line) in collapsed {
         let trimmed = line.trim();
         if !trimmed.starts_with("ENV ") && !trimmed.starts_with("ENV\t") {
             continue;
         }
         let body = trimmed[3..].trim_start();
         let pairs = parse_env_directive(body);
-        let line_no = (idx + 1) as u32;
         for (name, value) in pairs {
             let presence = if value.is_empty() {
                 ValuePresence::Empty
@@ -62,20 +61,20 @@ pub fn parse_dockerfile(path: &Path, root: &Path, base_rank: u8) -> Vec<(String,
 }
 
 /// Join lines that end with a backslash with the next line, preserving
-/// original line numbers (the joined line keeps the index of the *first*
-/// physical line so reported line numbers are predictable).
-fn collapse_continuations(raw: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// the 1-based start of each logical line alongside its text. Every key in
+/// a continued `ENV` directive belongs to its first physical line.
+fn collapse_continuations(raw: &str) -> Vec<(u32, String)> {
+    let mut out: Vec<(u32, String)> = Vec::new();
     let mut buf = String::new();
     let mut continuing = false;
-    for line in raw.lines() {
+    for (idx, line) in raw.lines().enumerate() {
         if continuing {
             // Append to last logical line buffer.
             buf.push(' ');
             buf.push_str(line.trim_end_matches('\\').trim());
             continuing = line.trim_end().ends_with('\\');
             if !continuing {
-                if let Some(last) = out.last_mut() {
+                if let Some((_, last)) = out.last_mut() {
                     last.push_str(&buf);
                 }
                 buf.clear();
@@ -88,10 +87,10 @@ fn collapse_continuations(raw: &str) -> Vec<String> {
             buf.clear();
             continuing = true;
         }
-        out.push(s);
+        out.push(((idx + 1) as u32, s));
     }
     // Flush any in-progress continuation at end of file.
-    if continuing && let Some(last) = out.last_mut() {
+    if continuing && let Some((_, last)) = out.last_mut() {
         last.push_str(&buf);
     }
     out
@@ -229,6 +228,86 @@ mod tests {
             &secret.1.value_present,
             ValuePresence::Plain { .. }
         ));
+    }
+
+    #[test]
+    fn preserves_physical_directive_lines() {
+        let raw = "FROM alpine\nRUN echo one \\\n    && echo two \\\n    && echo three\nENV DEMO_ALPHA=first\nENV DEMO_BETA=second \\\n    DEMO_GAMMA=third\nENV DEMO_DELTA=fourth";
+        for newline in ["\n", "\r\n"] {
+            for ending in ["", newline] {
+                let tmp = TempDir::new().expect("temp Dockerfile root");
+                let path = tmp.path().join("Dockerfile");
+                fs::write(&path, raw.replace('\n', newline) + ending).expect("write Dockerfile");
+                let out = parse_dockerfile(&path, tmp.path(), 40);
+                let sites: Vec<_> = out
+                    .iter()
+                    .map(|(name, src)| (name.as_str(), src.line))
+                    .collect();
+                assert_eq!(
+                    sites,
+                    [
+                        ("DEMO_ALPHA", Some(5)),
+                        ("DEMO_BETA", Some(6)),
+                        ("DEMO_GAMMA", Some(6)),
+                        ("DEMO_DELTA", Some(8))
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_lines_across_crlf_and_eof() {
+        let lines = [
+            "# header",
+            "",
+            "FROM alpine",
+            "RUN echo one \\",
+            "    && echo two",
+            "LABEL demo=one \\",
+            "    other=two",
+            "# after continuations",
+            "",
+            "ENV\tALPHA=first \\",
+            "    BETA=\"two words\" \\",
+            "    GAMMA='three words'",
+            "ENV LEGACY four words",
+            "ENV EMPTY=",
+            "ENV LAST=fifth \\",
+            "    TAIL=sixth \\",
+        ];
+        for newline in ["\n", "\r\n"] {
+            for ending in ["", newline] {
+                let tmp = TempDir::new().expect("temp Dockerfile root");
+                let path = tmp.path().join("Dockerfile");
+                fs::write(&path, lines.join(newline) + ending).expect("write Dockerfile");
+                let out = parse_dockerfile(&path, tmp.path(), 40);
+                let expected = [
+                    ("ALPHA", 10, "first"),
+                    ("BETA", 10, "two words"),
+                    ("GAMMA", 10, "three words"),
+                    ("LEGACY", 13, "four words"),
+                    ("EMPTY", 14, ""),
+                    ("LAST", 15, "fifth"),
+                    ("TAIL", 15, "sixth"),
+                ];
+                assert_eq!(out.len(), expected.len());
+                for ((name, src), (want_name, line, value)) in out.iter().zip(expected) {
+                    assert_eq!(name, want_name);
+                    assert_eq!(src.line, Some(line));
+                    assert_eq!(src.path, "Dockerfile");
+                    assert_eq!(src.kind, EnvSourceKind::Dockerfile);
+                    assert_eq!(src.precedence_rank, 40);
+                    if value.is_empty() {
+                        assert!(matches!(src.value_present, ValuePresence::Empty));
+                    } else {
+                        assert!(
+                            matches!(&src.value_present, ValuePresence::Plain { value_hash } if *value_hash == hash_value(value))
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
