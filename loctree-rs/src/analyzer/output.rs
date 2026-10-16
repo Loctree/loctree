@@ -23,7 +23,7 @@ use super::for_ai::{
     find_hub_files,
 };
 use super::graph::{MAX_GRAPH_EDGES, MAX_GRAPH_NODES, build_graph_data};
-use super::health_inputs::{canonical_exact_twins, structural_defects};
+use super::health_inputs::{canonical_exact_twins_with_sources, structural_defects};
 use super::health_score::calculate_health_score;
 use super::html::render_html_report;
 use super::insights::collect_ai_insights;
@@ -31,7 +31,7 @@ use super::open_server::current_open_base;
 use super::report::{
     AiInsight, CommandBridge, HotspotFile, HubFile, PriorityTask, TreeNode, TwinsData,
 };
-use super::root_scan::{RootContext, normalize_module_id};
+use super::root_scan::{RootContext, import_edge_label, normalize_module_id};
 use super::scan::resolve_event_constants_across_files;
 use super::twins::find_dead_parrots;
 use super::{DupSeverity, RankedDup};
@@ -233,23 +233,11 @@ fn build_cycle_edges(
         }
         for imp in &analysis.imports {
             if let Some(target) = &imp.resolved_path {
-                let kind = if imp.is_mod_declaration {
-                    // Rust `mod foo;` declarations create parent->child module relationships
-                    // These are NOT import edges and should not contribute to cycle detection
-                    "mod"
-                } else if imp.is_type_checking {
-                    "type_import"
-                } else if imp.is_lazy {
-                    "lazy_import"
-                } else {
-                    match imp.kind {
-                        ImportKind::Dynamic => "dynamic_import",
-                        _ => "import",
-                    }
-                };
-                if kind != "type_import" {
-                    edges.push((analysis.path.clone(), target.clone(), kind.to_string()));
-                }
+                edges.push((
+                    analysis.path.clone(),
+                    target.clone(),
+                    import_edge_label(imp).to_string(),
+                ));
             }
         }
 
@@ -932,15 +920,14 @@ pub fn process_root_context(
         // Note: include_tests=false for production reports
         let twins_result = find_dead_parrots(&analyses, true, false);
 
-        // Detect exact twins (same symbol exported from multiple files).
-        // F6: converged onto `canonical_exact_twins` (the same computation
-        // `findings.rs`/`health_inputs.rs` use) instead of a bare
-        // `detect_exact_twins` call. This root-scoped `structural_snapshot`
-        // has no semantic facts yet at this stage of the pipeline (built
-        // with `semantic_facts: None` a few lines above), so passing `None`
-        // here is not a behavior change — it degrades to exactly the same
-        // raw result this call already produced.
-        let exact_twins = canonical_exact_twins(&analyses, None, false);
+        // Shared canonical detector, using this scan context's explicit root.
+        // Semantic facts are not available at this pipeline stage yet.
+        let exact_twins = canonical_exact_twins_with_sources(
+            &analyses,
+            None,
+            false,
+            &mut crate::analyzer::twins::TwinSources::for_root(&root_path),
+        );
 
         // Analyze barrel chaos (missing barrels, deep chains, inconsistent paths)
         let barrel_analysis = analyze_barrel_chaos(&structural_snapshot);
@@ -1617,7 +1604,11 @@ Top duplicate exports (showing {} actionable, {} cross-lang silenced):",
             context_atlas: None,
         };
 
-        let quick_wins = extract_quick_wins(std::slice::from_ref(&section), &analyses);
+        let quick_wins = extract_quick_wins(
+            std::slice::from_ref(&section),
+            &analyses,
+            Some(&structural_snapshot),
+        );
         let priority_tasks: Vec<PriorityTask> = build_priority_tasks(&quick_wins)
             .into_iter()
             .map(|task: AiPriorityTask| PriorityTask {
@@ -1733,6 +1724,53 @@ mod tests {
     use super::build_tree;
     use crate::types::{FileAnalysis, ImportEntry, ImportKind};
     use std::path::Path;
+
+    #[test]
+    fn report_fallback_preserves_type_edges_from_real_scans() {
+        use crate::analyzer::root_scan::{ScanConfig, scan_roots};
+        use std::collections::HashSet;
+
+        for (ext, a, b) in [
+            (
+                "ts",
+                "import type { B } from './b.ts'; export interface A { b: B }",
+                "import type { A } from './a.ts'; export interface B { a: A }",
+            ),
+            (
+                "py",
+                "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from .b import B\nclass A: pass\n",
+                "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from .a import A\nclass B: pass\n",
+            ),
+        ] {
+            let root = tempfile::TempDir::new().expect("fixture");
+            std::fs::write(root.path().join(format!("a.{ext}")), a).expect("a source");
+            std::fs::write(root.path().join(format!("b.{ext}")), b).expect("b source");
+            let parsed = crate::args::ParsedArgs::default();
+            let py_stdlib = crate::analyzer::scan::python_stdlib();
+            let results = scan_roots(ScanConfig {
+                roots: &[root.path().to_path_buf()],
+                parsed: &parsed,
+                extensions: Some(crate::analyzer::runner::default_analyzer_exts()),
+                focus_set: &None,
+                exclude_set: &None,
+                ignore_exact: HashSet::new(),
+                ignore_prefixes: Vec::new(),
+                py_stdlib: &py_stdlib,
+                cached_analyses: None,
+                collect_edges: false,
+                custom_command_macros: &[],
+                command_detection: Default::default(),
+            })
+            .expect("scan with graph collection disabled");
+            let ctx = &results.contexts[0];
+            assert!(ctx.graph_edges.is_empty());
+            let edges = build_cycle_edges(&ctx.graph_edges, &ctx.analyses);
+            assert_eq!(edges.len(), 2, "{ext}");
+            assert!(edges.iter().all(|(_, _, label)| label == "type_import"));
+            let (strict, lazy) = crate::analyzer::cycles::find_cycles_with_lazy(&edges);
+            assert!(strict.is_empty() && lazy.is_empty(), "{ext}");
+        }
+    }
 
     /// F5 — a cycle formed only by `#[cfg(test)]`-only files (a fixture
     /// loader, a test module's own `include_str!` self-reference, …) must

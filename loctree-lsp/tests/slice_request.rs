@@ -6,7 +6,10 @@
 //!
 //! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders ⓒ 2025-2026 Vetcoders
 
-use loctree::slicer::{HolographicSlice, SliceFile, SliceStats};
+use loctree::slicer::{
+    ConsumerCoverage, ConsumerCoverageStatus, ConsumerDiagnostic, ConsumerDiagnosticReason,
+    ConsumerDiagnosticScope, HolographicSlice, SliceFile, SliceStats,
+};
 use loctree_lsp::{CursorState, ResponseIdentity, SliceParams, SliceResponse};
 
 fn slice_file(
@@ -36,6 +39,18 @@ fn fixture_slice() -> HolographicSlice {
             slice_file("src/inner/mod.rs", "deps", 7, 2),
         ],
         consumers: vec![slice_file("tests/it.rs", "consumers", 13, 1)],
+        consumer_coverage: ConsumerCoverage {
+            status: ConsumerCoverageStatus::Partial,
+            snapshot_reexports: 1,
+            reachable_barrels: 1,
+            diagnostics: vec![ConsumerDiagnostic {
+                scope: ConsumerDiagnosticScope::TargetReachable,
+                reason: ConsumerDiagnosticReason::WildcardReexports,
+                count: 1,
+                message: "Wildcard collision attribution remains uncertain.".into(),
+            }],
+            ..Default::default()
+        },
         symbol_consumers: vec![],
         core_symbols: vec![],
         authority_labels: vec![],
@@ -113,6 +128,7 @@ fn response_maps_holographic_slice() {
 
     assert_eq!(response.total_files, 4);
     assert_eq!(response.total_loc, 83);
+    assert_eq!(response.consumer_coverage, slice.consumer_coverage);
 }
 
 #[test]
@@ -121,13 +137,20 @@ fn response_serializes_to_pointer_only_shape() {
     let response = SliceResponse::from_holographic(&slice);
     let json = serde_json::to_value(&response).expect("response serializes");
 
-    // Top-level shape: core, deps, consumers, total_files, total_loc.
+    // Additive coverage metadata; existing paths-only layers are unchanged.
     let obj = json.as_object().expect("response is a JSON object");
     let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
     keys.sort();
     assert_eq!(
         keys,
-        ["consumers", "core", "deps", "total_files", "total_loc"]
+        [
+            "consumer_coverage",
+            "consumers",
+            "core",
+            "deps",
+            "total_files",
+            "total_loc"
+        ]
     );
 
     // No inline content key sneaks in (paths-only contract).
@@ -191,6 +214,7 @@ fn empty_slice_yields_zero_totals() {
         core: vec![],
         deps: vec![],
         consumers: vec![],
+        consumer_coverage: Default::default(),
         symbol_consumers: vec![],
         core_symbols: vec![],
         authority_labels: vec![],
@@ -272,6 +296,12 @@ fn large_consumer_layer_round_trips_through_cursor_pages() {
     assert_eq!(final_page.consumers.data[19].path, "tests/consumer_79.rs");
     assert!(final_page.consumers.next_cursor.is_none());
 
+    for page in [&first, &second, &final_page] {
+        assert_eq!(
+            serde_json::to_value(page).expect("page JSON")["consumer_coverage"],
+            serde_json::to_value(&slice.consumer_coverage).expect("library coverage")
+        );
+    }
     let all_paths: Vec<_> = first
         .consumers
         .data

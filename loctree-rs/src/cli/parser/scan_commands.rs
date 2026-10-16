@@ -324,8 +324,9 @@ USAGE:
 
 DESCRIPTION:
     Displays a hierarchical tree view of your codebase structure,
-    annotated with lines of code (LOC) metrics for each directory
-    and file. Helps understand code distribution and organization.
+    annotated with text line counts for measurable files. Binary, invalid
+    UTF-8 and unreadable files remain listed without LOC (JSON: null);
+    empty text has 0 LOC. Summary LOC totals use measured files.
 
     Similar to 'tree' command but with LOC counting and better
     handling of gitignored files.

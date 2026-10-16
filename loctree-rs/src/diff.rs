@@ -578,6 +578,7 @@ mod tests {
     fn mock_metadata() -> crate::snapshot::SnapshotMetadata {
         crate::snapshot::SnapshotMetadata {
             schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_string(),
+            analysis_generation: crate::snapshot::ANALYSIS_GENERATION.to_string(),
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             roots: vec![".".to_string()],
             languages: std::collections::HashSet::new(),

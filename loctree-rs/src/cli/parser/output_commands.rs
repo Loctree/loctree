@@ -718,6 +718,38 @@ pub(super) fn parse_jq_query_command(
 // Tests
 // ============================================================================
 
+pub(super) fn parse_history_command(args: &[String]) -> Result<Command, String> {
+    let mut opts = crate::cli::command::HistoryOptions::default();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--at" => opts.at = args.next().ok_or("--at requires a Git revision")?.clone(),
+            "--limit" => {
+                opts.limit = args
+                    .next()
+                    .ok_or("--limit requires a number")?
+                    .parse()
+                    .map_err(|_| "--limit must be 1..1000")?;
+                if !(1..=1000).contains(&opts.limit) {
+                    return Err("--limit must be 1..1000".to_owned());
+                }
+            }
+            "--help" | "-h" => {
+                return Ok(Command::Help(HelpOptions {
+                    command: Some("history".to_owned()),
+                    ..Default::default()
+                }));
+            }
+            value if value.starts_with('-') => {
+                return Err(format!("Unknown history option: {value}"));
+            }
+            value if opts.file.is_none() => opts.file = Some(value.to_owned()),
+            value => return Err(format!("Unexpected history argument: {value}")),
+        }
+    }
+    Ok(Command::History(opts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

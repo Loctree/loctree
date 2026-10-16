@@ -4,20 +4,20 @@
 //! Differentiates between strict cycles (always circular) and
 //! lazy cycles (circular only via lazy/dynamic imports).
 
-use crate::components::icons::{ICON_SIREN, ICON_WARNING_CIRCLE, Icon};
+use crate::components::icons::{ICON_WARNING_CIRCLE, Icon};
 use leptos::prelude::*;
 
 /// Displays circular import cycles with visual differentiation
-/// between strict (critical) and lazy (warning) cycles.
+/// between strict (structural) and lazy (review) cycles.
 ///
 /// # Props
 ///
-/// * `strict_cycles` - Vec of cycles that break immediately (A → B → C → A)
+/// * `strict_cycles` - Vec of cycles of eager dependency edges (A → B → C → A)
 /// * `lazy_cycles` - Vec of cycles only via lazy imports (can be resolved at runtime)
 ///
 /// # Display
 ///
-/// - Strict cycles shown in red with ICON_SIREN (critical)
+/// - Strict cycles shown as structural review evidence
 /// - Lazy cycles shown in yellow/orange with ICON_WARNING_CIRCLE (warning)
 /// - Each cycle rendered as: A → B → C → A
 /// - Empty state when no cycles detected
@@ -38,7 +38,7 @@ use leptos::prelude::*;
 /// ```
 #[component]
 pub fn Cycles(
-    /// Strict circular imports (break immediately)
+    /// Strict dependency cycles (execution outcome unverified)
     strict_cycles: Vec<Vec<String>>,
     /// Lazy circular imports (via dynamic/lazy imports only)
     lazy_cycles: Vec<Vec<String>>,
@@ -72,17 +72,17 @@ pub fn Cycles(
                 <span class="count-badge count-badge-warning">{total_count.to_string()}</span>
             </h3>
 
-            // Strict Cycles Section (Critical)
+            // Strict Cycles Section (Structural)
             {if strict_count > 0 {
                 view! {
                     <div class="cycles-section cycles-section-strict">
                         <div class="cycles-section-header">
-                            <Icon path=ICON_SIREN color="#c0392b" />
+                            <Icon path=ICON_WARNING_CIRCLE color="#e67e22" />
                             <h4>"Strict Cycles"</h4>
-                            <span class="count-badge count-badge-critical">{strict_count.to_string()}</span>
+                            <span class="count-badge count-badge-warning">{strict_count.to_string()}</span>
                         </div>
                         <p class="cycles-section-desc">
-                            "Critical: These cycles break immediately and should be resolved."
+                            "Structural coupling: compiler/runtime outcome unverified. Review initialization order and value access."
                         </p>
                         <div class="cycles-list">
                             {strict_cycles.into_iter().enumerate().map(|(idx, cycle)| {

@@ -12,6 +12,7 @@ pub mod deprecation;
 pub mod diff;
 pub mod doctor;
 pub mod env_truth;
+pub mod history;
 pub mod inventory;
 pub mod occurrences;
 pub mod output;

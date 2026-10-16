@@ -525,8 +525,9 @@ impl TwinClass {
     }
 }
 
-/// Dead parrots on `loct twins` use this cap and do not spend `--limit`.
-/// `follow twins` emits none.
+/// Historical dead-parrot cap, retained for source compatibility.
+/// `loct twins` now pages all finding families globally; `follow twins` emits
+/// no dead parrots.
 pub const DEAD_PARROTS_PAGE_CAP: usize = 10;
 
 fn twin_class_page_rank(class: TwinClass) -> u8 {
@@ -710,23 +711,42 @@ pub struct ExactTwin {
     pub shape_match: bool,
     /// W1-03 / W2-01 contract: the project manifest declares exactly one
     /// non-test module/target (Package.swift with one `.target` /
-    /// `.executableTarget`). Never inferred from language identity.
+    /// `.executableTarget`). `false` means not established, including unknown
+    /// source ownership; never inferred from language identity.
     #[serde(default)]
     pub single_module_target: bool,
     /// W1-03 / W2-01 contract: shapeless collision inside a single-module
     /// target must not feed health/score. The sensor still lists the group.
-    /// Equal to `!shape_match && single_module_target`.
+    /// Also true for shape-backed candidates whose owned source evidence is
+    /// unavailable. Those remain visible, but require verification before action.
     #[serde(default)]
     pub exclude_from_score: bool,
 }
 
 /// Page order: EXACT and SHAPE_SIMILAR, then NAME_COLLISION and IDIOM.
-/// Within a class, longer location lists stay first (stable).
+/// Within a class, longer location lists stay first, then names break ties.
+/// Locations use the detector's canonical preference (imports, shortest path,
+/// alphabetical tie). Pin that preference before paging, including cold scans
+/// whose file traversal order may differ from the sorted persisted snapshot.
 pub fn order_twins_for_page(twins: &mut [ExactTwin]) {
+    for twin in twins.iter_mut() {
+        twin.locations.sort_by(|a, b| {
+            b.import_count
+                .cmp(&a.import_count)
+                .then(a.file_path.len().cmp(&b.file_path.len()))
+                .then(a.file_path.cmp(&b.file_path))
+                .then(a.line.cmp(&b.line))
+                .then(a.kind.cmp(&b.kind))
+        });
+        for (index, location) in twin.locations.iter_mut().enumerate() {
+            location.is_canonical = index == 0;
+        }
+    }
     twins.sort_by(|a, b| {
         twin_class_page_rank(a.class)
             .cmp(&twin_class_page_rank(b.class))
             .then(b.locations.len().cmp(&a.locations.len()))
+            .then_with(|| a.name.cmp(&b.name))
     });
 }
 
@@ -781,24 +801,136 @@ pub fn omit_from_duplicate_groups(twin: &ExactTwin) -> bool {
 }
 
 /// Manifest-derived: the project declares exactly one non-test SwiftPM target.
-/// No `Package.swift`, or more than one product target, is not single-module.
-/// Language identity is never consulted.
-pub fn project_is_single_module_target(analyses: &[FileAnalysis]) -> bool {
-    let mut saw_single = false;
-    for analysis in analyses {
-        let path = analysis.path.replace('\\', "/");
-        if !path.ends_with("Package.swift") {
-            continue;
-        }
-        let Ok(src) = std::fs::read_to_string(&analysis.path) else {
-            return false;
-        };
-        match count_swiftpm_product_targets(&src) {
-            1 => saw_single = true,
-            _ => return false,
+/// Legacy rootless query: without an owner this fact is unproven (`false`).
+/// Production detection uses `TwinSources` to prove the per-owner manifest
+/// gate. Language identity is never consulted.
+pub fn project_is_single_module_target(_analyses: &[FileAnalysis]) -> bool {
+    // Without an explicit source owner the manifest fact is unproven.
+    false
+}
+
+/// Filesystem evidence for one twin computation. Display paths and SymbolIDs
+/// stay untouched. Only explicit, canonical project roots authorize reads.
+/// Relative paths in a multi-root snapshot have no recorded per-file owner;
+/// they are unknown, never assigned to the first root or searched by existence.
+#[derive(Default)]
+pub struct TwinSources {
+    // Preserve the declared spelling as well as realpath (macOS /var alias).
+    // Lexical ownership is chosen before the confinement gate follows symlinks.
+    roots: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    allow_relative: bool,
+    contents: HashMap<String, Option<String>>,
+}
+
+impl TwinSources {
+    pub fn for_root(root: &std::path::Path) -> Self {
+        Self {
+            roots: std::path::absolute(root)
+                .ok()
+                .and_then(|declared| {
+                    root.canonicalize()
+                        .ok()
+                        .map(|canonical| (declared, canonical))
+                })
+                .into_iter()
+                .collect(),
+            allow_relative: true,
+            ..Self::default()
         }
     }
-    saw_single
+
+    pub fn for_snapshot(snapshot: &crate::snapshot::Snapshot) -> Self {
+        let roots = snapshot
+            .metadata
+            .roots
+            .iter()
+            .map(std::path::PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .filter_map(|root| root.canonicalize().ok().map(|canonical| (root, canonical)))
+            .collect();
+        Self {
+            roots,
+            // Missing/relative owners must not collapse a multi-root snapshot
+            // into apparent single-root provenance.
+            allow_relative: snapshot.metadata.roots.len() == 1,
+            ..Self::default()
+        }
+    }
+
+    /// A request root may rebase a single-root snapshot, but cannot erase
+    /// multiple source owners recorded by a multi-root scan.
+    pub fn for_request(snapshot: &crate::snapshot::Snapshot, root: &std::path::Path) -> Self {
+        if snapshot.metadata.roots.len() > 1 {
+            Self::for_snapshot(snapshot)
+        } else {
+            Self::for_root(root)
+        }
+    }
+
+    fn owner(&self, file: &str) -> Option<&std::path::Path> {
+        let path = std::path::Path::new(file);
+        if path.is_absolute() {
+            self.roots
+                .iter()
+                .filter(|(declared, canonical)| {
+                    path.starts_with(declared) || path.starts_with(canonical)
+                })
+                .max_by_key(|(declared, canonical)| {
+                    declared
+                        .components()
+                        .count()
+                        .max(canonical.components().count())
+                })
+                .map(|(_, canonical)| canonical.as_path())
+        } else if self.allow_relative && self.roots.len() == 1 {
+            Some(self.roots[0].1.as_path())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn read(&mut self, file: &str) -> Option<&str> {
+        if !self.contents.contains_key(file) {
+            let content = self.owner(file).and_then(|root| {
+                let path = root.join(file);
+                crate::fs_utils::read_to_string_within(root, &path).ok()
+            });
+            self.contents.insert(file.to_string(), content);
+        }
+        self.contents
+            .get(file)
+            .and_then(|content| content.as_deref())
+    }
+
+    fn single_module_for(&mut self, analyses: &[FileAnalysis], locations: &[TwinLocation]) -> bool {
+        let Some(owner) = locations
+            .first()
+            .and_then(|loc| self.owner(&loc.file_path))
+            .map(|p| p.to_path_buf())
+        else {
+            return false;
+        };
+        if locations
+            .iter()
+            .any(|loc| self.owner(&loc.file_path) != Some(owner.as_path()))
+        {
+            return false;
+        }
+        let manifests: Vec<_> = analyses
+            .iter()
+            .filter(|a| {
+                std::path::Path::new(&a.path)
+                    .file_name()
+                    .is_some_and(|name| name == "Package.swift")
+                    && self.owner(&a.path) == Some(owner.as_path())
+            })
+            .collect();
+        !manifests.is_empty()
+            && manifests.iter().all(|a| {
+                self.read(&a.path)
+                    .is_some_and(|src| count_swiftpm_product_targets(src) == 1)
+            })
+    }
 }
 
 /// Language category for twin classification
@@ -1108,6 +1240,9 @@ pub fn twin_action(twin: &ExactTwin) -> &'static str {
     if twin.classification == TwinClassification::Mirror {
         return "verify the mirror contract is current; do not consolidate";
     }
+    if twin.exclude_from_score && matches!(twin.class, TwinClass::Exact | TwinClass::ShapeSimilar) {
+        return "verify owned source and target evidence before consolidation; excluded from score";
+    }
     // "Consolidate" is earned by shape evidence (class EXACT), never by name
     // equality alone.
     match twin.class {
@@ -1149,7 +1284,11 @@ fn fingerprint_similarity(fp1: &str, fp2: &str) -> f32 {
 
 /// Compute average pairwise similarity for a group of fingerprints.
 fn compute_group_similarity(fingerprints: &[Option<String>]) -> Option<f32> {
-    let valid_fps: Vec<&String> = fingerprints.iter().filter_map(|f| f.as_ref()).collect();
+    let mut valid_fps: Vec<&String> = fingerprints.iter().filter_map(|f| f.as_ref()).collect();
+    // Registry iteration is randomized per process. Keep the same f32 pairwise
+    // mean (including repeated signatures), but accumulate in canonical order.
+    // Sorting locations later cannot undo order-dependent floating point sums.
+    valid_fps.sort_unstable();
 
     if valid_fps.len() < 2 {
         return None; // Need at least 2 to compare
@@ -1260,6 +1399,22 @@ pub fn detect_exact_twins_with_frameworks(
     include_tests: bool,
     frameworks: Option<&[crate::analyzer::frameworks::Framework]>,
 ) -> Vec<ExactTwin> {
+    detect_exact_twins_with_sources(
+        analyses,
+        include_tests,
+        frameworks,
+        &mut TwinSources::default(),
+    )
+}
+
+/// Root-aware twin pipeline; the rootless API retains AST evidence only and
+/// qualifies unavailable source instead of reading the caller's directory.
+pub fn detect_exact_twins_with_sources(
+    analyses: &[FileAnalysis],
+    include_tests: bool,
+    frameworks: Option<&[crate::analyzer::frameworks::Framework]>,
+    sources: &mut TwinSources,
+) -> Vec<ExactTwin> {
     let registry = build_symbol_registry(analyses, include_tests);
 
     // Methods declared inside impl blocks (regex-based Rust extraction exports
@@ -1294,9 +1449,6 @@ pub fn detect_exact_twins_with_frameworks(
 
     // Get frameworks slice for filtering
     let fw_slice = frameworks.unwrap_or(&[]);
-
-    // Manifest-derived project fact — computed once, applied to every group.
-    let single_module_target = project_is_single_module_target(analyses);
 
     // Filter to only symbols exported from multiple files
     let mut twins: Vec<ExactTwin> = Vec::new();
@@ -1370,19 +1522,28 @@ pub fn detect_exact_twins_with_frameworks(
 
         // Class B: Token from a comment block flagged as a type declaration.
         let mut is_comment = false;
+        let mut source_unknown = false;
         for loc in &locations {
-            if let Ok(content) = std::fs::read_to_string(&loc.file_path)
+            if let Some(content) = sources.read(&loc.file_path)
                 && let Some(line) = content.lines().nth(loc.line.saturating_sub(1))
             {
                 let trimmed = line.trim();
                 if trimmed.starts_with("//")
                     || trimmed.starts_with("/*")
                     || trimmed.starts_with("*")
-                    || trimmed.starts_with("#")
+                    || (trimmed.starts_with('#')
+                        && matches!(
+                            std::path::Path::new(&loc.file_path)
+                                .extension()
+                                .and_then(|e| e.to_str()),
+                            Some("py" | "pyi" | "sh" | "bash" | "zsh")
+                        ))
                 {
                     is_comment = true;
                     break;
                 }
+            } else {
+                source_unknown = true;
             }
         }
         if is_comment {
@@ -1464,6 +1625,7 @@ pub fn detect_exact_twins_with_frameworks(
         };
 
         let shape_match = locations_have_shape_match(&locations);
+        let single_module_target = sources.single_module_for(analyses, &locations);
         twins.push(ExactTwin {
             name,
             locations,
@@ -1472,7 +1634,8 @@ pub fn detect_exact_twins_with_frameworks(
             class,
             shape_match,
             single_module_target,
-            exclude_from_score: !shape_match && single_module_target,
+            exclude_from_score: (!shape_match && single_module_target)
+                || (source_unknown && matches!(class, TwinClass::Exact | TwinClass::ShapeSimilar)),
         });
     }
 
@@ -1640,6 +1803,39 @@ pub fn print_exact_twins(twins: &[ExactTwin], output: OutputMode) {
 mod tests {
     use super::*;
     use crate::types::{ExportSymbol, ImportEntry, ImportKind, ImportSymbol};
+
+    #[test]
+    fn group_similarity_is_bit_exact_for_every_fingerprint_permutation() {
+        fn permute(values: &mut [Option<String>], start: usize, expected: u32) {
+            if start == values.len() {
+                assert_eq!(
+                    compute_group_similarity(values)
+                        .expect("pair mean")
+                        .to_bits(),
+                    expected
+                );
+                return;
+            }
+            for i in start..values.len() {
+                values.swap(start, i);
+                permute(values, start + 1, expected);
+                values.swap(start, i);
+            }
+        }
+        let mut values = ["A,B,C|D", "A|B", "C|D,E", "A,B,C|D", "Z|Q", "A|D,E,F"]
+            .map(|s| Some(s.to_string()))
+            .to_vec();
+        values.push(None);
+        let expected = compute_group_similarity(&values)
+            .expect("pair mean")
+            .to_bits();
+        permute(&mut values, 0, expected);
+        assert_eq!(compute_group_similarity(&[None, Some("A|B".into())]), None);
+        assert_eq!(
+            compute_group_similarity(&[Some("A|B".into()), Some("A|B".into())]),
+            Some(1.0)
+        );
+    }
 
     fn mock_file_with_exports(path: &str, exports: Vec<(&str, &str)>) -> FileAnalysis {
         FileAnalysis {
@@ -2255,13 +2451,15 @@ let package = Package(
 )
 "#,
         );
-        let twins = detect_exact_twins(
+        let twins = detect_exact_twins_with_sources(
             &[
                 manifest,
                 mock_file_with_exports("Sources/UI/A.swift", vec![("text", "let")]),
                 mock_file_with_exports("Sources/UI/B.swift", vec![("text", "let")]),
             ],
             false,
+            None,
+            &mut TwinSources::for_root(&dir),
         );
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(twins.len(), 1, "sensor must still list the group");
@@ -2292,13 +2490,15 @@ let package = Package(
 )
 "#,
         );
-        let twins = detect_exact_twins(
+        let twins = detect_exact_twins_with_sources(
             &[
                 manifest,
                 mock_file_with_exports("Sources/App/A.swift", vec![("text", "let")]),
                 mock_file_with_exports("Sources/Kit/B.swift", vec![("text", "let")]),
             ],
             false,
+            None,
+            &mut TwinSources::for_root(&dir),
         );
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(twins.len(), 1, "sensor must still list the group");
@@ -2427,18 +2627,35 @@ let package = Package(
             page_twin("shape", TwinClass::ShapeSimilar, 3),
             page_twin("exact_small", TwinClass::Exact, 2),
         ];
+        // Cold traversal order and stale canonical ties must not leak into
+        // a later page's location prefix.
+        for twin in &mut twins {
+            twin.locations.reverse();
+            for location in &mut twin.locations {
+                location.is_canonical = true;
+            }
+        }
         order_twins_for_page(&mut twins);
         let names: Vec<_> = twins.iter().map(|twin| twin.name.as_str()).collect();
         assert_eq!(
             names,
             vec![
-                "keep_me_visible",
                 "exact_small",
+                "keep_me_visible",
                 "shape",
                 "body",
                 "from_env",
             ]
         );
+        for twin in &twins {
+            assert!(twin.locations[0].is_canonical);
+            assert!(
+                twin.locations[1..]
+                    .iter()
+                    .all(|location| !location.is_canonical)
+            );
+            assert_eq!(twin.locations[0].file_path, format!("{}-0.rs", twin.name));
+        }
     }
 
     #[test]
@@ -2475,5 +2692,130 @@ let package = Package(
             page_family_windows(&[5, 4], 0, Some(3)),
             vec![(0, 3), (0, 0)]
         );
+    }
+}
+
+#[cfg(test)]
+mod source_evidence_tests {
+    use super::*;
+
+    fn file(path: &str) -> FileAnalysis {
+        let mut file = FileAnalysis::new(path.to_string());
+        file.exports.push(crate::types::ExportSymbol {
+            name: "shared".into(),
+            kind: "function".into(),
+            export_type: "named".into(),
+            line: Some(1),
+            params: Vec::new(),
+            symbol_id: Default::default(),
+        });
+        file.signature_uses.push(crate::types::SignatureUse {
+            function: "shared".into(),
+            usage: crate::types::SignatureUseKind::Parameter,
+            type_name: "Input".into(),
+            line: Some(1),
+        });
+        file
+    }
+
+    #[test]
+    fn missing_owned_source_retains_sensor_with_verification_action() {
+        let root = tempfile::tempdir().expect("root");
+        let files = [file("a.rs"), file("b.rs")];
+        let twins = detect_exact_twins_with_sources(
+            &files,
+            false,
+            None,
+            &mut TwinSources::for_root(root.path()),
+        );
+        assert_eq!(twins.len(), 1);
+        assert_eq!(twins[0].class, TwinClass::Exact);
+        assert!(twins[0].exclude_from_score);
+        assert!(twin_action(&twins[0]).contains("verify owned source"));
+        assert!(!twins[0].single_module_target);
+    }
+
+    #[test]
+    fn multiroot_relative_paths_never_borrow_first_existing_source() {
+        let first = tempfile::tempdir().expect("first");
+        let second = tempfile::tempdir().expect("second");
+        for root in [first.path(), second.path()] {
+            std::fs::write(root.join("a.rs"), "// foreign comment").expect("write");
+            std::fs::write(root.join("b.rs"), "// foreign comment").expect("write");
+        }
+        let mut snapshot = crate::snapshot::Snapshot::new(vec![
+            first.path().display().to_string(),
+            second.path().display().to_string(),
+        ]);
+        snapshot.files = vec![file("a.rs"), file("b.rs")];
+        let twins = detect_exact_twins_with_sources(
+            &snapshot.files,
+            false,
+            None,
+            &mut TwinSources::for_request(&snapshot, first.path()),
+        );
+        assert_eq!(
+            twins.len(),
+            1,
+            "ambiguous sources cannot suppress sensor rows"
+        );
+        assert!(twins[0].exclude_from_score);
+        let mut missing_owner = snapshot.clone();
+        missing_owner.metadata.roots[1] = second.path().join("missing-root").display().to_string();
+        let ambiguous = detect_exact_twins_with_sources(
+            &missing_owner.files,
+            false,
+            None,
+            &mut TwinSources::for_snapshot(&missing_owner),
+        );
+        assert_eq!(
+            ambiguous.len(),
+            1,
+            "missing owner cannot authorize the other root's comments"
+        );
+        assert!(ambiguous[0].exclude_from_score);
+        // Absolute, owned paths in distinct roots remain valid and retain identity.
+        for (idx, root) in [first.path(), second.path()].iter().enumerate() {
+            let path = root.join("owned.rs");
+            std::fs::write(&path, "pub fn shared() {}\n").expect("write");
+            snapshot.files[idx].path = path.display().to_string();
+        }
+        let twins = detect_exact_twins_with_sources(
+            &snapshot.files,
+            false,
+            None,
+            &mut TwinSources::for_snapshot(&snapshot),
+        );
+        assert_eq!(twins.len(), 1);
+        assert!(!twins[0].exclude_from_score);
+        assert!(!twins[0].single_module_target);
+        assert!(
+            twins[0]
+                .locations
+                .iter()
+                .all(|l| std::path::Path::new(&l.file_path).is_absolute())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_and_parent_escape_are_unknown_even_when_target_has_comments() {
+        let root = tempfile::tempdir().expect("root");
+        let foreign = tempfile::tempdir().expect("foreign");
+        let target = foreign.path().join("foreign.rs");
+        std::fs::write(&target, "// foreign evidence").expect("write");
+        std::os::unix::fs::symlink(&target, root.path().join("a.rs")).expect("symlink");
+        let mut sources = TwinSources::for_root(root.path());
+        assert!(sources.read("a.rs").is_none());
+        assert!(sources.read(target.to_str().expect("utf8")).is_none());
+        assert!(sources.read("../foreign.rs").is_none());
+        let twins = detect_exact_twins_with_sources(
+            &[file("a.rs"), file("b.rs")],
+            false,
+            None,
+            &mut sources,
+        );
+        assert_eq!(twins.len(), 1);
+        assert!(twins[0].exclude_from_score);
     }
 }

@@ -21,10 +21,12 @@
         <br/><br/>
         The plugin starts the native loctree language server for
         supported files (TypeScript, JavaScript, Rust, Python, Go) and
-        surfaces standard LSP diagnostics, hover, navigation, and code
-        actions, plus Loctree-specific tooling: Context Pack cards,
+        surfaces pushed diagnostics, advertised code actions and opt-in
+        code lenses, plus Loctree-specific tooling: Context Pack cards,
         literal occurrences, symbol bodies, impact analysis, holographic
-        slices, and secondary findings.
+        slices, and secondary findings. Standard hover, go-to-definition and
+        references remain owned by the IDE's native language providers;
+        loctree-lsp does not advertise those providers.
         <br/><br/>
         <b>Requires a paid JetBrains IDE on the 2025.2.1+ line</b> —
         IntelliJ IDEA Ultimate, WebStorm, PyCharm Professional, GoLand,
@@ -50,7 +52,7 @@
         <p>Initial Marketplace release.</p>
         <ul>
             <li>Native IntelliJ LSP integration for the <b>loctree-lsp</b>
-                server: diagnostics, hover, navigation, and code actions for
+                server: pushed diagnostics, code actions and opt-in code lenses for
                 TypeScript, JavaScript, Rust, Python, and Go.</li>
             <li>Loctree tool window with routed query modes — Health, Find,
                 Literal, Body, Follow, Slice, Impact, Context Atlas, Context

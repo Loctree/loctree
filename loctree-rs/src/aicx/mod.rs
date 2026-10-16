@@ -26,6 +26,11 @@
 //!
 //! When neither transport can produce data, the wrapper returns an empty result.
 
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 #[cfg(feature = "aicx-inprocess")]
 mod inprocess;
 mod intent_source;
@@ -891,7 +896,7 @@ enum AicxMode {
 
 impl AicxMode {
     fn from_env() -> Self {
-        match std::env::var(AICX_MODE_ENV)
+        match env::var(AICX_MODE_ENV)
             .ok()
             .map(|raw| raw.trim().to_ascii_lowercase())
             .as_deref()
@@ -1682,8 +1687,7 @@ mod tests {
     }
 
     fn clear_aicx_env() {
-        // Tests in this module are serialised on the `aicx_env` group because
-        // they mutate process-global env vars; `test_env` holds the unsafe.
+        // Clear this test thread's injected transport settings.
         {
             crate::test_env::remove_var(AICX_BINARY_ENV);
             crate::test_env::remove_var(AICX_MODE_ENV);
@@ -1904,8 +1908,6 @@ done
     #[serial_test::serial(aicx_env)]
     fn client_returns_empty_when_aicx_not_installed() {
         // Point the wrapper at a path that cannot be spawned.
-        // SAFETY: tests in this module are serialised on the `aicx_env` group
-        // because they mutate process-global env vars.
         {
             clear_aicx_env();
             enable_aicx_for_test();

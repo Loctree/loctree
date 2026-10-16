@@ -2,6 +2,11 @@
 //!
 //! Loads optional `.loctree/config.toml` from project root.
 
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use serde::Deserialize;
 use std::path::Path;
 
@@ -115,7 +120,7 @@ impl LoctreeConfig {
     /// Unknown values silently fall back to `oxc` so config typos never
     /// degrade analyzer behavior.
     pub fn parser_strategy(&self) -> &'static str {
-        if let Ok(env) = std::env::var("LOCTREE_PARSER") {
+        if let Ok(env) = env::var("LOCTREE_PARSER") {
             return normalize_parser_strategy(&env);
         }
         normalize_parser_strategy(&self.analyzer.parser)
@@ -209,10 +214,7 @@ invalid_command_names = ["npm"]
     #[test]
     #[serial_test::serial(loctree_parser_env)]
     fn parser_strategy_defaults_to_oxc() {
-        // Avoid env-var leakage when other tests set LOCTREE_PARSER. The
-        // serial group is what makes the test_env helper's unsafe sound:
-        // unit tests run on parallel threads, so every LOCTREE_PARSER
-        // mutation in this process must share the group.
+        // Inject an absent parser setting for this test only.
         {
             crate::test_env::remove_var("LOCTREE_PARSER");
         }

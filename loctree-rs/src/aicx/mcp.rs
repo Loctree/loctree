@@ -5,6 +5,11 @@
 //! persistent rmcp client session to `aicx-mcp --transport stdio`, then maps MCP
 //! tool output back into the same typed records produced by the shell transport.
 
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -84,6 +89,8 @@ impl AicxMcpClient {
         let service = run_blocking_on(&runtime, async {
             let mut command = tokio::process::Command::new(aicx_mcp_binary());
             command.arg("--transport").arg("stdio");
+            #[cfg(test)]
+            crate::test_env::apply(command.as_std_mut());
             let (transport, _stderr) = TokioChildProcess::builder(command)
                 .stderr(Stdio::null())
                 .spawn()
@@ -240,13 +247,13 @@ impl AicxMcpClient {
 }
 
 fn aicx_mcp_binary() -> PathBuf {
-    std::env::var(AICX_MCP_BINARY_ENV)
+    env::var(AICX_MCP_BINARY_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("aicx-mcp"))
 }
 
 fn mcp_call_timeout() -> Duration {
-    std::env::var(shell::AICX_TIMEOUT_ENV)
+    env::var(shell::AICX_TIMEOUT_ENV)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -401,7 +408,7 @@ mod tests {
     #[test]
     #[serial_test::serial(aicx_env)]
     fn mcp_call_timeout_honors_aicx_timeout_env() {
-        let old_value = std::env::var(shell::AICX_TIMEOUT_ENV).ok();
+        let old_value = env::var(shell::AICX_TIMEOUT_ENV).ok();
         {
             crate::test_env::set_var(shell::AICX_TIMEOUT_ENV, "60");
         }

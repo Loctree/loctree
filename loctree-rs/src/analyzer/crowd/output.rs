@@ -97,27 +97,32 @@ pub fn format_crowd(crowd: &Crowd, _verbose: bool) -> String {
     // Issues
     if !crowd.issues.is_empty() {
         lines.push(String::new());
-        lines.push("=== ISSUES DETECTED ===".to_string());
+        lines.push("=== EVIDENCED REVIEW CANDIDATES ===".to_string());
+        lines.push(
+            "Namespace/platform variants may be intentional; no duplication or deletion verdict."
+                .to_string(),
+        );
 
         for issue in &crowd.issues {
             match issue {
                 CrowdIssue::NameCollision { files } => {
                     lines.push(format!(
-                        "  - Name collision: {} files with similar names",
-                        files.len()
+                        "  - Name collision candidate (exact case-sensitive leaf stem): {}",
+                        files.join(", ")
                     ));
                 }
                 CrowdIssue::UsageAsymmetry { primary, underused } => {
                     lines.push(format!(
-                        "  - Usage asymmetry: {} is primary, {} underused",
+                        "  - Usage comparison candidate (same stem or shared exports): {} has more importers than [{}]; lower usage alone is not a defect",
                         primary,
-                        underused.len()
+                        underused.join(", ")
                     ));
                 }
-                CrowdIssue::ExportOverlap { files, overlap: _ } => {
+                CrowdIssue::ExportOverlap { files, overlap } => {
                     lines.push(format!(
-                        "  - Export overlap: {} files export similar things",
-                        files.len()
+                        "  - Export overlap candidate: [{}] share indexed names [{}] (not implementation equivalence)",
+                        files.join(", "),
+                        overlap.join(", ")
                     ));
                 }
                 CrowdIssue::Fragmentation { categories } => {

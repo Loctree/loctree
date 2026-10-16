@@ -293,9 +293,9 @@ impl FindOptions {
 
 /// Options for the `occurrences` command — literal exact-identifier scan.
 ///
-/// Unlike `find`, this never consults the AST/tagmap and never promotes a
-/// fuzzy suggestion. It walks raw snapshot file bytes and reports every
-/// identifier-boundary occurrence so that "not found" means not found.
+/// Literal inclusion walks raw snapshot file bytes, independently of symbol
+/// extraction, and never promotes fuzzy suggestions. Qualified role metadata
+/// may use source AST spans and snapshot anchors without widening that matching.
 #[derive(Debug, Clone, Default)]
 pub struct OccurrencesOptions {
     /// The exact identifier to scan for.
@@ -963,22 +963,22 @@ impl Default for FocusOptions {
 }
 
 /// Options for the `hotspots` command.
-/// Shows import frequency heatmap - which files are core vs peripheral.
+/// Shows static dependency degree bands, not architectural roles.
 #[derive(Debug, Clone, Default)]
 pub struct HotspotsOptions {
     /// Root directory (defaults to current directory)
     pub root: Option<PathBuf>,
 
-    /// Minimum import count to show (default: 1)
+    /// Minimum distinct known-file incoming degree (default: 0)
     pub min_imports: Option<usize>,
 
     /// Maximum files to show (default: 50)
     pub limit: Option<usize>,
 
-    /// Show only files with zero importers (leaf nodes)
+    /// Show only zero incoming degree; overrides min_imports
     pub leaves_only: bool,
 
-    /// Show coupling score (out-degree / files that import many others)
+    /// Include distinct known-file outgoing degree in text output
     pub coupling: bool,
 }
 
@@ -1351,4 +1351,21 @@ pub struct AtlasOptions {
 
     /// Emit machine-readable pointer JSON to stdout.
     pub json: bool,
+}
+
+/// Bounded Git timeline, optionally scoped to one file.
+#[derive(Debug, Clone)]
+pub struct HistoryOptions {
+    pub file: Option<String>,
+    pub at: String,
+    pub limit: usize,
+}
+impl Default for HistoryOptions {
+    fn default() -> Self {
+        Self {
+            file: None,
+            at: "HEAD".to_owned(),
+            limit: 20,
+        }
+    }
 }

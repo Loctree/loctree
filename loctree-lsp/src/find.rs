@@ -13,7 +13,8 @@ use std::path::PathBuf;
 use loctree::analyzer::classify::language_from_path;
 use loctree::analyzer::dead_parrots::{SimilarityCandidate, SymbolFileMatch, SymbolMatchKind};
 use loctree::analyzer::occurrences::{
-    FileScope, OccurrenceResults, ReportOptions, ScanOptions, scan_files_for_literal_query,
+    FileScope, OccurrenceResults, ReportOptions, ScanOptions, enrich_with_snapshot,
+    scan_files_for_literal_query,
 };
 use loctree::analyzer::search::{
     CrossMatchFile, FuzzySuggestion, ParamMatch, SearchResults, SuppressionMatch,
@@ -450,10 +451,26 @@ fn paginate_response(
 /// identical file/line set for a given snapshot (including agent pipe-OR
 /// `A|B`). Only the file-enumeration glue is mirrored from the CLI handler
 /// (`read_snapshot_contents`); there is no second scanner.
+/// The shared snapshot enrichment qualifies metadata before either consumer
+/// (`find` or `symbolContext`) ranks or pages the complete literal set.
 ///
 /// Unreadable files (binary, deleted, permission) are skipped — they are simply
 /// not literal match sites, exactly as in the CLI.
 pub fn scan_literal(
+    snapshot: &Snapshot,
+    base: Option<&std::path::Path>,
+    ident: &str,
+    opts: ScanOptions,
+    scope: FileScope<'_>,
+) -> OccurrenceResults {
+    let mut result = scan_literal_raw(snapshot, base, ident, opts, scope);
+    enrich_with_snapshot(&mut result, snapshot);
+    result
+}
+
+/// Cache only disk-derived matches: snapshot metadata is qualified on return,
+/// so a reloaded snapshot cannot inherit an earlier snapshot's semantic facts.
+fn scan_literal_raw(
     snapshot: &Snapshot,
     base: Option<&std::path::Path>,
     ident: &str,
@@ -516,6 +533,7 @@ struct LiteralCacheKey {
     fingerprint: u64,
     ident: String,
     whole_token: bool,
+    no_generated: bool,
     file: Option<String>,
 }
 
@@ -563,12 +581,14 @@ fn file_set_fingerprint(snapshot: &Snapshot, base: Option<&std::path::Path>) -> 
 /// `scan_literal` reads every workspace file from disk on each call, so repeated
 /// hover / "Load more" over the same query would otherwise re-scan the whole
 /// tree — a hidden "scan storm" on large workspaces. The cache is keyed by
-/// `(workspace root, file-set fingerprint, identifier, whole_token, file
+/// `(workspace root, file-set fingerprint, identifier, scan options, file
 /// scope)`. The fingerprint (resolved path + len + mtime per file) is the
 /// freshness signal: any on-disk edit changes it and forces a fresh scan, so a
 /// reloaded or edited workspace is never served stale matches; entries also age
 /// out under the capacity bound. The expensive scan runs WITHOUT the lock held
-/// so distinct concurrent queries do not serialize behind one another.
+/// so distinct concurrent queries do not serialize behind one another. Entries
+/// retain raw matches only; shared enrichment runs against the current snapshot
+/// on every return, outside the lock, without rescanning or hashing the AST.
 pub struct LiteralScanCache {
     inner: std::sync::Mutex<std::collections::VecDeque<(LiteralCacheKey, OccurrenceResults)>>,
     cap: usize,
@@ -597,6 +617,7 @@ impl LiteralScanCache {
             fingerprint: file_set_fingerprint(snapshot, base),
             ident: ident.to_string(),
             whole_token: opts.whole_token,
+            no_generated: opts.no_generated,
             file: scope.file.map(str::to_string),
         };
 
@@ -606,13 +627,15 @@ impl LiteralScanCache {
             && let Some(pos) = guard.iter().position(|(k, _)| *k == key)
         {
             let (k, v) = guard.remove(pos).expect("position is within bounds");
-            let result = v.clone();
+            let mut result = v.clone();
             guard.push_front((k, v));
+            drop(guard);
+            enrich_with_snapshot(&mut result, snapshot);
             return result;
         }
 
         // Miss: run the scan WITHOUT holding the lock.
-        let result = scan_literal(snapshot, base, ident, opts, scope);
+        let mut result = scan_literal_raw(snapshot, base, ident, opts, scope);
 
         if let Ok(mut guard) = self.inner.lock() {
             // A concurrent miss may have inserted the same key meanwhile.
@@ -625,6 +648,7 @@ impl LiteralScanCache {
             }
         }
 
+        enrich_with_snapshot(&mut result, snapshot);
         result
     }
 }
@@ -854,7 +878,7 @@ mod tests {
             "query": "compose_runtime_slice",
             "symbol_id": "src/pack.rs::compose_runtime_slice",
         });
-        let params: FindParams = serde_json::from_value(raw).unwrap();
+        let params: FindParams = serde_json::from_value(raw).expect("symbol id params");
         assert_eq!(
             params.symbol_id.as_ref().map(|id| id.as_str().to_string()),
             Some("src/pack.rs::compose_runtime_slice".to_string())
@@ -864,7 +888,7 @@ mod tests {
     #[test]
     fn find_params_omit_symbol_id_when_absent() {
         let raw = serde_json::json!({ "query": "anything" });
-        let params: FindParams = serde_json::from_value(raw).unwrap();
+        let params: FindParams = serde_json::from_value(raw).expect("minimal params");
         assert!(params.symbol_id.is_none());
     }
 

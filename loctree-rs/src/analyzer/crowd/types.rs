@@ -1,13 +1,14 @@
-//! Types for crowd detection (functional duplicate clustering)
+//! Types for crowd detection (functional associations and review candidates)
 //!
 //! A "crowd" is a cluster of files that serve similar purposes or handle the same domain,
-//! often indicating fragmentation or duplication in the codebase.
+//! not by itself evidence of fragmentation or duplication in the codebase.
 //!
 //! Example crowds:
 //! - 3 different hooks all managing "message" state
 //! - 2 components both rendering messages with overlapping exports
 //! - Multiple utils files with similar string manipulation functions
 
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 /// UI context type for a crowd - helps AI agents understand the architectural role
@@ -57,7 +58,8 @@ pub struct Crowd {
     pub pattern: String,
     /// Files in this crowd, sorted by usage (most used first)
     pub members: Vec<CrowdMember>,
-    /// Overall crowd score (0-10, higher = more problematic)
+    /// Evidenced concern score (0-10, higher = more problematic); membership
+    /// and import similarity alone contribute nothing.
     pub score: f32,
     /// Detected issues
     pub issues: Vec<CrowdIssue>,
@@ -110,23 +112,23 @@ pub enum MatchReason {
     },
 }
 
-/// Detected issue in a crowd
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Evidenced review candidate, not a redundancy or deletion verdict.
+#[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CrowdIssue {
-    /// Multiple files with very similar names
+    /// Same exact, case-sensitive leaf stem after removing only the final extension.
     NameCollision {
-        /// Files with colliding names
+        /// Full root-relative file paths with that stem (at least two).
         files: Vec<String>,
     },
-    /// Some files have much lower usage than others
+    /// A usage gap between peers supported by NameCollision or ExportOverlap.
     UsageAsymmetry {
-        /// The primary/most-used file
+        /// The more-imported peer, not an architectural authority.
         primary: String,
-        /// Underused files that might be redundant
+        /// Lower-usage peer candidates, not evidence of redundant implementations.
         underused: Vec<String>,
     },
-    /// Files export similar things
+    /// Exact shared indexed export names, excluding default/star placeholders.
     ExportOverlap {
         /// Files with overlapping exports
         files: Vec<String>,
@@ -138,4 +140,85 @@ pub enum CrowdIssue {
         /// Categories/themes found scattered across crowd
         categories: Vec<String>,
     },
+}
+
+impl CrowdIssue {
+    fn qualification(&self) -> &'static str {
+        match self {
+            Self::NameCollision { .. } => {
+                "Review candidate: same exact case-sensitive leaf stem (final extension removed). Namespaces/platform variants may be intentional; not a duplication or deletion verdict."
+            }
+            Self::UsageAsymmetry { .. } => {
+                "Peer comparison candidate only: see name_collision/export_overlap evidence and member importer counts. Lower usage does not establish redundancy or architectural authority."
+            }
+            Self::ExportOverlap { .. } => {
+                "Review candidate: exact shared indexed export names, not shared imports or proof of duplicate implementation. Re-exports and namespace/platform variants may be intentional."
+            }
+            Self::Fragmentation { .. } => {
+                "Review candidate only; related functionality need not be consolidated."
+            }
+        }
+    }
+}
+
+// MCP's legacy string issues use Debug; keep their evidence and qualification
+// aligned with the structured payload without changing the response container.
+impl std::fmt::Debug for CrowdIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = match self {
+            Self::NameCollision { files } => {
+                let mut debug = f.debug_struct("NameCollision");
+                debug.field("files", files);
+                debug
+            }
+            Self::UsageAsymmetry { primary, underused } => {
+                let mut debug = f.debug_struct("UsageAsymmetry");
+                debug
+                    .field("primary", primary)
+                    .field("underused", underused);
+                debug
+            }
+            Self::ExportOverlap { files, overlap } => {
+                let mut debug = f.debug_struct("ExportOverlap");
+                debug.field("files", files).field("overlap", overlap);
+                debug
+            }
+            Self::Fragmentation { categories } => {
+                let mut debug = f.debug_struct("Fragmentation");
+                debug.field("categories", categories);
+                debug
+            }
+        };
+        debug.field("qualification", &self.qualification()).finish()
+    }
+}
+
+// Add qualification on the wire without changing Rust variants or their fields.
+// Older payloads still deserialize; clients may ignore the additive field.
+impl Serialize for CrowdIssue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::NameCollision { files } => {
+                map.serialize_entry("type", "name_collision")?;
+                map.serialize_entry("files", files)?;
+            }
+            Self::UsageAsymmetry { primary, underused } => {
+                map.serialize_entry("type", "usage_asymmetry")?;
+                map.serialize_entry("primary", primary)?;
+                map.serialize_entry("underused", underused)?;
+            }
+            Self::ExportOverlap { files, overlap } => {
+                map.serialize_entry("type", "export_overlap")?;
+                map.serialize_entry("files", files)?;
+                map.serialize_entry("overlap", overlap)?;
+            }
+            Self::Fragmentation { categories } => {
+                map.serialize_entry("type", "fragmentation")?;
+                map.serialize_entry("categories", categories)?;
+            }
+        }
+        map.serialize_entry("qualification", self.qualification())?;
+        map.end()
+    }
 }

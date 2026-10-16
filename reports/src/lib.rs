@@ -340,6 +340,42 @@ mod tests {
     }
 
     #[test]
+    fn action_plan_bounds_long_unicode_guidance_without_losing_full_text() {
+        let hint = (0..84)
+            .map(|i| format!("src/żółć/section_{i:02}/implementation.rs"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let section = ReportSection {
+            root: "owned-source".into(),
+            priority_tasks: vec![types::PriorityTask {
+                priority: 1,
+                kind: "duplicate_candidate".into(),
+                target: "normalizeLedger".into(),
+                location: "src/ledger.rs:3".into(),
+                why: "EXACT signature evidence; body equivalence is unverified".into(),
+                risk: "medium".into(),
+                fix_hint: hint.clone(),
+                verify_cmd: "loct twins --json".into(),
+            }],
+            ..Default::default()
+        };
+        let html = render_report(&[section], &JsAssets::default(), false);
+        let start = html.find("<summary>").expect("bounded expandable guidance");
+        let summary = &html[start..start + html[start..].find("</summary>").expect("summary end")];
+        assert!(summary.contains("more characters; expand full guidance"));
+        assert!(summary.chars().count() < 450);
+        assert!(!summary.contains("section_83"));
+        assert!(
+            html.contains(&hint),
+            "all guidance retained in expanded details"
+        );
+        assert!(
+            !html.contains("<details open"),
+            "default card must stay bounded"
+        );
+    }
+
+    #[test]
     fn renders_hub_files_panel() {
         use types::HubFile;
 

@@ -585,16 +585,57 @@ pub fn normalise_ignore_patterns(patterns: &[String], root: &Path) -> Vec<PathBu
         .collect()
 }
 
+/// Count complete UTF-8, NUL-free text; unavailable is distinct from empty.
+/// Binary extensions use the scanner's existing policy, not a tree-only list.
 pub fn count_lines(path: &Path) -> Option<usize> {
-    let file = File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    let mut count = 0usize;
-    for line in reader.lines() {
-        if line.is_ok() {
-            count += 1;
-        }
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            crate::analyzer::scan::BINARY_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+        })
+    {
+        return None;
     }
-    Some(count)
+    count_text_lines(File::open(path).ok()?)
+}
+
+fn count_text_lines(mut reader: impl Read) -> Option<usize> {
+    // At most three bytes of an incomplete UTF-8 codepoint cross a read boundary.
+    // Memory stays bounded even for a file consisting of one enormous line.
+    let mut buffer = [0u8; 8192 + 3];
+    let mut pending = 0;
+    let mut count = 0;
+    let mut has_bytes = false;
+    let mut ends_with_newline = false;
+    loop {
+        let read = match reader.read(&mut buffer[pending..]) {
+            Ok(0) => {
+                return (pending == 0)
+                    .then_some(count + usize::from(has_bytes && !ends_with_newline));
+            }
+            Ok(read) => read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        let len = pending + read;
+        if buffer[..len].contains(&0) {
+            return None;
+        }
+        let valid = match std::str::from_utf8(&buffer[..len]) {
+            Ok(_) => len,
+            Err(err) if err.error_len().is_none() => err.valid_up_to(),
+            Err(_) => return None,
+        };
+        count += buffer[..valid]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+        has_bytes = true;
+        ends_with_newline = buffer[len - 1] == b'\n';
+        pending = len - valid;
+        buffer.copy_within(valid..len, 0);
+    }
 }
 
 pub fn matches_extension(
@@ -1576,6 +1617,78 @@ mod tests {
     fn test_count_lines_missing_file() {
         let count = count_lines(Path::new("/nonexistent/file.txt"));
         assert!(count.is_none());
+    }
+
+    #[test]
+    fn test_count_lines_text_contract_and_utf8_boundaries() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let path = tmp.path().join("text.rs");
+        for (text, expected) in [
+            ("", 0),
+            ("\n", 1),
+            ("one", 1),
+            ("one\n", 1),
+            ("one\ntwo", 2),
+            ("one\r\ntwo\r\n", 2),
+            ("Zażółć gęślą 🦀\n東京", 2),
+            ("\r", 1),
+        ] {
+            std::fs::write(&path, text).expect("write text");
+            assert_eq!(count_lines(&path), Some(expected), "{text:?}");
+        }
+        for padding in 8189..8197 {
+            let text = format!("{}é東🦀\nlast", "a".repeat(padding));
+            std::fs::write(&path, &text).expect("write boundary text");
+            assert_eq!(count_lines(&path), Some(2), "padding={padding}");
+        }
+        std::fs::write(&path, "a".repeat(1_000_000)).expect("write long line");
+        assert_eq!(count_lines(&path), Some(1));
+    }
+
+    #[test]
+    fn test_count_lines_rejects_binary_and_late_invalid_text() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let path = tmp.path().join("text.rs");
+        for tail in [b"\xff\n".as_slice(), b"\xe2\x82", b"\0tail\n"] {
+            let mut bytes = b"valid\n".repeat(20_000);
+            bytes.extend_from_slice(tail);
+            std::fs::write(&path, bytes).expect("write invalid text");
+            assert_eq!(count_lines(&path), None, "tail={tail:?}");
+        }
+        for bytes in [
+            b"\x89PNG\r\n\x1a\nreadable tail".as_slice(),
+            b"a\0b\0\n\0",
+            b"\xff\xfea\0",
+        ] {
+            std::fs::write(&path, bytes).expect("write binary bytes");
+            assert_eq!(count_lines(&path), None);
+        }
+        // Shared binary policy applies even when a binary suffix has ASCII bytes.
+        let binary = tmp.path().join("asset.PNG");
+        std::fs::write(&binary, b"readable tail\n").expect("write binary extension");
+        assert_eq!(count_lines(&binary), None);
+        let svg = tmp.path().join("asset.svg");
+        std::fs::write(&svg, "<svg>é</svg>\n").expect("write text resource");
+        assert_eq!(count_lines(&svg), Some(1));
+        assert_eq!(
+            count_lines(tmp.path()),
+            None,
+            "directory is not readable text"
+        );
+    }
+
+    #[test]
+    fn test_count_lines_read_failure_never_returns_partial_count() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
+        }
+        // Inject permission denial after real successful reads: deterministic
+        // under root too, unlike chmod-based tests that can falsely pass.
+        let prefix = io::Cursor::new(b"valid\n".repeat(20_000));
+        assert_eq!(count_text_lines(prefix.chain(FailingReader)), None);
     }
 
     #[test]

@@ -191,6 +191,7 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
             parsed.slice_target = Some(opts.target.clone());
             parsed.slice_consumers = opts.consumers;
             parsed.slice_rescan = opts.rescan;
+            parsed.slice_acquire_options = acquire_options_from_global(global);
             parsed.include_untracked = opts.include_untracked;
             parsed.root_list = if let Some(ref root) = opts.root {
                 vec![root.clone()]
@@ -485,6 +486,7 @@ pub fn command_to_parsed_args(cmd: &Command, global: &GlobalOptions) -> ParsedAr
             // as it doesn't go through ParsedArgs
         }
 
+        Command::History(_) => {}
         Command::Diff(_) => {
             // Diff is handled specially in dispatch_command
             // as it doesn't go through ParsedArgs
@@ -708,6 +710,9 @@ pub fn dispatch_command(parsed_cmd: &ParsedCommand) -> DispatchResult {
         Command::Impact(opts) => {
             // Execute impact analysis and return result
             return handlers::diff::handle_impact_command(opts, &parsed_cmd.global);
+        }
+        Command::History(opts) => {
+            return handlers::history::handle_history_command(opts, &parsed_cmd.global);
         }
         Command::Diff(opts) => {
             // Execute diff and return result

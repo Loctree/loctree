@@ -155,7 +155,7 @@ pub fn ReportSectionView(section: ReportSection, active: bool, view_id: String) 
                     </span>
                     <span class="stat-badge">
                         <span class="stat-badge-value">{duplicate_exports_count}</span>
-                        <span class="stat-badge-label">"dups"</span>
+                        <span class="stat-badge-label" title="Raw repeated export names, including scoped names and conventions; not duplicate implementations">"repeated names"</span>
                     </span>
                 </div>
             </header>

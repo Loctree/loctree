@@ -1,5 +1,8 @@
 //! Handler for `loct doctor` cache identity and scope diagnostics.
 
+#[cfg(test)]
+use crate::test_env as env;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -941,7 +944,7 @@ mod tests {
         fn set_path(key: &'static str, value: &Path) -> Self {
             let guard = Self {
                 key,
-                original: std::env::var_os(key),
+                original: env::var_os(key),
             };
             set_env_var(key, value.as_os_str());
             guard
@@ -1010,7 +1013,8 @@ mod tests {
         let snapshot_path = snapshot_dir.join("snapshot.json");
         let body = serde_json::json!({
             "metadata": {
-                "schema_version": env!("CARGO_PKG_VERSION"),
+                "schema_version": crate::snapshot::SNAPSHOT_SCHEMA_VERSION,
+                "analysis_generation": crate::snapshot::ANALYSIS_GENERATION,
                 "generated_at": "2026-04-25T18:00:00.000000000Z",
                 "roots": roots,
                 "languages": [],

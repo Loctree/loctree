@@ -23,7 +23,10 @@ fn handle_changed_files_summary(
         }
     };
 
-    let changed_files = match git_repo.changed_files(since_path, "HEAD") {
+    let changed_files = match opts.to.as_deref().map_or_else(
+        || git_repo.changed_files_in_worktree(since_path),
+        |target| git_repo.changed_files(since_path, target),
+    ) {
         Ok(files) => files,
         Err(e) => {
             eprintln!(
@@ -49,7 +52,7 @@ fn handle_changed_files_summary(
         } else {
             let payload = json!({
                 "from": since_path,
-                "to": "HEAD",
+                "to": opts.to.as_deref().unwrap_or("working-tree"),
                 "total": changed_files.len(),
                 "changed_files": changed_files,
             });
@@ -66,7 +69,7 @@ fn handle_changed_files_summary(
 
     println!("Changed Files ({})", changed_files.len());
     println!("  From: {}", since_path);
-    println!("  To:   HEAD");
+    println!("  To:   {}", opts.to.as_deref().unwrap_or("working-tree"));
     println!();
     for file in changed_files {
         let marker = match file.status {
@@ -180,218 +183,15 @@ pub fn handle_auto_scan_base_diff(
     global: &GlobalOptions,
     since_path: &str,
 ) -> DispatchResult {
-    use crate::diff::SnapshotDiff;
-    use crate::git::GitRepo;
-    use crate::snapshot::Snapshot;
-    use std::path::Path;
-
-    // Discover git repository
-    let git_repo = match GitRepo::discover(Path::new(".")) {
-        Ok(repo) => repo,
-        Err(e) => {
-            eprintln!("[loct][error] Not a git repository: {}", e);
-            eprintln!("[loct][hint] --auto-scan-base requires a git repository");
-            return DispatchResult::Exit(1);
-        }
-    };
-
-    // Verify target branch exists
-    if let Err(e) = git_repo.resolve_ref(since_path) {
-        eprintln!(
-            "[loct][error] Failed to resolve branch '{}': {}",
-            since_path, e
-        );
-        eprintln!("[loct][hint] Ensure the branch/commit exists");
-        return DispatchResult::Exit(1);
-    }
-
-    if !global.quiet {
-        eprintln!(
-            "[loct] Exporting tree of '{}' (no git worktree)...",
-            since_path
-        );
-    }
-
-    let project_root = Path::new(".");
-    let cache_dir = crate::snapshot::project_cache_dir(project_root).join("export-tree");
-
-    // Hold the project cache lock only while writing/scanning the export.
-    // Drop it before load_or_create_snapshot(".") — that path takes the same lock.
-    let base_snapshot = {
-        let _cache_lock = match crate::snapshot::acquire_snapshot_cache_lock(project_root) {
-            Ok(lock) => lock,
-            Err(e) => {
-                eprintln!("[loct][error] Failed to lock snapshot cache: {}", e);
-                return DispatchResult::Exit(1);
-            }
-        };
-
-        let export_path = match git_repo.export_tree(since_path, &cache_dir) {
-            Ok(path) => path,
-            Err(e) => {
-                eprintln!(
-                    "[loct][error] Failed to export tree for '{}': {}",
-                    since_path, e
-                );
-                eprintln!(
-                    "[loct][hint] Ensure the ref exists; baseline uses git plumbing, not a worktree"
-                );
-                return DispatchResult::Exit(1);
-            }
-        };
-
-        if !global.quiet {
-            eprintln!("[loct] Scanning exported tree...");
-        }
-
-        // The export is not a git checkout, so this internal scan opts into
-        // force_non_git. Unified scan args keep the same file universe as the
-        // current snapshot (detect-applied extensions + .loctignore).
-        let mut parsed = crate::snapshot::unified_scan_args(&export_path, global.verbose);
-        parsed.force_non_git = true;
-        let root_list = vec![export_path.clone()];
-
-        if let Err(e) = crate::snapshot::run_init_with_options(&root_list, &parsed, true) {
-            eprintln!("[loct][error] Failed to scan exported tree: {}", e);
-            return DispatchResult::Exit(1);
-        }
-
-        match Snapshot::load(&export_path) {
-            Ok(snap) => snap,
-            Err(e) => {
-                eprintln!("[loct][error] Failed to load exported-tree snapshot: {}", e);
-                return DispatchResult::Exit(1);
-            }
-        }
-    };
-
-    // Load current snapshot (auto-scan if missing)
-    let current_snapshot = match load_or_create_snapshot(Path::new("."), global) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[loct][error] Failed to load current snapshot: {}", e);
-            return DispatchResult::Exit(1);
-        }
-    };
-
-    // Get changed files using git diff
-    let changed_files = match git_repo.changed_files(since_path, "HEAD") {
-        Ok(files) => files,
-        Err(e) => {
-            if !global.quiet {
-                eprintln!("[loct][warning] Failed to get changed files: {}", e);
-            }
-            vec![]
-        }
-    };
-
-    // Get commit info
-    let from_commit = git_repo.get_commit_info(since_path).ok();
-    let to_commit = git_repo.get_commit_info("HEAD").ok();
-
-    // Compare snapshots (artifact fence default-on; --include-artifacts opts out)
-    let diff = SnapshotDiff::compare_fenced(
-        &base_snapshot,
-        &current_snapshot,
-        from_commit,
-        to_commit,
-        &changed_files,
-        opts.include_artifacts,
-    );
-
-    // Output results
-    if global.json || opts.jsonl {
-        // JSON/JSONL output
-        if opts.jsonl {
-            match serde_json::to_string(&diff) {
-                Ok(json) => println!("{}", json),
-                Err(e) => {
-                    eprintln!("[loct][error] Failed to serialize diff: {}", e);
-                    return DispatchResult::Exit(1);
-                }
-            }
-        } else {
-            match serde_json::to_string_pretty(&diff) {
-                Ok(json) => println!("{}", json),
-                Err(e) => {
-                    eprintln!("[loct][error] Failed to serialize diff: {}", e);
-                    return DispatchResult::Exit(1);
-                }
-            }
-        }
-    } else {
-        // Human-readable output
-        println!("Snapshot Diff (auto-scanned):");
-        println!("  From: {} (exported tree)", since_path);
-        println!("  To:   (current)");
-        println!();
-        println!("Summary: {}", diff.impact.summary);
-        println!("Risk Score: {:.2}", diff.impact.risk_score);
-        println!();
-
-        if !diff.files.added.is_empty() {
-            println!("Files Added ({}):", diff.files.added.len());
-            for path in diff.files.added.iter().take(20) {
-                println!("  + {}", path.display());
-            }
-            if diff.files.added.len() > 20 {
-                println!("  ... and {} more", diff.files.added.len() - 20);
-            }
-            println!();
-        }
-
-        if !diff.files.removed.is_empty() {
-            println!("Files Removed ({}):", diff.files.removed.len());
-            for path in diff.files.removed.iter().take(20) {
-                println!("  - {}", path.display());
-            }
-            if diff.files.removed.len() > 20 {
-                println!("  ... and {} more", diff.files.removed.len() - 20);
-            }
-            println!();
-        }
-
-        if !diff.files.modified.is_empty() {
-            println!("Files Modified ({}):", diff.files.modified.len());
-            for path in diff.files.modified.iter().take(20) {
-                println!("  ~ {}", path.display());
-            }
-            if diff.files.modified.len() > 20 {
-                println!("  ... and {} more", diff.files.modified.len() - 20);
-            }
-            println!();
-        }
-
-        if !diff.exports.removed.is_empty() {
-            println!("Exports Removed ({}):", diff.exports.removed.len());
-            for export in diff.exports.removed.iter().take(10) {
-                println!(
-                    "  - {} ({}) in {}",
-                    export.name,
-                    export.kind,
-                    export.file.display()
-                );
-            }
-            if diff.exports.removed.len() > 10 {
-                println!("  ... and {} more", diff.exports.removed.len() - 10);
-            }
-        }
-
-        if !diff.exports.artifact_excluded.is_empty() {
-            println!(
-                "{} (exports in artifact files; use --include-artifacts to inspect)",
-                diff.exports.artifact_excluded.summary_line()
-            );
-        }
-    }
-
-    DispatchResult::Exit(0)
+    let mut compatible = opts.clone();
+    compatible.since = Some(since_path.to_owned());
+    compatible.auto_scan_base = false;
+    handle_diff_command(&compatible, global)
 }
 
 /// Handle the diff command directly
 pub fn handle_diff_command(opts: &DiffOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::diff::SnapshotDiff;
-    use crate::snapshot::Snapshot;
     use std::path::Path;
 
     // For MVP: Load snapshots from paths or IDs
@@ -404,59 +204,48 @@ pub fn handle_diff_command(opts: &DiffOptions, global: &GlobalOptions) -> Dispat
         return DispatchResult::Exit(1);
     };
 
-    // Handle --auto-scan-base: export ref tree (no worktree), scan, compare
     if opts.auto_scan_base {
         return handle_auto_scan_base_diff(opts, global, since_path);
     }
-
     if opts.changed_files {
         return handle_changed_files_summary(opts, global, since_path);
     }
-
-    // Load "from" snapshot
-    let from_snapshot = match Snapshot::load(Path::new(since_path)) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "[loct][error] Failed to load snapshot from '{}': {}",
-                since_path, e
-            );
-            eprintln!("[loct][hint] Provide a valid snapshot path or run 'loct scan' first.");
-            return DispatchResult::Exit(1);
-        }
-    };
-
-    // Load "to" snapshot (current if not specified)
-    let to_snapshot = if let Some(ref to_path) = opts.to {
-        match Snapshot::load(Path::new(to_path)) {
-            Ok(s) => s,
+    let project = Path::new(".");
+    let (from, to) =
+        match crate::git_snapshot::resolve_pair(project, since_path, opts.to.as_deref()) {
+            Ok(value) => value,
             Err(e) => {
-                eprintln!(
-                    "[loct][error] Failed to load snapshot from '{}': {}",
-                    to_path, e
-                );
+                eprintln!("[loct][error] {e}");
+                return DispatchResult::Exit(1);
+            }
+        };
+    let changed_files = if let Some(base) = &from.commit {
+        let repo = match crate::git::GitRepo::discover(project) {
+            Ok(repo) => repo,
+            Err(e) => {
+                eprintln!("[loct][error] {e}");
+                return DispatchResult::Exit(1);
+            }
+        };
+        let result = match &to.commit {
+            Some(target) => repo.changed_files(&base.hash, &target.hash),
+            None if opts.to.is_none() => repo.changed_files_in_worktree(&base.hash),
+            None => Ok(vec![]),
+        };
+        match result {
+            Ok(files) => files,
+            Err(e) => {
+                eprintln!("[loct][error] {e}");
                 return DispatchResult::Exit(1);
             }
         }
     } else {
-        // Load current snapshot from .loctree/ (auto-scan if missing)
-        match load_or_create_snapshot(Path::new("."), global) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[loct][error] Failed to load current snapshot: {}", e);
-                return DispatchResult::Exit(1);
-            }
-        }
+        vec![]
     };
-
-    // For now, we don't have git commit info in this flow
-    // In future, we could extract it from snapshot metadata
-    let from_commit = None;
-    let to_commit = None;
-
-    // We don't have changed_files info without git integration
-    // For snapshot-to-snapshot diff, we'll compute it from the diff itself
-    let changed_files = vec![];
+    let from_snapshot = from.snapshot;
+    let to_snapshot = to.snapshot;
+    let from_commit = from.commit;
+    let to_commit = to.commit;
 
     // Compare snapshots (artifact fence default-on; --include-artifacts opts out)
     let diff = SnapshotDiff::compare_fenced(
