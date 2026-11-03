@@ -101,12 +101,21 @@ cat > "$TMP_ROOT/bin/tar" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 args=("$@")
+creating=0
 for ((i = 0; i < ${#args[@]}; i++)); do
   if [[ "${args[$i]}" == "-czf" ]]; then
+    creating=1
     archive="${args[$((i + 1))]}"
     [[ "$archive" != */* && "$archive" != *:* ]]
   fi
 done
+if [[ -n "${TAR_LOG:-}" ]]; then
+  printf '%s\n' "${args[@]}" >> "$TAR_LOG"
+  if [[ "$creating" == 1 ]]; then
+    printf 'COPYFILE_DISABLE=%s\n' "${COPYFILE_DISABLE:-}" >> "$TAR_LOG"
+  fi
+  printf '\n' >> "$TAR_LOG"
+fi
 exec "$REAL_TAR" "$@"
 SH
 chmod +x "$TMP_ROOT/bin/tar"
@@ -126,6 +135,7 @@ asset() {
 FAKE_RELEASE_DIR="$TMP_ROOT/release-payload" \
 FAKE_ARCHIVE_SHA="$archive_sha" \
 REAL_TAR="$real_tar" \
+TAR_LOG="$TMP_ROOT/tar-invocations.txt" \
 LOCTREE_GPG_KEY_ID="" \
 PATH="$TMP_ROOT/bin:$PATH" bash "$ROOT_DIR/distribution/build-bundle.sh" 0.14.4 \
   --aicx-version 0.12.5 \
@@ -149,6 +159,19 @@ grep -Fx "$root/README.md" "$TMP_ROOT/contents.txt" >/dev/null
 if grep -Fx "$root/bin/loct" "$TMP_ROOT/contents.txt" >/dev/null; then
   echo "Windows bundle contains an unsuffixed loct binary" >&2
   exit 1
+fi
+
+# macOS bsdtar otherwise embeds com.apple.provenance. The packager must ask
+# tar to leave extended attributes out, and set COPYFILE_DISABLE for the
+# older Apple copyfile tar. GNU tar documents --no-xattrs, so this host must
+# see that flag on the create invocation.
+grep -Fx -- '--no-xattrs' "$TMP_ROOT/tar-invocations.txt" >/dev/null
+grep -Fx 'COPYFILE_DISABLE=1' "$TMP_ROOT/tar-invocations.txt" >/dev/null
+if tar -tzf "$archive" 2>"$TMP_ROOT/tar-list.err" >/dev/null; then
+  if grep -F 'LIBARCHIVE.xattr' "$TMP_ROOT/tar-list.err" >/dev/null; then
+    echo "bundle tarball still carries macOS extended-attribute headers" >&2
+    exit 1
+  fi
 fi
 
 echo "Windows release bundle contract passed"

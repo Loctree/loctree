@@ -6,6 +6,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- README install section for the signed installer, npm, and crates.io.
+
+### Fixed
+
+- Release bundle tarballs omit macOS extended attributes, so extracting them
+  with GNU tar no longer warns about `LIBARCHIVE.xattr.com.apple.provenance`.
+
 ## [0.15.1] - 2026-10-14
 
 ### Fixed
