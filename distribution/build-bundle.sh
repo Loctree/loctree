@@ -385,6 +385,28 @@ if [[ -n "$PRINT_AICX_ASSET_TARGET" ]]; then
   exit 0
 fi
 
+# Flags for `tar -czf`. macOS bsdtar stores extended attributes in pax headers.
+# Release bundles packed on macOS carry com.apple.provenance as
+# LIBARCHIVE.xattr.com.apple.provenance and SCHILY.xattr.com.apple.provenance,
+# and GNU tar warns once per member:
+#   tar: Ignoring unknown extended header keyword 'LIBARCHIVE.xattr...'
+# Pass a suppression flag only when this tar documents it. GNU tar accepts
+# --no-xattrs and already omits xattrs unless --xattrs is set.
+# --no-mac-metadata is bsdtar-only. COPYFILE_DISABLE covers Apple's older
+# copyfile-based tar and is a no-op for GNU tar.
+tar_create_flags() {
+  local help flags
+  help="$(tar --help 2>&1 || true)"
+  flags=""
+  if printf '%s\n' "$help" | grep -q -- '--no-xattrs'; then
+    flags="$flags --no-xattrs"
+  fi
+  if printf '%s\n' "$help" | grep -q -- '--no-mac-metadata'; then
+    flags="$flags --no-mac-metadata"
+  fi
+  printf '%s' "${flags# }"
+}
+
 # Extract the canonical AICX archive format for the selected platform.
 extract_aicx_archive() {
   local archive="$1"
@@ -581,6 +603,8 @@ write_bundle_readme() {
   } > "$output"
 }
 
+TAR_CREATE_FLAGS="$(tar_create_flags)"
+
 for target in "${TARGETS[@]}"; do
   bundle_flavor=$(bundle_flavor_for_target "$target")
   bundle_suffix=$(bundle_suffix_for_flavor "$bundle_flavor")
@@ -625,7 +649,7 @@ for target in "${TARGETS[@]}"; do
         echo "  [dry-run] codesign staged AICX binaries with MACOS_DEVELOPER_ID_APPLICATION"
       fi
     fi
-    echo "  [dry-run] tar -czf $tarball -C $target_work $bundle_name"
+    echo "  [dry-run] (cd $target_work && COPYFILE_DISABLE=1 tar $TAR_CREATE_FLAGS -czf $bundle_name.tar.gz $bundle_name)"
     if [[ -n "$GPG_KEY_ID" ]]; then
       echo "  [dry-run] gpg --batch --yes --local-user $GPG_KEY_ID --detach-sign --output $tarball.sig $tarball"
     fi
@@ -666,7 +690,10 @@ for target in "${TARGETS[@]}"; do
   rm -f "$tarball" "$tarball.sha256" "$tarball.sig" "$tarball_tmp"
   # Keep the archive operand relative. GNU tar treats `D:\...` as remote
   # `host:path` syntax on Git Bash even though it is a local Windows drive.
-  (cd "$target_work" && tar -czf "$bundle_name.tar.gz" "$bundle_name")
+  # Word-splitting on TAR_CREATE_FLAGS is intentional: tar_create_flags emits
+  # only flag tokens (--no-xattrs, --no-mac-metadata).
+  # shellcheck disable=SC2086
+  (cd "$target_work" && COPYFILE_DISABLE=1 tar $TAR_CREATE_FLAGS -czf "$bundle_name.tar.gz" "$bundle_name")
   mv "$tarball_tmp" "$tarball"
   printf "%s  %s\n" "$(sha256_file "$tarball")" "$(basename "$tarball")" > "$tarball.sha256"
   echo "  tarball -> $tarball"
