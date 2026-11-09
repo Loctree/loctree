@@ -6,6 +6,16 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-11-09
+
+### Security
+
+- Move the MCP SDK dependency `rmcp` from 2.x to 3.x (lock: 3.9.0) to clear
+  RUSTSEC-2026-0457 / GHSA-5p52-q7pq-9fq2 (OAuth client SSRF, patched in 3.7.0, no
+  2.x backport). Loctree does not enable the affected `auth` feature, but every
+  consumer of the `loctree` crate inherited the vulnerable version in its audit.
+  No rmcp type is part of the `loctree` public API; `cargo update -p loctree` is enough.
+
 ## [0.15.1] - 2026-10-14
 
 ### Fixed

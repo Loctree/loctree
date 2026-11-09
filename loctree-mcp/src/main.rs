@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use fs4::fs_std::FileExt;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::ServerInfo;
+use rmcp::model::ServerConfig;
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -4397,16 +4397,16 @@ fn bundle_diagnostic() -> BundleDiagnostic<'static> {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for LoctreeServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         touch_activity();
         let mut capabilities = rmcp::model::ServerCapabilities::default();
-        // rmcp 2.x marks ToolsCapability non-exhaustive: build via Default and
+        // rmcp marks ToolsCapability non-exhaustive: build via Default and
         // mutate the pub fields, struct expressions are refused (E0639).
         let mut tools = rmcp::model::ToolsCapability::default();
         tools.list_changed = Some(true);
         capabilities.tools = Some(tools);
 
-        ServerInfo::new(capabilities)
+        ServerConfig::new(capabilities)
             .with_server_info(
                 // `version` carries the git commit as semver build metadata
                 // (`0.13.0+g<sha>`), so an agent reading `serverInfo.version`
