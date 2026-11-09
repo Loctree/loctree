@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.15.1"
+version = "0.15.2"
 edition = "2024"
 rust-version = "1.93.0"
 license = "BUSL-1.1"
@@ -25,7 +25,7 @@ authors = ["LibraxisAI <support@loctree.com>"]
 "clap" = { "version" = "4.4", "features" = ["derive"] }
 "tracing" = "0.1"
 "tracing-subscriber" = "0.3"
-"rmcp" = { "version" = "2.0", "features" = ["server"] }
+"rmcp" = { "version" = "3.8", "features" = ["server"] }
 "futures" = "0.3"
 "axum" = { "version" = "0.8", "features" = ["json"] }
 "tower" = { "version" = "0.5", "features" = ["util"] }
@@ -39,6 +39,6 @@ authors = ["LibraxisAI <support@loctree.com>"]
 "reqwest" = { "version" = "0.12", "default-features" = false, "features" = ["json", "stream", "rustls-tls-native-roots"] }
 "sha2" = "0.10"
 "schemars" = "1"
-loctree = { path = "loctree-rs", version = "0.15.1" }
-loctree-ast = { path = "loctree-ast", version = "0.15.1" }
-report-leptos = { path = "reports", version = "0.15.1" }
+loctree = { path = "loctree-rs", version = "0.15.2" }
+loctree-ast = { path = "loctree-ast", version = "0.15.2" }
+report-leptos = { path = "reports", version = "0.15.2" }
