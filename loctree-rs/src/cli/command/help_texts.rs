@@ -90,6 +90,11 @@ OPTIONS:
                       no value = wait indefinitely
     --help, -h        Show this help message
 
+ANALYZER UPGRADES:
+    Queries automatically reparse caches from incompatible analysis generations.
+    --no-scan / --fail-stale refuse obsolete facts without writing caches.
+    Run `loct scan` to refresh. Compatible builds share warm analysis caches.
+
 ARGUMENTS:
     [PATHS...]        Root directories to scan (default: current directory)
 
@@ -177,7 +182,9 @@ USAGE:
     loct tree [OPTIONS] [PATHS...]
 
 DESCRIPTION:
-    Hierarchical tree of the codebase with LOC metrics.
+    Hierarchical tree of selected physical files with text line counts.
+    Binary, invalid UTF-8 and unreadable files remain listed without LOC
+    (JSON: null); empty text has 0 LOC. Summary LOC totals use measured files.
     Similar to 'tree' but with LOC and gitignore handling.
 
 OPTIONS:
@@ -468,9 +475,12 @@ DESCRIPTION:
     Walks source bytes of every file in the current snapshot and reports every
     identifier-boundary occurrence of <IDENT>. This provides exact
     identifier-boundary occurrences over the indexed universe (coverage stated per query)
-    beneath 'find': it does not consult the AST/tagmap, so it sees local
-    variables buried inside large function bodies (e.g. 'let mut utterance_id'
-    plus later 'utterance_id += 1') that symbol search can miss.
+    beneath 'find'. Literal inclusion does not depend on symbol extraction,
+    so it sees locals buried inside large function bodies (e.g. 'let mut
+    utterance_id' plus later 'utterance_id += 1') that symbol search can miss.
+
+    Role metadata may use source AST and snapshot anchors. This qualified
+    enrichment does not widen literal matching or turn fuzzy candidates into hits.
 
     Matching is token/identifier-boundary aware, not naive substring:
     searching 'id' will NOT match inside 'utterance_id' or 'valid'.
@@ -550,10 +560,10 @@ DESCRIPTION:
     Detects circular dependencies in your import graph.
     Example: A -> B -> C -> A
 
-    Circular imports cause:
-    - Runtime initialization errors
-    - Build/bundling failures
-    - Flaky test behavior
+    Cycles are structural coupling, not compiler/runtime verdicts.
+    The analyzer does not compile or execute your project. Initialization
+    order and value access may cause failures in some JS/TS/Python cycles;
+    other cycles execute successfully. Review before refactoring.
 
 OPTIONS:
     --path <PATTERN>     Filter to files matching pattern
@@ -677,7 +687,8 @@ EXAMPLES:
     loct events
     loct events --races";
 
-pub(super) const ROUTES_HELP: &str = "loct routes - List backend/web routes (FastAPI/Flask)
+pub(super) const ROUTES_HELP: &str =
+    "loct routes - List Python FastAPI/Flask and narrow Rust Axum routes
 
 USAGE:
     loct routes [OPTIONS] [PATHS...]
@@ -686,15 +697,24 @@ DESCRIPTION:
     Detects Python web routes based on common decorators:
     - FastAPI: @app.get/post/put/delete/patch, @router.*, @api_router.*
     - Flask:   @app.route, @blueprint.route, .route(...)
+    Detects Rust Axum-style .route(\"/path\", get(handler)) registrations
+    with a literal path and a bare method combinator/handler name.
+
+LIMITS:
+    Axum detection is regex-based, not all Rust routing. A method-chain such
+    as get(a).post(b) reports only the first method; mounts, nesting and
+    runtime registration are not resolved. TypeScript routing frameworks
+    are unsupported. Zero rows are not proof that an application has no routes.
 
 OPTIONS:
-    --framework <NAME>   Filter by framework label (fastapi, flask)
+    --framework <NAME>   Filter by framework label (fastapi, flask, axum)
     --path <PATTERN>     Filter by route path substring
     --help, -h           Show this help message
 
 EXAMPLES:
     loct routes
     loct routes --framework fastapi
+    loct routes --framework axum
     loct routes --path /patients";
 
 pub(super) const INFO_HELP: &str = "loct info - Show snapshot metadata and project info
@@ -954,10 +974,10 @@ DESCRIPTION:
     - New circular dependencies
 
 OPTIONS:
-    --since <SNAPSHOT>   Base snapshot to compare from (required)
-    --to <SNAPSHOT>      Target snapshot (default: current working tree)
-    --auto-scan-base     Export the --since ref tree and scan it (no git worktree)
-    --changed-files      Show only the changed-file summary for <ref>..HEAD
+    --since <SNAPSHOT>   Base Git ref or snapshot path (required)
+    --to <SNAPSHOT>      Target Git ref or snapshot path (default: fresh working tree)
+    --auto-scan-base     Compatibility flag; Git refs are scanned automatically
+    --changed-files      Show changed files to --to or the working tree
     --problems-only      Show only regressions (new dead code, new cycles)
     --help, -h           Show this help message
 
@@ -1063,10 +1083,21 @@ DESCRIPTION:
 OPTIONS:
     --path <DIR>           Root directory to analyze
     --limit <N>            Maximum findings across all output families
+    --offset <N>           Skip N findings in the same global census (default: 0)
+    --class <CSV>          Filter twin classes; routes excluded, other families retained
     --dead-only            Show only dead parrots (0 imports)
     --include-tests        Include test files (excluded by default)
     --include-suppressed   Show suppressed findings too
     --help, -h             Show this help message
+
+PAGINATION:
+    Order: class-ranked exact twins, routes, dead parrots, then barrel families.
+    Without --limit, all eligible findings after --offset are emitted.
+    --limit 0 emits no findings; has_more reports whether eligible findings remain.
+    JSON page.total is the filtered census; summary counts remain detection totals.
+    Nested arrays are capped independently by --limit with *_total, *_omitted and
+    *_truncated metadata; page.nested_items_omitted counts omitted nested entries.
+    follow twins uses the same budget and order, excluding dead parrots.
 
 EXAMPLES:
     loct twins                    # Full analysis
@@ -1149,7 +1180,11 @@ DESCRIPTION:
     - Which events are emitted but never tested
     - Which exports are tested but never used in production
 
-    This is semantic coverage - not 'how many lines' but 'what functionality'.
+    The --tests ratio counts callable exports (function/method/def/func) with
+    test-import evidence. Rust inline-test references receive heuristic credit;
+    no test execution is measured. Types, constants, reexports, externs and
+    noncallable properties are excluded. With no eligible exports the legacy
+    percentage remains 0.0; that does not establish zero runtime coverage.
 
 OPTIONS:
     --handlers            Only show handler gaps (skip events/exports)
@@ -1177,7 +1212,9 @@ OUTPUT:
     - MEDIUM: Exports without test imports
     - LOW: Tests that import unused code
 
-    Each gap shows the source location and usage context.";
+    Each gap shows the source location and usage context.
+    JSON: default gaps is a list; --tests is a structural report;
+    --tests --gaps combines named tests/gaps/excluded_artifacts containers.";
 
 pub(super) const SUPPRESS_HELP: &str = "loct suppress - Mark findings as false positives
 
@@ -1350,66 +1387,51 @@ RELATED COMMANDS:
     loct impact <file>      Show what breaks if you change a file
     loct crowd <pattern>    Find files clustering around a pattern";
 
-pub(super) const HOTSPOTS_HELP: &str =
-    "loct hotspots - Import frequency heatmap (core vs peripheral)
+pub(super) const HOTSPOTS_HELP: &str = "loct hotspots - Static dependency degree by file
 
 USAGE:
     loct hotspots [OPTIONS]
 
 DESCRIPTION:
-    Ranks files by how often they are imported (in-degree) to identify:
+    Ranks indexed files by incoming dependency degree, descending, then path.
+    In-degree counts distinct known-file source neighbors; out-degree counts
+    distinct known-file target neighbors. All snapshot edge kinds participate
+    (imports, modules, re-exports, calls, etc.); repeated (from,to) pairs count once.
+    Both endpoints must be known files in the static indexed snapshot.
 
-    CORE:       Files imported by 10+ others (critical infrastructure)
-    SHARED:     Files imported by 3-9 others (shared utilities)
-    PERIPHERAL: Files imported by 1-2 others (feature-specific)
-    LEAF:       Files with 0 importers (entry points or dead code)
-
-    This helps AI agents understand which files are risky to modify
-    (high in-degree = many dependents) vs safe to refactor (low in-degree).
+    CORE (10+), SHARED (3-9), PERIPHERAL (1-2), LEAF (0) are incoming degree
+    bands, not architectural roles. High degree suggests inspecting impact/follow.
+    A zero/low-degree file can still be an important external or runtime entry point.
+    Degree is not a runtime call count, hot path, performance score, dead-code
+    proof or safety certificate for refactoring.
 
 OPTIONS:
-    --min <N>              Minimum import count to show (default: 1)
+    --min <N>              Minimum incoming degree (default: 0, includes zero)
     --limit <N>            Maximum files to show (default: 50)
-    --leaves               Show only leaf nodes (0 importers)
-    --coupling             Include out-degree (files that import many others)
+    --leaves               Only zero incoming degree; overrides --min
+    --coupling             Include outgoing degree in text (JSON always has both)
     --root <PATH>          Project root (default: current directory)
-    --json                 Output as JSON for agent consumption
+    --json                 Output path, in_degree, out_degree, loc and category
     --help, -h             Show this help message
 
 EXAMPLES:
-    loct hotspots                    # Show top 50 most-imported files
+    loct hotspots                    # Top 50 by incoming degree, including zero
     loct hotspots --limit 20         # Top 20 only
-    loct hotspots --leaves           # Find leaf nodes (entry points / dead)
-    loct hotspots --coupling         # Show both in-degree and out-degree
-    loct hotspots --min 5            # Only files with 5+ importers
-    loct hotspots --json             # JSON output for AI tools
+    loct hotspots --leaves           # Zero known incoming neighbors
+    loct hotspots --coupling         # Incoming and outgoing degree
+    loct hotspots --min 5            # At least 5 distinct incoming neighbors
+    loct hotspots --json             # Same rows and degree bands as text
 
 OUTPUT FORMAT:
-    Import Hotspots (42 files analyzed)
-
-    CORE (10+ importers):
-      [32] src/utils/helpers.ts           # hub module
-      [18] src/components/Button.tsx
-
-    SHARED (3-9 importers):
-      [7]  src/hooks/useAuth.ts
-      [5]  src/api/client.ts
-
-    PERIPHERAL (1-2 importers):
-      [2]  src/features/login/form.tsx
-      [1]  src/features/login/types.ts
-
-    LEAF (0 importers):
-      src/pages/index.tsx               # entry point
-      src/features/old/legacy.ts        # possibly dead
-
+    Dependency Hotspots (42 files analyzed)
+    CORE (10+ incoming neighbors):
+      [32] src/utils/helpers.ts
     With --coupling:
-      [in:32 out:3]  src/utils/helpers.ts    # hub, low coupling
-      [in:2  out:15] src/features/main.tsx   # feature root, high coupling
+      [in:32 out:3] src/utils/helpers.ts
 
 RELATED COMMANDS:
-    loct dead               Find unused exports
-    loct impact <file>      Show what breaks if you modify a file
+    loct impact <file>      Inspect indexed dependents before modifying a file
+    loct follow hotspots   Inspect dependency neighborhoods
     loct focus <dir>        Extract context for a directory";
 
 pub(super) const LAYOUTMAP_HELP: &str = "loct layoutmap - Analyze CSS layout properties
@@ -1610,7 +1632,7 @@ OPTIONS:
     --scope                Validate snapshot scope (T1)
     --fix                  Purge scope-mismatched cache entries (T2; interactive)
     --yes                  Skip interactive confirmation for --fix
-    --json                 Emit JSON report with schema_version = \"1.0\"
+    --json                 Emit JSON report with schema_version = \"1.2\"
     --project PATH         Limit diagnostics to one project path
     --help, -h             Show this help message
 
@@ -1628,16 +1650,21 @@ RELATED COMMANDS:
     loct cache list      Deprecated; prefer loct doctor --list
     loct info            Show snapshot metadata for the current project";
 
-pub(super) const PLAN_HELP: &str = "loct plan - Generate architectural refactoring plan
+pub(super) const PLAN_HELP: &str =
+    "loct plan - Experimental path-heuristic refactoring preview (not proof of safety)
 
 USAGE:
     loct plan [OPTIONS] [PATHS...]
     loct p [OPTIONS] [PATHS...]
 
 DESCRIPTION:
-    Analyzes module coupling and generates a safe refactoring plan.
-    Detects architectural layers (UI, App, Kernel, Infra) and suggests
+    Analyzes module coupling and suggests a refactoring plan.
+    Infers architectural layers (UI, App, Kernel, Infra) using path heuristics and suggests
     file moves ordered by risk level (LOW first).
+    Generated moves and risk labels are not proof of safe refactoring.
+    Generated destinations can collide, including manifests and package entrypoints.
+    Do not execute generated scripts as-is. Review each destination, ownership,
+    runtime contracts and tests before applying any move.
 
     The plan includes:
     - Layer detection via path heuristics
@@ -1704,6 +1731,44 @@ RELATED COMMANDS:
     loct focus <dir>     Holographic context for a directory
     loct cycles          Detect circular imports
     loct audit           Full codebase audit";
+
+pub(super) const HELP_HELP: &str = "loct help - Show help without executing command behavior
+
+USAGE:
+    loct help [COMMAND]
+    loct <COMMAND> --help
+    loct help --full
+    loct help --legacy
+
+DESCRIPTION:
+    Live commands and their aliases share topic help. Retired sniff/zombie
+    topics exit nonzero with a migration to loct findings; they are not analyzers.
+    jq is a help-only topic for quoted filter expressions.
+
+OPTIONS:
+    --full             Show every live command and scope/migration boundaries
+    --legacy           Show legacy flag migrations
+    --help, -h         Show this help message";
+
+pub(super) const PRUNE_OLD_ARTIFACTS_HELP: &str =
+    "loct prune-old-artifacts - Prune old per-branch snapshot artifacts
+
+USAGE:
+    loct prune-old-artifacts [PATH] [OPTIONS]
+
+OPTIONS:
+    --root <PATH>      Project root to scan (default: current directory)
+    --keep <N>         Keep N newest per-branch snapshots per `.loctree/` (default: 3)
+    --include-sub      Also walk into sub-`.loctree/` dirs (e.g. `src-tauri/.loctree/`)
+    --apply            Actually delete files (default: dry-run preview)
+    --help, -h         Show this help message without scanning or deleting
+
+EXAMPLES:
+    loct prune-old-artifacts                       # Dry-run preview, root only
+    loct prune-old-artifacts --apply               # Actually delete in root .loctree/
+    loct prune-old-artifacts --include-sub         # Preview including sub-projects
+    loct prune-old-artifacts --include-sub --apply # Full sweep, hard apply
+    loct prune-old-artifacts --keep 5 --apply      # Keep 5 newest per dir";
 
 pub(super) const CACHE_HELP: &str = "loct cache - Manage snapshot cache
 
@@ -1931,3 +1996,28 @@ RELATED COMMANDS:
     loct snapshot-path --json
     loct context --full          Context atlas (hubs/cards) — different organ
     loct repo-view               Sense overview";
+
+pub(super) const HISTORY_HELP: &str = "loct history - Browse Git history and structural comparisons
+
+USAGE:
+    loct history [FILE] [--at REF] [--limit N] [--json]
+
+OPTIONS:
+    --at REF       Start revision (default HEAD), resolved to full SHA
+    --limit N      Maximum commits, 1..1000 (default 20)
+    --json         Full commit metadata and structural next commands
+
+File paths are relative to the current directory, including from subdirectories.
+History does not scan or modify the checkout. Follow the emitted diff commands
+to ask what changed IN each listed commit: its frozen first-parent SHA -> its SHA.
+For merges this is the net change relative to the first parent, not each parent
+or a combined merge diff. Initial commits have no parent: JSON command is null
+with boundary=initial_commit and a reason; no failing diff command is suggested.
+JSON keeps at/file/commits/suggested_next and adds comparison endpoints and parents.
+FILE filters the bounded timeline; structural diff commands compare the whole repo.
+This differs from changes SINCE a commit to --at or the current working tree.
+
+EXAMPLES:
+    loct history src/main.rs --limit 10
+    loct history --at v1.0.0 --json
+";

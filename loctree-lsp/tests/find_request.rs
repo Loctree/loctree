@@ -613,7 +613,7 @@ fn semantic_matches_sorted_by_score_desc() {
         .map(|c| c.score)
         .collect();
     let mut sorted = scores.clone();
-    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    sorted.sort_by(|a, b| b.partial_cmp(a).expect("finite fixture scores"));
     assert_eq!(scores, sorted, "semantic matches must be score-desc");
 }
 
@@ -828,8 +828,8 @@ fn non_literal_response_omits_literal_fields_from_json() {
 #[test]
 fn scan_literal_matches_shared_scanner_on_disk() {
     // Parity contract: the LSP scan_literal reads the same bytes and runs the
-    // same scanner as `loct occurrences`, so its output is byte-for-byte equal
-    // to a direct scan_files over the same content.
+    // same scanner and snapshot qualification as `loct occurrences`, so its
+    // output equals a directly enriched scan over the same content.
     let dir = tempfile::tempdir().expect("temp project");
     std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
     std::fs::write(dir.path().join("src/scribe.rs"), LITERAL_SOURCE).expect("write scribe.rs");
@@ -849,7 +849,8 @@ fn scan_literal_matches_shared_scanner_on_disk() {
         },
         FileScope::default(),
     );
-    let expected = scan_files([("src/scribe.rs", LITERAL_SOURCE)], "utterance_id");
+    let mut expected = scan_files([("src/scribe.rs", LITERAL_SOURCE)], "utterance_id");
+    loctree::analyzer::occurrences::enrich_with_snapshot(&mut expected, &snapshot);
 
     assert_eq!(
         serde_json::to_value(&scanned).unwrap(),
@@ -979,6 +980,171 @@ fn scan_literal_honors_file_scope_and_preserves_range_metadata() {
 }
 
 #[test]
+fn literal_bridge_semantics_match_shared_enrichment_before_reporting() {
+    use loctree::analyzer::occurrences::{enrich_with_snapshot, scan_files_for_literal_query};
+    use loctree::types::ExportSymbol;
+
+    let dir = tempfile::tempdir().expect("literal fixture");
+    let source = "getGlyphPack('before');\nexport function getGlyphPack(id: string) { return id; }\nfunction load(source: getGlyphPack = fallback) {}\nconst event = { getGlyphPack };\n// getGlyphPack\nconst label = 'getGlyphPack';\n";
+    std::fs::write(dir.path().join("packs.ts"), source).expect("write source");
+    std::fs::write(dir.path().join("other.ts"), "getGlyphPack('other');\n").expect("write sibling");
+    let mut snapshot = Snapshot::new(vec![dir.path().display().to_string()]);
+    let mut file = FileAnalysis::new("packs.ts".into());
+    file.exports.push(ExportSymbol {
+        name: "getGlyphPack".into(),
+        kind: "function".into(),
+        export_type: "named".into(),
+        line: Some(2),
+        params: Vec::new(),
+        symbol_id: Default::default(),
+    });
+    snapshot.files = vec![file, FileAnalysis::new("other.ts".into())];
+    let scope = FileScope {
+        file: Some("packs.ts"),
+    };
+    let mut expected = scan_files_for_literal_query(
+        &[
+            ("packs.ts", source),
+            ("other.ts", "getGlyphPack('other');\n"),
+        ],
+        "getGlyphPack",
+        ScanOptions::default(),
+        scope,
+    );
+    let raw_coordinates: Vec<_> = expected
+        .occurrences
+        .iter()
+        .map(|hit| (hit.file.clone(), hit.range, hit.matched_text.clone()))
+        .collect();
+    enrich_with_snapshot(&mut expected, &snapshot);
+    let cache = find::LiteralScanCache::new();
+    let scan = || {
+        cache.get_or_scan(
+            &snapshot,
+            Some(dir.path()),
+            "getGlyphPack",
+            ScanOptions::default(),
+            scope,
+        )
+    };
+    let actual = scan();
+    assert_eq!(
+        actual
+            .occurrences
+            .iter()
+            .map(|hit| (hit.file.clone(), hit.range, hit.matched_text.clone()))
+            .collect::<Vec<_>>(),
+        raw_coordinates
+    );
+    assert_eq!(
+        serde_json::to_value(&actual).expect("actual"),
+        serde_json::to_value(&expected).expect("expected")
+    );
+    assert_eq!(
+        serde_json::to_value(scan()).expect("cache hit"),
+        serde_json::to_value(&expected).expect("expected")
+    );
+    assert_eq!(expected.occurrences[1].match_role.as_str(), "definition");
+    assert_eq!(
+        expected.occurrences[1].confidence,
+        loctree::analyzer::occurrences::MatchConfidence::High
+    );
+    assert_eq!(expected.occurrences[2].match_role.as_str(), "reference");
+    assert_eq!(expected.total, 6);
+
+    let mut params = literal_params();
+    params.query = "getGlyphPack".into();
+    params.limit = Some(5);
+    params.group_by_file = true;
+    let page = find::build_literal_response(scan(), vec![], &params);
+    let page = serde_json::to_value(page.literal_matches).expect("page");
+    assert_eq!(page["occurrences"][0]["match_role"], "definition");
+    assert_eq!(page["total"], 6);
+    assert_eq!(page["emitted"], 5);
+    assert_eq!(page["page"]["has_more"], true);
+    params.offset = 5;
+    let tail =
+        serde_json::to_value(find::build_literal_response(scan(), vec![], &params).literal_matches)
+            .expect("tail");
+    assert_eq!(tail["emitted"], 1);
+    assert_eq!(tail["role_summary"], page["role_summary"]);
+    assert_eq!(tail["universe"], page["universe"]);
+    params.count_only = true;
+    let counts =
+        serde_json::to_value(find::build_literal_response(scan(), vec![], &params).literal_matches)
+            .expect("counts");
+    assert_eq!(counts["occurrences"], serde_json::json!([]));
+    assert_eq!(counts["total"], 6);
+    assert_eq!(counts["role_summary"], page["role_summary"]);
+
+    // The disk key is unchanged when a snapshot is reloaded with different
+    // semantic facts. A cache hit must qualify the raw matches again, rather
+    // than retaining the earlier snapshot's definition and candidate list.
+    let mut reloaded = snapshot.clone();
+    reloaded.files[0].exports.clear();
+    let requalified = cache.get_or_scan(
+        &reloaded,
+        Some(dir.path()),
+        "getGlyphPack",
+        ScanOptions::default(),
+        scope,
+    );
+    assert_eq!(requalified.occurrences[1].match_role.as_str(), "reference");
+    assert!(requalified.occurrences[1].definition_candidates.is_empty());
+    assert_eq!(
+        serde_json::to_value(&requalified).expect("requalified cache hit"),
+        serde_json::to_value(find::scan_literal(
+            &reloaded,
+            Some(dir.path()),
+            "getGlyphPack",
+            ScanOptions::default(),
+            scope
+        ))
+        .expect("reloaded direct scan")
+    );
+    assert_eq!(scan().occurrences[1].match_role.as_str(), "definition");
+
+    let mut generated = snapshot.clone();
+    generated.files[0].is_generated = true;
+    let excluded = cache.get_or_scan(
+        &generated,
+        Some(dir.path()),
+        "getGlyphPack",
+        ScanOptions {
+            no_generated: true,
+            ..Default::default()
+        },
+        scope,
+    );
+    assert_eq!(excluded.total, 0);
+    assert_eq!(
+        scan().total,
+        6,
+        "scan options cannot poison another cache entry"
+    );
+
+    std::fs::write(
+        dir.path().join("packs.ts"),
+        "// getGlyphPack after a saved dirty edit\n",
+    )
+    .expect("save edit");
+    let changed = scan();
+    assert_eq!(changed.total, 1);
+    assert_eq!(changed.occurrences[0].match_role.as_str(), "comment");
+    let direct = find::scan_literal(
+        &snapshot,
+        Some(dir.path()),
+        "getGlyphPack",
+        ScanOptions::default(),
+        scope,
+    );
+    assert_eq!(
+        serde_json::to_value(changed).expect("changed"),
+        serde_json::to_value(direct).expect("direct")
+    );
+}
+
+#[test]
 fn scan_literal_expands_agent_pipe_or_to_multi_literal() {
     // Same engine path as CLI/MCP: pipe form of simple identifiers is exact OR.
     let dir = tempfile::tempdir().expect("temp project");
@@ -1002,12 +1168,13 @@ fn scan_literal_expands_agent_pipe_or_to_multi_literal() {
         },
         FileScope::default(),
     );
-    let expected = loctree::analyzer::occurrences::scan_files_for_literal_query(
+    let mut expected = loctree::analyzer::occurrences::scan_files_for_literal_query(
         &[("src/runtime.rs", source)],
         "global_async_runtime|get_tokio_runtime",
         ScanOptions::default(),
         FileScope::default(),
     );
+    loctree::analyzer::occurrences::enrich_with_snapshot(&mut expected, &snapshot);
 
     assert_eq!(
         scanned.match_mode,

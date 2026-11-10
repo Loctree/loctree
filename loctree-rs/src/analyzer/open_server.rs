@@ -1,3 +1,8 @@
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,7 +30,7 @@ static OPEN_SERVER_BASE: OnceLock<String> = OnceLock::new();
 /// Falsy values (case-insensitive): `0`, `false`, `no`. Any other value
 /// (including unset) returns `false`, preserving the default open behavior.
 fn auto_open_disabled() -> bool {
-    match std::env::var(LOCT_OPEN_BROWSER_ENV) {
+    match env::var(LOCT_OPEN_BROWSER_ENV) {
         Ok(raw) => matches!(
             raw.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no"
@@ -671,22 +676,11 @@ mod tests {
         assert_eq!(url_encode_component(""), "");
     }
 
-    /// Serial mutex for env-var tests — `std::env::set_var` is process-global
-    /// and racing with parallel test threads would flake.
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-    }
-
     #[test]
     fn auto_open_disabled_respects_falsy_values() {
-        let _guard = env_lock();
-        let prev = std::env::var(LOCT_OPEN_BROWSER_ENV).ok();
+        let prev = env::var(LOCT_OPEN_BROWSER_ENV).ok();
 
         for raw in ["0", "false", "FALSE", "False", "no", "NO", " 0 ", "false "] {
-            // SAFETY: env mutation guarded by env_lock() for serial access.
             crate::test_env::set_var(LOCT_OPEN_BROWSER_ENV, raw);
             assert!(
                 auto_open_disabled(),
@@ -696,7 +690,6 @@ mod tests {
 
         // Truthy / unrecognized values keep the default open behavior.
         for raw in ["1", "true", "yes", "on", "", "anything-else"] {
-            // SAFETY: env mutation guarded by env_lock() for serial access.
             crate::test_env::set_var(LOCT_OPEN_BROWSER_ENV, raw);
             assert!(
                 !auto_open_disabled(),
@@ -704,7 +697,6 @@ mod tests {
             );
         }
 
-        // SAFETY: env mutation guarded by env_lock() for serial access.
         crate::test_env::remove_var(LOCT_OPEN_BROWSER_ENV);
         assert!(
             !auto_open_disabled(),
@@ -713,7 +705,6 @@ mod tests {
 
         // Restore prior value if any so neighbouring tests are unaffected.
         if let Some(prev) = prev {
-            // SAFETY: env mutation guarded by env_lock() for serial access.
             crate::test_env::set_var(LOCT_OPEN_BROWSER_ENV, prev);
         }
     }

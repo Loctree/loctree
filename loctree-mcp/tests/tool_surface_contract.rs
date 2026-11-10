@@ -569,9 +569,13 @@ struct StdioServer {
 
 impl StdioServer {
     fn start() -> Self {
+        Self::start_in(std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+    }
+
+    fn start_in(cwd: &std::path::Path) -> Self {
         let temp = tempfile::tempdir().ok();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_loctree-mcp"));
-        cmd.args(["--log-level", "error"]);
+        cmd.args(["--log-level", "error"]).current_dir(cwd);
         if let Some(ref t) = temp {
             cmd.env("LOCT_CACHE_DIR", t.path().join("cache"));
         }
@@ -868,4 +872,47 @@ fn sse_json(body: &str, id: u64) -> Value {
         }
     }
     panic!("SSE response id={id} not found in body: {body}");
+}
+
+#[test]
+fn twin_evidence_stdio_child_uses_explicit_project_from_foreign_cwd() {
+    let project = sample_project();
+    let foreign = tempfile::tempdir().expect("foreign");
+    let empty = tempfile::tempdir().expect("empty");
+    fs::create_dir_all(foreign.path().join("src")).expect("foreign src");
+    for name in ["a.rs", "b.rs"] {
+        fs::write(project.path().join("src").join(name), "#[derive(Debug)] pub struct Attributed;\npub fn shared(input: Input) -> Output { todo!() }\n").expect("owned source");
+        fs::write(
+            foreign.path().join("src").join(name),
+            "// misleading foreign source\n// misleading foreign source\n",
+        )
+        .expect("foreign source");
+    }
+    let mut expected = None;
+    for cwd in [project.path(), empty.path(), foreign.path()] {
+        let mut server = StdioServer::start_in(cwd);
+        server.initialize();
+        server.initialized();
+        let result = server.request(2, "tools/call", json!({
+            "name": "follow",
+            "arguments": {"project": project.path().to_string_lossy(), "scope": "twins", "limit": 100}
+        }));
+        let payload: Value = serde_json::from_str(
+            result["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text"),
+        )
+        .expect("payload");
+        assert!(
+            payload.to_string().contains("Attributed"),
+            "nonzero attribute control: {payload}"
+        );
+        if let Some(ref expected) = expected {
+            assert_eq!(expected, &payload);
+        } else {
+            expected = Some(payload);
+        }
+        // Drop shuts down and waits for this owned stdio child only.
+        drop(server);
+    }
 }

@@ -166,6 +166,13 @@ impl GitRepo {
         Ok(commit.id().to_string())
     }
 
+    /// Ordered, frozen parent hashes; the first parent defines a commit's net change.
+    pub fn parent_ids(&self, reference: &str) -> Result<Vec<String>, GitError> {
+        let sha = self.resolve_ref(reference)?;
+        let commit = self.repo.find_commit(Oid::from_str(&sha)?)?;
+        Ok(commit.parent_ids().map(|oid| oid.to_string()).collect())
+    }
+
     /// Get commit information for a given reference
     pub fn get_commit_info(&self, reference: &str) -> Result<CommitInfo, GitError> {
         let oid_str = self.resolve_ref(reference)?;
@@ -196,8 +203,19 @@ impl GitRepo {
 
     /// Get commit log for a file or the entire repository
     pub fn log(&self, file_path: Option<&Path>, limit: usize) -> Result<Vec<CommitInfo>, GitError> {
+        self.log_at("HEAD", file_path, limit)
+    }
+
+    /// Read a bounded timeline rooted at a selected immutable commit.
+    pub fn log_at(
+        &self,
+        at: &str,
+        file_path: Option<&Path>,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>, GitError> {
+        let sha = self.resolve_ref(at)?;
         let mut revwalk = self.repo.revwalk()?;
-        revwalk.push_head()?;
+        revwalk.push(Oid::from_str(&sha)?)?;
         revwalk.set_sorting(git2::Sort::TIME)?;
 
         let mut commits = Vec::new();
@@ -256,7 +274,7 @@ impl GitRepo {
         };
 
         let mut opts = DiffOptions::new();
-        opts.pathspec(file_path);
+        opts.pathspec(file_path).disable_pathspec_match(true);
 
         let diff =
             self.repo
@@ -303,6 +321,31 @@ impl GitRepo {
         }
 
         Ok(files)
+    }
+
+    /// Compare a frozen commit to index plus working files, including untracked files.
+    pub fn changed_files_in_worktree(&self, from: &str) -> Result<Vec<ChangedFile>, GitError> {
+        let oid = Oid::from_str(&self.resolve_ref(from)?)?;
+        let tree = self.repo.find_commit(oid)?.tree()?;
+        let mut options = git2::DiffOptions::new();
+        options.include_untracked(true).recurse_untracked_dirs(true);
+        let diff = self
+            .repo
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))?;
+        Ok(diff
+            .deltas()
+            .map(|delta| ChangedFile {
+                old_path: delta.old_file().path().map(Path::to_path_buf),
+                new_path: delta.new_file().path().map(Path::to_path_buf),
+                status: match delta.status() {
+                    git2::Delta::Added | git2::Delta::Untracked => ChangeStatus::Added,
+                    git2::Delta::Deleted => ChangeStatus::Deleted,
+                    git2::Delta::Renamed => ChangeStatus::Renamed,
+                    git2::Delta::Copied => ChangeStatus::Copied,
+                    _ => ChangeStatus::Modified,
+                },
+            })
+            .collect())
     }
 
     /// Get file content at a specific commit

@@ -5,6 +5,276 @@
 use super::help_texts::*;
 use super::types::Command;
 
+struct CommandTopic {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    text: &'static str,
+}
+
+// Shared vocabulary for syntax recognition, suggestions, topic help and the full reference.
+const COMMAND_TOPICS: &[CommandTopic] = &[
+    CommandTopic {
+        name: "auto",
+        aliases: &[],
+        text: AUTO_HELP,
+    },
+    CommandTopic {
+        name: "agent",
+        aliases: &[],
+        text: AGENT_HELP,
+    },
+    CommandTopic {
+        name: "scan",
+        aliases: &[],
+        text: SCAN_HELP,
+    },
+    CommandTopic {
+        name: "watch",
+        aliases: &[],
+        text: WATCH_HELP,
+    },
+    CommandTopic {
+        name: "tree",
+        aliases: &[],
+        text: TREE_HELP,
+    },
+    CommandTopic {
+        name: "slice",
+        aliases: &["s"],
+        text: SLICE_HELP,
+    },
+    CommandTopic {
+        name: "context",
+        aliases: &[],
+        text: CONTEXT_HELP,
+    },
+    CommandTopic {
+        name: "repo-view",
+        aliases: &[],
+        text: REPO_VIEW_HELP,
+    },
+    CommandTopic {
+        name: "find",
+        aliases: &["f"],
+        text: FIND_HELP,
+    },
+    CommandTopic {
+        name: "occurrences",
+        aliases: &[],
+        text: OCCURRENCES_HELP,
+    },
+    CommandTopic {
+        name: "findings",
+        aliases: &[],
+        text: FINDINGS_HELP,
+    },
+    CommandTopic {
+        name: "dead",
+        aliases: &["d", "unused"],
+        text: DEAD_HELP,
+    },
+    CommandTopic {
+        name: "cycles",
+        aliases: &["c"],
+        text: CYCLES_HELP,
+    },
+    CommandTopic {
+        name: "trace",
+        aliases: &[],
+        text: TRACE_HELP,
+    },
+    CommandTopic {
+        name: "commands",
+        aliases: &[],
+        text: COMMANDS_HELP,
+    },
+    CommandTopic {
+        name: "events",
+        aliases: &[],
+        text: EVENTS_HELP,
+    },
+    CommandTopic {
+        name: "pipelines",
+        aliases: &[],
+        text: PIPELINES_HELP,
+    },
+    CommandTopic {
+        name: "insights",
+        aliases: &[],
+        text: INSIGHTS_HELP,
+    },
+    CommandTopic {
+        name: "manifests",
+        aliases: &[],
+        text: MANIFESTS_HELP,
+    },
+    CommandTopic {
+        name: "info",
+        aliases: &[],
+        text: INFO_HELP,
+    },
+    CommandTopic {
+        name: "anchors",
+        aliases: &[],
+        text: ANCHORS_HELP,
+    },
+    CommandTopic {
+        name: "lint",
+        aliases: &[],
+        text: LINT_HELP,
+    },
+    CommandTopic {
+        name: "report",
+        aliases: &[],
+        text: REPORT_HELP,
+    },
+    CommandTopic {
+        name: "prism",
+        aliases: &[],
+        text: PRISM_HELP,
+    },
+    CommandTopic {
+        name: "help",
+        aliases: &[],
+        text: HELP_HELP,
+    },
+    CommandTopic {
+        name: "query",
+        aliases: &["q"],
+        text: QUERY_HELP,
+    },
+    CommandTopic {
+        name: "body",
+        aliases: &[],
+        text: BODY_HELP,
+    },
+    CommandTopic {
+        name: "diff",
+        aliases: &[],
+        text: DIFF_HELP,
+    },
+    CommandTopic {
+        name: "history",
+        aliases: &[],
+        text: HISTORY_HELP,
+    },
+    CommandTopic {
+        name: "crowd",
+        aliases: &[],
+        text: CROWD_HELP,
+    },
+    CommandTopic {
+        name: "tagmap",
+        aliases: &[],
+        text: TAGMAP_HELP,
+    },
+    CommandTopic {
+        name: "twins",
+        aliases: &["t"],
+        text: TWINS_HELP,
+    },
+    CommandTopic {
+        name: "suppress",
+        aliases: &[],
+        text: SUPPRESS_HELP,
+    },
+    CommandTopic {
+        name: "suppressions",
+        aliases: &[],
+        text: SUPPRESSIONS_HELP,
+    },
+    CommandTopic {
+        name: "routes",
+        aliases: &[],
+        text: ROUTES_HELP,
+    },
+    CommandTopic {
+        name: "dist",
+        aliases: &[],
+        text: DIST_HELP,
+    },
+    CommandTopic {
+        name: "coverage",
+        aliases: &[],
+        text: COVERAGE_HELP,
+    },
+    CommandTopic {
+        name: "impact",
+        aliases: &["i"],
+        text: IMPACT_HELP,
+    },
+    CommandTopic {
+        name: "focus",
+        aliases: &[],
+        text: FOCUS_HELP,
+    },
+    CommandTopic {
+        name: "hotspots",
+        aliases: &[],
+        text: HOTSPOTS_HELP,
+    },
+    CommandTopic {
+        name: "follow",
+        aliases: &[],
+        text: FOLLOW_HELP,
+    },
+    CommandTopic {
+        name: "layoutmap",
+        aliases: &[],
+        text: LAYOUTMAP_HELP,
+    },
+    CommandTopic {
+        name: "health",
+        aliases: &["h"],
+        text: HEALTH_HELP,
+    },
+    CommandTopic {
+        name: "audit",
+        aliases: &[],
+        text: AUDIT_HELP,
+    },
+    CommandTopic {
+        name: "doctor",
+        aliases: &[],
+        text: DOCTOR_HELP,
+    },
+    CommandTopic {
+        name: "env-truth",
+        aliases: &["envtruth"],
+        text: ENV_TRUTH_HELP,
+    },
+    CommandTopic {
+        name: "plan",
+        aliases: &["p"],
+        text: PLAN_HELP,
+    },
+    CommandTopic {
+        name: "cache",
+        aliases: &[],
+        text: CACHE_HELP,
+    },
+    CommandTopic {
+        name: "prune-old-artifacts",
+        aliases: &[],
+        text: PRUNE_OLD_ARTIFACTS_HELP,
+    },
+    CommandTopic {
+        name: "snapshot-path",
+        aliases: &[],
+        text: SNAPSHOT_PATH_HELP,
+    },
+    CommandTopic {
+        name: "inventory",
+        aliases: &[],
+        text: INVENTORY_HELP,
+    },
+    CommandTopic {
+        name: "atlas",
+        aliases: &[],
+        text: ATLAS_HELP,
+    },
+];
+
 /// Legacy-path usage banner. Version is compile-time so it cannot drift from Cargo.toml.
 pub const LOCT_USAGE: &str = concat!(
     "loct - Static Analysis for AI Agents (v",
@@ -51,6 +321,19 @@ More: loct --help-full\n"
 );
 
 impl Command {
+    pub(crate) fn subcommand_names() -> impl Iterator<Item = &'static str> {
+        COMMAND_TOPICS
+            .iter()
+            .flat_map(|topic| std::iter::once(topic.name).chain(topic.aliases.iter().copied()))
+    }
+
+    pub(crate) fn canonical_subcommand(name: &str) -> Option<&'static str> {
+        COMMAND_TOPICS
+            .iter()
+            .find(|topic| topic.name == name || topic.aliases.contains(&name))
+            .map(|topic| topic.name)
+    }
+
     /// Hard retirement messages for command shells kept only for migration.
     pub fn retired_command_message(command: &str) -> Option<&'static str> {
         match command {
@@ -96,6 +379,7 @@ impl Command {
             Command::Query(_) => "query",
             Command::Body(_) => "body",
             Command::Diff(_) => "diff",
+            Command::History(_) => "history",
             Command::Crowd(_) => "crowd",
             Command::Tagmap(_) => "tagmap",
             Command::Twins(_) => "twins",
@@ -159,6 +443,7 @@ impl Command {
             Command::Query(_) => "Query snapshot data (who-imports, where-symbol, component-of)",
             Command::Body(_) => "Show bounded source body/range of a symbol (no grep)",
             Command::Diff(_) => "Compare snapshots and show semantic delta",
+            Command::History(_) => "Browse Git history and structural comparison entry points",
             Command::Crowd(_) => "Detect functional crowds (similar files clustering)",
             Command::Tagmap(_) => "Unified search: files + crowd + dead around a keyword",
             Command::Twins(_) => "Show symbol registry and dead parrots (0 imports)",
@@ -166,14 +451,14 @@ impl Command {
             Command::Suppressions(_) => {
                 "Source-side silencer inventory (allow/nosemgrep/ts-ignore/noqa/unsafe...) — literal-only"
             }
-            Command::Routes(_) => "List backend/web routes (FastAPI/Flask)",
+            Command::Routes(_) => "List Python FastAPI/Flask and narrow Rust Axum routes",
             Command::Dist(_) => "Verify tree-shaking from production source maps",
             Command::Coverage(_) => "Analyze test coverage gaps (structural coverage)",
             Command::Sniff(_) => "Sniff for code smells (twins + dead parrots + crowds)",
             Command::JqQuery(_) => "Query snapshot with jq-style filters (loct '.filter')",
             Command::Impact(_) => "Analyze impact of modifying/removing a file",
             Command::Focus(_) => "Extract holographic context for a directory",
-            Command::Hotspots(_) => "Show import frequency heatmap (core vs peripheral)",
+            Command::Hotspots(_) => "Show static dependency degree by file",
             Command::Follow(_) => "Pursue structural signals from one unified surface",
             Command::Layoutmap(_) => "Analyze CSS layout (z-index, position, grid/flex)",
             Command::Zombie(_) => "Find zombie code (dead exports + orphan files + shadows)",
@@ -184,7 +469,9 @@ impl Command {
                 "Audit report; aggregates dead/twins/cycles — no additional detectors"
             }
             Command::Doctor(_) => "Cache identity and snapshot scope diagnostics",
-            Command::Plan(_) => "Generate architectural refactoring plan",
+            Command::Plan(_) => {
+                "Experimental path-heuristic refactoring preview (not proof of safety)"
+            }
             Command::Cache(_) => "Manage snapshot cache (list, clean)",
             Command::EnvTruth(_) => {
                 "Audit env declaration sources for resolution-order drift (Cut 8 / Lane 4)"
@@ -270,59 +557,14 @@ impl Command {
 
     /// Generate help text for a specific subcommand (new CLI).
     pub fn format_command_help(command: &str) -> Option<&'static str> {
-        match command {
-            "auto" => Some(AUTO_HELP),
-            "agent" => Some(AGENT_HELP),
-            "scan" => Some(SCAN_HELP),
-            "watch" => Some(WATCH_HELP),
-            "tree" => Some(TREE_HELP),
-            "slice" => Some(SLICE_HELP),
-            "context" => Some(CONTEXT_HELP),
-            "repo-view" => Some(REPO_VIEW_HELP),
-            "find" => Some(FIND_HELP),
-            "occurrences" => Some(OCCURRENCES_HELP),
-            "dead" | "unused" => Some(DEAD_HELP),
-            "cycles" => Some(CYCLES_HELP),
-            "trace" => Some(TRACE_HELP),
-            "commands" => Some(COMMANDS_HELP),
-            "events" => Some(EVENTS_HELP),
-            "pipelines" => Some(PIPELINES_HELP),
-            "insights" => Some(INSIGHTS_HELP),
-            "manifests" => Some(MANIFESTS_HELP),
-            "info" => Some(INFO_HELP),
-            "anchors" => Some(ANCHORS_HELP),
-            "lint" => Some(LINT_HELP),
-            "report" => Some(REPORT_HELP),
-            "prism" => Some(PRISM_HELP),
-            "findings" => Some(FINDINGS_HELP),
-            "query" => Some(QUERY_HELP),
-            "body" => Some(BODY_HELP),
-            "impact" => Some(IMPACT_HELP),
-            "diff" => Some(DIFF_HELP),
-            "crowd" => Some(CROWD_HELP),
-            "tagmap" => Some(TAGMAP_HELP),
-            "twins" => Some(TWINS_HELP),
-            "routes" => Some(ROUTES_HELP),
-            "dist" => Some(DIST_HELP),
-            "coverage" => Some(COVERAGE_HELP),
-            "suppress" => Some(SUPPRESS_HELP),
-            "suppressions" => Some(SUPPRESSIONS_HELP),
-            "focus" => Some(FOCUS_HELP),
-            "hotspots" => Some(HOTSPOTS_HELP),
-            "follow" => Some(FOLLOW_HELP),
-            "layoutmap" => Some(LAYOUTMAP_HELP),
-            "health" => Some(HEALTH_HELP),
-            "audit" => Some(AUDIT_HELP),
-            "doctor" => Some(DOCTOR_HELP),
-            "jq" => Some(JQ_HELP),
-            "plan" | "p" => Some(PLAN_HELP),
-            "cache" => Some(CACHE_HELP),
-            "env-truth" | "envtruth" => Some(ENV_TRUTH_HELP),
-            "snapshot-path" => Some(SNAPSHOT_PATH_HELP),
-            "inventory" => Some(INVENTORY_HELP),
-            "atlas" => Some(ATLAS_HELP),
-            _ => None,
+        if command == "jq" {
+            return Some(JQ_HELP);
         }
+        let canonical = Self::canonical_subcommand(command)?;
+        COMMAND_TOPICS
+            .iter()
+            .find(|topic| topic.name == canonical)
+            .map(|topic| topic.text)
     }
 
     /// Generate the full help text with ALL commands (auto-generated).
@@ -339,109 +581,72 @@ impl Command {
             "            Run `loct` to create artifacts, then query with subcommands.\n\n",
         );
 
-        // === INSTANT COMMANDS (< 100ms) ===
-        help.push_str("=== INSTANT COMMANDS (<100ms) ===\n\n");
-        let instant_cmds = [
-            ("focus <dir>", "Holographic context for a directory"),
-            ("hotspots", "Import frequency heatmap (core vs peripheral)"),
-            ("commands", "Tauri FE↔BE handler bridges"),
-            ("events", "Event emit/listen flow analysis"),
-            ("pipelines", "Pipeline summary (events/commands/risks)"),
-            ("insights", "AI insights summary"),
-            ("manifests", "Manifest summaries (package.json/Cargo.toml)"),
-            ("coverage", "Test coverage gaps (structural)"),
-            (
-                "health",
-                "Aggregates dead/twins/cycles — no additional detectors",
-            ),
-            ("findings", "Full findings JSON or summary for pipes/CI"),
-            ("anchors", "Deterministic loctree.anchors.v1 catalog"),
-            ("context", "Markdown pill + artifacts; --full for full pack"),
-            ("repo-view", "Repository overview for AI agents"),
-            ("snapshot-path", "Resolve snapshot.json path (no body dump)"),
-            ("inventory", "JSONL file inventory + coverage receipt"),
-            ("atlas", "Repo atlas pack: sense / inventory / signals"),
-            ("prism", "Compare task framings and score conceptual smear"),
-            ("slice <file>", "Context for a file (deps + consumers)"),
-            ("impact <file>", "What breaks if you modify this file"),
-            ("occurrences <id>", "Literal exact-identifier truth scan"),
-            ("body <symbol>", "Bounded source body/range for a symbol"),
-            ("query <type>", "Graph queries (who-imports, where-symbol)"),
-        ];
-        for (cmd, desc) in instant_cmds {
-            help.push_str(&format!("  loct {:<16} {}\n", cmd, desc));
-        }
-        help.push('\n');
+        help.push_str("=== START WITH YOUR QUESTION ===\n\n");
+        help.push_str("  Where is this name used?       loct find GitContext\n");
+        help.push_str("  What does its file connect to? loct slice loctree-rs/src/git.rs\n");
+        help.push_str("  What would this change affect? loct impact loctree-rs/src/git.rs\n");
+        help.push_str("  How does this module fit?      loct focus loctree-rs/src/cli/\n");
+        help.push_str("  Where does this domain live?   loct tagmap snapshot --limit 10\n");
+        help.push_str("  Which structural risks exist?  loct follow all --limit 10\n");
+        help.push_str(
+            "  Where are the HTTP endpoints?  loct routes  # FastAPI/Flask; narrow Axum shapes\n",
+        );
+        help.push_str("  What changed since a commit?   loct diff --since HEAD~1\n\n");
+        help.push_str("  Start with the name you know. Read its definitions, enclosing symbols,\n");
+        help.push_str("  and consumers; use slice/focus/impact to follow the relationships.\n");
+        help.push_str("  Inspect implementation with body. Read <command> --help for scope.\n");
+        help.push_str("  follow trace is a Tauri command bridge, not a general call graph.\n\n");
 
-        // === ANALYSIS COMMANDS ===
-        help.push_str("=== ANALYSIS COMMANDS ===\n\n");
-        let analysis_cmds = [
-            ("dead", "Find unused exports / dead code"),
-            ("cycles", "Detect circular import chains"),
-            ("twins", "Find dead parrots (0 imports) + duplicate exports"),
-            ("follow [scope]", "Unified signal follower"),
-            (
-                "audit",
-                "Aggregates dead/twins/cycles — no additional detectors",
-            ),
-            ("crowd <kw>", "Functional clustering around keyword"),
-            ("tagmap <kw>", "Unified search: files + crowd + dead"),
-        ];
-        for (cmd, desc) in analysis_cmds {
-            help.push_str(&format!("  loct {:<16} {}\n", cmd, desc));
+        help.push_str("=== LIVE COMMANDS ===\n\n");
+        for topic in COMMAND_TOPICS {
+            let description = topic
+                .text
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .split_once(" - ")
+                .map(|(_, description)| description)
+                .unwrap_or_default();
+            help.push_str(&format!("  loct {:<20} {}\n", topic.name, description));
+            for alias in topic.aliases {
+                help.push_str(&format!(
+                    "  loct {:<20} Alias for loct {}\n",
+                    alias, topic.name
+                ));
+            }
         }
         help.push('\n');
-
-        // === FRAMEWORK-SPECIFIC ===
-        help.push_str("=== FRAMEWORK-SPECIFIC ===\n\n");
-        let framework_cmds = [
-            ("trace <handler>", "Trace Tauri handler end-to-end"),
-            ("routes", "List FastAPI/Flask routes"),
-            ("dist", "Verify tree-shaking from one or more source maps"),
-            ("layoutmap", "CSS z-index/position/grid analysis"),
-        ];
-        for (cmd, desc) in framework_cmds {
-            help.push_str(&format!("  loct {:<16} {}\n", cmd, desc));
-        }
-        help.push('\n');
-
-        // === MANAGEMENT ===
-        help.push_str("=== MANAGEMENT ===\n\n");
-        let mgmt_cmds = [
-            ("doctor", "Cache identity and snapshot scope diagnostics"),
-            (
-                "env-truth",
-                "Audit env declaration drift (dotenv/k8s/helm/GHA/...)",
-            ),
-            ("suppress", "Manage false positive suppressions"),
-            (
-                "suppressions",
-                "Source-side silencer inventory (allow/nosemgrep/ts-ignore/noqa/unsafe...)",
-            ),
-            ("cache", "Manage snapshot cache (list, clean)"),
-            ("diff", "Compare snapshots between branches/commits"),
-        ];
-        for (cmd, desc) in mgmt_cmds {
-            help.push_str(&format!("  loct {:<16} {}\n", cmd, desc));
-        }
-        help.push('\n');
-
-        // === CORE WORKFLOW ===
-        help.push_str("=== CORE WORKFLOW ===\n\n");
-        let core_cmds = [
-            ("auto", "Full scan → cached artifacts (see LOCT_CACHE_DIR)"),
-            ("scan", "Build/update snapshot (supports --watch)"),
-            ("watch", "Per-root locked watch loop; --http exposes MCP"),
-            ("tree", "Directory tree with LOC counts"),
-            ("find <id>", "Exact literal identifier search"),
-            ("find --discover X", "Broad AST/parameter/fuzzy discovery"),
-            ("report", "Generate HTML report + cached artifacts"),
-            ("lint", "Structural lint and policy checks"),
-        ];
-        for (cmd, desc) in core_cmds {
-            help.push_str(&format!("  loct {:<16} {}\n", cmd, desc));
-        }
-        help.push('\n');
+        help.push_str("  loct find --discover X    Broad AST/parameter/fuzzy discovery\n\n");
+        help.push_str("=== LIMITS AND MIGRATION ===\n\n");
+        help.push_str("  hotspots: Static indexed snapshot degree; all edge kinds, distinct known-file (from,to) pairs.\n");
+        help.push_str("            In-degree = source neighbors; out-degree = target neighbors.\n");
+        help.push_str(
+            "            CORE/SHARED/PERIPHERAL/LEAF are degree bands, not architectural roles.\n",
+        );
+        help.push_str("            High degree suggests impact/follow inspection; zero/low-degree external or runtime entry points can matter.\n");
+        help.push_str("            No runtime call counts, hot paths, performance scores, dead-code proof or refactoring safety certificate.\n");
+        help.push_str("            --min default: 0; --limit default: 50; --leaves selects zero and overrides --min.\n");
+        help.push_str("  occurrences: Literal inclusion does not depend on symbol extraction.\n");
+        help.push_str("               Role metadata may use source AST and snapshot anchors.\n");
+        help.push_str("               No fuzzy suggestions are promoted as primary results.\n");
+        help.push_str(
+            "  routes: Python FastAPI/Flask decorators; Rust Axum .route(path, method(handler)).\n",
+        );
+        help.push_str(
+            "          Axum method-chain registrations are partial (first method only).\n",
+        );
+        help.push_str("          TypeScript routing frameworks are unsupported; zero is not proof of absence.\n");
+        help.push_str(
+            "  plan: experimental path-heuristic preview, not proof of safe refactoring.\n",
+        );
+        help.push_str(
+            "        Generated destinations can collide. Do not execute generated scripts as-is.\n",
+        );
+        help.push_str("  sniff, zombie: retired; use `loct findings`. Not live analyzers; help exits nonzero.\n");
+        help.push_str(
+            "  jq: help-only topic (`loct help jq`); execute quoted filters, not `loct jq`.\n",
+        );
+        help.push_str("  version: use `loct --version`; not a positional command.\n\n");
 
         // === CAPABILITIES ===
         help.push_str("=== CAPABILITIES ===\n\n");
@@ -523,7 +728,7 @@ impl Command {
         help.push_str("  loct                       # Scan repo, create artifacts\n");
         help.push_str("  loct health                # Quick health check\n");
         help.push_str("  loct health --json         # Summary JSON for CI\n");
-        help.push_str("  loct hotspots              # Find hub files\n\n");
+        help.push_str("  loct hotspots              # Rank static incoming degree\n\n");
 
         help.push_str("  # Deep analysis\n");
         help.push_str("  loct focus src/features/   # Directory context\n");

@@ -6,6 +6,11 @@
 //! falls back to the published 3-line text block format because that
 //! subcommand does not yet emit JSON.
 
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use serde::Deserialize;
 use std::io::Read;
 use std::path::PathBuf;
@@ -36,7 +41,7 @@ pub const AICX_TIMEOUT_ENV: &str = "LOCT_AICX_TIMEOUT_SECS";
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn invocation_timeout() -> Duration {
-    std::env::var(AICX_TIMEOUT_ENV)
+    env::var(AICX_TIMEOUT_ENV)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -46,7 +51,7 @@ fn invocation_timeout() -> Duration {
 
 /// Resolve which binary to invoke for `aicx`.
 pub(super) fn aicx_binary() -> PathBuf {
-    std::env::var(AICX_BINARY_ENV)
+    env::var(AICX_BINARY_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("aicx"))
 }
@@ -68,7 +73,10 @@ pub fn is_aicx_available() -> bool {
 
 fn is_aicx_available_uncached() -> bool {
     let bin = aicx_binary();
-    let mut child = match Command::new(&bin)
+    let mut probe = Command::new(&bin);
+    #[cfg(test)]
+    crate::test_env::apply(&mut probe);
+    let mut child = match probe
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -103,7 +111,7 @@ fn is_aicx_available_uncached() -> bool {
 
 /// Emit a single debug line on stderr, gated by `LOCT_DEBUG`.
 pub(super) fn debug_log(msg: impl AsRef<str>) {
-    if std::env::var("LOCT_DEBUG")
+    if env::var("LOCT_DEBUG")
         .ok()
         .filter(|v| !v.is_empty())
         .is_some()
@@ -148,6 +156,8 @@ pub(super) fn run_aicx_outcome(
 ) -> Result<String, AicxRunFailure> {
     let bin = aicx_binary();
     let mut cmd = Command::new(&bin);
+    #[cfg(test)]
+    crate::test_env::apply(&mut cmd);
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

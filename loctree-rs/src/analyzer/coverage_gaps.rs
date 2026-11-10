@@ -28,26 +28,33 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Source hak: 2026-05-18 Screenscribe HAK 3 (`loct coverage` mixes external
 /// imports as "missing exports"). See `~/internal-artifacts/loctree/loctree-feedback.md`.
-fn import_is_local_repo_symbol(import: &ImportEntry) -> bool {
+fn import_is_local_repo_symbol(import: &ImportEntry, local_paths: &HashSet<&str>) -> bool {
     match import.resolution {
         ImportResolutionKind::Local => true,
-        ImportResolutionKind::Stdlib
-        | ImportResolutionKind::Dynamic
-        | ImportResolutionKind::Unknown => false,
+        // Some parsers leave the category Unknown after the shared resolver
+        // has established a local target (notably JS/TS). The snapshot target
+        // is stronger evidence than that unset category. Never admit an
+        // unresolved package import or a target outside this snapshot.
+        ImportResolutionKind::Unknown => import
+            .resolved_path
+            .as_ref()
+            .is_some_and(|target| local_paths.contains(target.as_str())),
+        ImportResolutionKind::Stdlib | ImportResolutionKind::Dynamic => false,
     }
 }
 
 /// N1 (round-2): which export kinds have behavior a test could cover.
 ///
 /// `export_without_test` gaps and the `coverage_percent` denominator only
-/// apply to functions/methods. Types (`struct`/`enum`/`trait`/`type`/
+/// apply to functions/methods, including the Python `def` and Swift `func`
+/// spellings emitted by the canonical parsers. Types (`struct`/`enum`/`trait`/`type`/
 /// `union`), constants (`decl`), re-exports (`reexport`) and FFI `extern`
 /// declarations carry no executable behavior of their own - flagging them
 /// as "untested" produced pure noise (e.g. extern `AXUIElementCopyAttributeValue`
 /// fired a medium gap). Integrator decision, round 2 cut V: those kinds are
 /// removed from this surface entirely (no new Info severity).
 pub(crate) fn is_testable_export_kind(kind: &str) -> bool {
-    matches!(kind, "function" | "method")
+    matches!(kind, "function" | "method" | "def" | "func")
 }
 
 /// A gap in test coverage
@@ -413,6 +420,7 @@ fn find_export_gaps(
     test_files: &HashSet<String>,
 ) -> Vec<CoverageGap> {
     let mut gaps = Vec::new();
+    let local_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
 
     // N1 (round-2): name -> is-a-testable-kind map, built from snapshot
     // exports. Only functions/methods can have a "missing test" gap; types,
@@ -445,7 +453,7 @@ fn find_export_gaps(
             // gaps for `from typing import Annotated`, `from rich.progress
             // import BarColumn`, etc. — drowning real gaps in noise.
             // See loctree-feedback.md 2026-05-18 Screenscribe HAK 3.
-            if !import_is_local_repo_symbol(import) {
+            if !import_is_local_repo_symbol(import, &local_paths) {
                 continue;
             }
             for symbol in &import.symbols {
@@ -473,10 +481,10 @@ fn find_export_gaps(
 
         // N1 (round-2): symbols whose exports are all non-testable kinds
         // (struct/enum/trait/type/union/decl/reexport/extern) never produce
-        // this gap. Symbols with NO export entry keep the historical
-        // behavior (eligible) - absence from the map proves nothing about
-        // the symbol's kind.
-        let kind_testable = testable_kinds.get(&symbol).copied().unwrap_or(true);
+        // this gap. A missing export is not evidence of callable behavior:
+        // e.g. Python values may be imported without an ExportSymbol entry.
+        // Keep the same known-callable universe as the coverage report.
+        let kind_testable = testable_kinds.get(&symbol).copied().unwrap_or(false);
 
         if !is_tested && kind_testable && usage_locations.len() >= 2 {
             // Only flag if used in multiple places (more important)
@@ -528,6 +536,7 @@ fn find_tested_but_unused(
     test_file_paths: &HashSet<String>,
 ) -> Vec<CoverageGap> {
     let mut gaps = Vec::new();
+    let local_paths: HashSet<&str> = files.iter().map(|file| file.path.as_str()).collect();
 
     // Build set of production-used handlers and events
     let mut production_handlers: HashSet<String> = HashSet::new();
@@ -553,7 +562,7 @@ fn find_tested_but_unused(
             continue;
         }
         for import in &file.imports {
-            if !import_is_local_repo_symbol(import) {
+            if !import_is_local_repo_symbol(import, &local_paths) {
                 continue;
             }
             for symbol in &import.symbols {
@@ -734,6 +743,34 @@ pub fn gaps_to_quick_wins(gaps: &[CoverageGap]) -> Vec<crate::analyzer::for_ai::
 mod tests {
     use super::*;
     use crate::types::{ExportSymbol, ImportEntry, ImportKind, ImportSymbol};
+
+    #[test]
+    fn callable_spellings_share_one_bounded_allowlist() {
+        for kind in ["function", "method", "def", "func"] {
+            assert!(is_testable_export_kind(kind), "{kind}");
+        }
+        for kind in [
+            "struct", "enum", "trait", "type", "union", "decl", "const", "reexport", "extern",
+            "class", "var", "let", "default", "property", "field",
+        ] {
+            assert!(!is_testable_export_kind(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn unknown_import_requires_a_snapshot_target_and_externals_stay_excluded() {
+        let local_paths = HashSet::from(["src/service.ts"]);
+        let mut import = unknown_bare_import("./service", "run");
+        assert!(!import_is_local_repo_symbol(&import, &local_paths));
+        import.resolved_path = Some("outside/service.ts".to_string());
+        assert!(!import_is_local_repo_symbol(&import, &local_paths));
+        import.resolved_path = Some("src/service.ts".to_string());
+        assert!(import_is_local_repo_symbol(&import, &local_paths));
+        for resolution in [ImportResolutionKind::Stdlib, ImportResolutionKind::Dynamic] {
+            import.resolution = resolution;
+            assert!(!import_is_local_repo_symbol(&import, &local_paths));
+        }
+    }
 
     fn local_import(source: &str, symbol: &str) -> ImportEntry {
         let mut imp = ImportEntry::new(source.to_string(), ImportKind::Static);
@@ -951,6 +988,10 @@ mod tests {
     #[test]
     fn find_export_gaps_keeps_local_imports() {
         let files = vec![
+            file_with_exports(
+                "screenscribe/internal_util.py",
+                vec![("process_video", "def")],
+            ),
             file_with_imports(
                 "screenscribe/cli.py",
                 vec![local_import("./internal_util", "process_video")],
@@ -1024,18 +1065,19 @@ mod tests {
         assert_eq!(real.severity, Severity::Medium);
     }
 
-    /// N1 (round-2): a symbol with no export entry at all (kind unknowable)
-    /// keeps the historical behavior and stays eligible.
+    /// D20 supersedes the speculative N1 fallback: import spelling alone
+    /// cannot prove callable behavior. The parser-backed Python VALUE control
+    /// in coverage_callable_cli covers the real constant false positive.
     #[test]
-    fn find_export_gaps_keeps_symbols_without_kind_evidence() {
+    fn find_export_gaps_requires_known_callable_kind_evidence() {
         let files = vec![
             file_with_imports("src/a.rs", vec![local_import("./util", "mystery_fn")]),
             file_with_imports("src/b.rs", vec![local_import("./util", "mystery_fn")]),
         ];
         let gaps = find_export_gaps(&files, &HashMap::new(), &HashSet::new());
         assert!(
-            gaps.iter().any(|g| g.target == "mystery_fn"),
-            "unknown-kind symbol must stay eligible (was: {:?})",
+            gaps.is_empty(),
+            "unknown-kind symbol must not be guessed callable (was: {:?})",
             gaps
         );
     }

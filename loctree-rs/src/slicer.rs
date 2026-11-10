@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::args::ParsedArgs;
 use crate::snapshot::Snapshot;
-use crate::types::FileAnalysis;
+use crate::types::{FileAnalysis, ReexportKind};
 
 fn assemble_slice_target_path(input: &str) -> io::Result<PathBuf> {
     if input.trim().is_empty() {
@@ -180,6 +180,9 @@ pub struct HolographicSlice {
     pub deps: Vec<SliceFile>,
     /// Consumer layer files (who imports target)
     pub consumers: Vec<SliceFile>,
+    /// Evidence and limits of consumer modeling, not a count of missing callers.
+    #[serde(default)]
+    pub consumer_coverage: ConsumerCoverage,
     /// Files that use symbols defined in the target without importing it —
     /// the symbol-graph consumer layer (Wave C-1). Catches the Swift
     /// intra-module case where the import graph is structurally silent.
@@ -216,6 +219,100 @@ pub struct SymbolConsumer {
     pub language: String,
     /// Target-defined symbol names this consumer touches.
     pub symbols: Vec<String>,
+}
+
+/// Coverage of represented consumer relationships, never compiler-complete usage.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerCoverage {
+    pub status: ConsumerCoverageStatus,
+    pub compiler_complete: bool,
+    /// Denominator for snapshot-global unresolved re-export observations.
+    pub snapshot_reexports: usize,
+    /// Distinct resolved facades visited, excluding the target.
+    pub reachable_barrels: usize,
+    /// Counts are observations of the stated reason/scope, not missing consumers.
+    pub diagnostics: Vec<ConsumerDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerCoverageStatus {
+    /// Old serialized results or projections that did not measure coverage.
+    #[default]
+    NotMeasured,
+    NotRequested,
+    /// No target-reachable qualification observed within the binding model.
+    Modeled,
+    Partial,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerDiagnosticScope {
+    /// Target or reachable facade observations; not proof of missing target usage.
+    TargetReachable,
+    /// Entire snapshot; target relevance has not been established.
+    SnapshotGlobal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerDiagnosticReason {
+    UnresolvedReexports,
+    MissingBindingMetadata,
+    UnmodeledStarExports,
+    WildcardReexports,
+    NamespaceImports,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumerDiagnostic {
+    pub scope: ConsumerDiagnosticScope,
+    pub reason: ConsumerDiagnosticReason,
+    pub count: usize,
+    pub message: String,
+}
+
+impl ConsumerCoverage {
+    fn observe(
+        &mut self,
+        scope: ConsumerDiagnosticScope,
+        reason: ConsumerDiagnosticReason,
+        count: usize,
+        message: &str,
+    ) {
+        if count == 0 {
+            return;
+        }
+        if scope == ConsumerDiagnosticScope::TargetReachable {
+            self.status = ConsumerCoverageStatus::Partial;
+        }
+        self.diagnostics.push(ConsumerDiagnostic {
+            scope,
+            reason,
+            count,
+            message: message.to_string(),
+        });
+    }
+
+    /// Useful for human projections; machine projections retain the typed data.
+    pub fn notes(&self) -> Vec<String> {
+        self.diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let scope = match diagnostic.scope {
+                    ConsumerDiagnosticScope::TargetReachable => "target-reachable",
+                    ConsumerDiagnosticScope::SnapshotGlobal => {
+                        "snapshot-global, target relevance unknown"
+                    }
+                };
+                format!(
+                    "Consumer coverage ({scope}, {} observations): {}",
+                    diagnostic.count, diagnostic.message
+                )
+            })
+            .collect()
+    }
 }
 
 pub(crate) fn collect_core_symbols(file: &FileAnalysis) -> Vec<CoreSymbol> {
@@ -272,10 +369,6 @@ pub(crate) fn suggested_next_for_symbols(
             command: format!("loct body {quoted} --json"),
             reason: format!("inspect the defining body for {}", symbol.name),
         });
-        steps.push(SuggestedNext {
-            command: format!("loct find --literal {quoted} --json"),
-            reason: "confirm exact identifier-boundary parity before editing".to_string(),
-        });
     }
     steps.push(SuggestedNext {
         command: target_command,
@@ -321,6 +414,201 @@ fn strip_extension(path: &str) -> &str {
         }
     }
     path
+}
+
+/// Follow resolved re-export bindings, not arbitrary consumers of a facade.
+/// The queue carries the exported name at each hop so aliases and mixed barrels
+/// cannot turn consumers of unrelated bindings into consumers of the target.
+fn collect_reexport_consumers(
+    snapshot: &Snapshot,
+    target: &FileAnalysis,
+) -> (HashMap<String, usize>, ConsumerCoverage) {
+    let files: HashMap<_, _> = snapshot
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
+    let mut reexported_by = HashMap::<_, Vec<_>>::new();
+    let mut imported_by = HashMap::<_, Vec<_>>::new();
+    let mut graph_importers = HashMap::<_, Vec<_>>::new();
+    let mut coverage = ConsumerCoverage {
+        status: ConsumerCoverageStatus::Modeled,
+        snapshot_reexports: snapshot.files.iter().map(|file| file.reexports.len()).sum(),
+        ..Default::default()
+    };
+    let mut unresolved = 0;
+    let mut missing_bindings = HashSet::new();
+    let mut star_exports = HashSet::new();
+    let mut unmodeled_stars = HashSet::new();
+    let mut namespace_imports = HashSet::new();
+    for edge in &snapshot.edges {
+        graph_importers
+            .entry(snapshot.normalize_path(&edge.to))
+            .or_default()
+            .push(edge.from.as_str());
+    }
+    for file in &snapshot.files {
+        for reexport in &file.reexports {
+            if let Some(path) = &reexport.resolved {
+                reexported_by
+                    .entry(snapshot.normalize_path(path))
+                    .or_default()
+                    .push((file, reexport));
+            } else {
+                unresolved += 1;
+            }
+        }
+        for import in &file.imports {
+            if let Some(path) = &import.resolved_path {
+                imported_by
+                    .entry(snapshot.normalize_path(path))
+                    .or_default()
+                    .push((file, import));
+            }
+        }
+    }
+
+    let mut consumers = HashMap::<String, usize>::new();
+    // None is only the origin: every binding explicitly re-exported from the
+    // target belongs to that file, even if its definition was not indexed.
+    let mut queue = VecDeque::from([(target.path.clone(), None::<String>, 0)]);
+    let mut visited = HashSet::new();
+    let mut checked_coverage = HashSet::new();
+    while let Some((path, name, depth)) = queue.pop_front() {
+        if !visited.insert((path.clone(), name.clone())) {
+            continue;
+        }
+        if checked_coverage.insert(path.clone()) {
+            for (file, import) in imported_by.get(&path).into_iter().flatten() {
+                if import.symbols.iter().any(|symbol| symbol.name == "*") {
+                    namespace_imports.insert((path.clone(), file.path.clone()));
+                }
+            }
+            for importer in graph_importers.get(&path).into_iter().flatten() {
+                let has_binding = imported_by
+                    .get(&path)
+                    .into_iter()
+                    .flatten()
+                    .any(|(file, import)| file.path == *importer && !import.symbols.is_empty())
+                    || reexported_by
+                        .get(&path)
+                        .into_iter()
+                        .flatten()
+                        .any(|(file, _)| file.path == *importer);
+                if !has_binding
+                    && (depth > 0
+                        || files
+                            .get(importer)
+                            .is_some_and(|file| !file.reexports.is_empty()))
+                {
+                    missing_bindings.insert((path.clone(), *importer));
+                }
+            }
+        }
+        if depth > 0 {
+            consumers
+                .entry(path.clone())
+                .and_modify(|d| *d = (*d).min(depth))
+                .or_insert(depth);
+            for (file, import) in imported_by.get(&path).into_iter().flatten() {
+                if file.path != target.path
+                    && import.symbols.iter().any(|symbol| {
+                        symbol.name == "*"
+                            || name.as_deref()
+                                == Some(if symbol.is_default {
+                                    "default"
+                                } else {
+                                    &symbol.name
+                                })
+                    })
+                {
+                    consumers
+                        .entry(file.path.clone())
+                        .and_modify(|d| *d = (*d).min(depth + 1))
+                        .or_insert(depth + 1);
+                }
+            }
+        }
+
+        for (barrel, reexport) in reexported_by.get(&path).into_iter().flatten() {
+            if barrel.path == target.path {
+                continue;
+            }
+            let names: Vec<String> = match &reexport.kind {
+                ReexportKind::Named(pairs) => pairs
+                    .iter()
+                    .filter(|(original, _)| name.as_ref().is_none_or(|name| name == original))
+                    .map(|(_, exported)| exported.clone())
+                    .collect(),
+                ReexportKind::Star => {
+                    star_exports.insert((barrel.path.as_str(), path.clone()));
+                    let candidates: Vec<_> = match &name {
+                        Some(name) => vec![name.clone()],
+                        None => files
+                            .get(path.as_str())
+                            .into_iter()
+                            .flat_map(|file| &file.exports)
+                            .filter(|export| export.kind != "default_object_member")
+                            .map(|export| export.name.clone())
+                            .collect(),
+                    };
+                    if candidates.is_empty() {
+                        unmodeled_stars.insert((barrel.path.as_str(), path.clone()));
+                    }
+                    candidates
+                        .into_iter()
+                        .filter(|name| {
+                            // JS export-star excludes default. Local and explicit
+                            // named exports shadow wildcard bindings.
+                            !(name == "default"
+                                && matches!(
+                                    barrel.language.as_str(),
+                                    "ts" | "tsx" | "js" | "jsx" | "typescript" | "javascript"
+                                ))
+                                && !barrel
+                                    .exports
+                                    .iter()
+                                    .any(|export| export.name == *name && export.kind != "reexport")
+                                && !barrel.reexports.iter().any(|other| {
+                                    matches!(&other.kind, ReexportKind::Named(pairs)
+                                        if pairs.iter().any(|(_, exported)| exported == name))
+                                })
+                        })
+                        .collect()
+                }
+            };
+            for name in names {
+                queue.push_back((barrel.path.clone(), Some(name), depth + 1));
+            }
+        }
+    }
+    coverage.reachable_barrels = checked_coverage.len().saturating_sub(1);
+    use ConsumerDiagnosticReason as Reason;
+    use ConsumerDiagnosticScope as Scope;
+    let reachable_unresolved = snapshot
+        .files
+        .iter()
+        .filter(|file| checked_coverage.contains(&file.path))
+        .flat_map(|file| &file.reexports)
+        .filter(|reexport| reexport.resolved.is_none())
+        .count();
+    coverage.observe(Scope::TargetReachable, Reason::MissingBindingMetadata, missing_bindings.len(),
+        "Import edges lack binding metadata; onward target-specific relationships are not inferred.");
+    coverage.observe(
+        Scope::TargetReachable,
+        Reason::UnmodeledStarExports,
+        unmodeled_stars.len(),
+        "Wildcard source has no indexed exported names; onward relationships may be unrepresented.",
+    );
+    coverage.observe(Scope::TargetReachable, Reason::WildcardReexports, star_exports.len(),
+        "Wildcard source/facade pairs use modeled names, not compiler resolution; export-star collisions remain uncertain.");
+    coverage.observe(Scope::TargetReachable, Reason::NamespaceImports, namespace_imports.len(),
+        "Namespace importer/source pairs are file relationships; member attribution remains uncertain.");
+    coverage.observe(Scope::TargetReachable, Reason::UnresolvedReexports, reachable_unresolved,
+        "Unresolved re-export declarations in the target or reachable facades; binding relevance remains unknown (also included in snapshot-global count).");
+    coverage.observe(Scope::SnapshotGlobal, Reason::UnresolvedReexports, unresolved,
+        "Unresolved re-export declarations across the snapshot; target relevance and missing target consumers are not measured.");
+    (consumers, coverage)
 }
 
 impl HolographicSlice {
@@ -429,6 +717,10 @@ impl HolographicSlice {
             core: Vec::new(),
             deps: Vec::new(),
             consumers: Vec::new(),
+            consumer_coverage: ConsumerCoverage {
+                status: ConsumerCoverageStatus::NotRequested,
+                ..Default::default()
+            },
             symbol_consumers: Vec::new(),
             core_symbols: Vec::new(),
             authority_labels: Vec::new(),
@@ -517,12 +809,11 @@ impl HolographicSlice {
             }
         }
 
-        // Layer 3: Consumers - files that import target
-        // For barrel files (index.ts), we need to transitively find consumers through re-export chains
+        // Layer 3: Direct graph consumers plus target-specific re-export chains.
+        // max_depth bounds dependencies; consumers retain their actual hop depths.
         if config.include_consumers {
-            let mut all_consumers = HashSet::new();
-            let mut to_visit: VecDeque<String> = VecDeque::new();
-            let mut visited_for_consumers = HashSet::new();
+            let (mut all_consumers, coverage) = collect_reexport_consumers(snapshot, target_file);
+            slice.consumer_coverage = coverage;
             let is_target_consumer = |consumer_path: &str| {
                 consumer_path == target_path_norm.as_str()
                     || strip_extension(consumer_path) == target_stripped.as_str()
@@ -541,52 +832,11 @@ impl HolographicSlice {
                 if is_target_consumer(&consumer) {
                     continue;
                 }
-                all_consumers.insert(consumer.clone());
-                to_visit.push_back(consumer);
-            }
-
-            // Transitively follow through barrel files
-            // If A imports barrel B, and B re-exports target, then A is a consumer of target
-            while let Some(current) = to_visit.pop_front() {
-                if visited_for_consumers.contains(&current) {
-                    continue;
-                }
-                visited_for_consumers.insert(current.clone());
-
-                // Check if current file is a barrel that re-exports the target
-                let current_file = snapshot
-                    .files
-                    .iter()
-                    .find(|f| f.path == current || strip_extension(&f.path) == current);
-
-                let is_barrel = current_file
-                    .map(|f| !f.reexports.is_empty())
-                    .unwrap_or(false);
-
-                if is_barrel {
-                    // Find consumers of this barrel and add them
-                    let current_stripped = strip_extension(&current).to_string();
-                    let barrel_consumers: Vec<String> = imported_by
-                        .get(&current)
-                        .into_iter()
-                        .chain(imported_by.get(&current_stripped))
-                        .flatten()
-                        .cloned()
-                        .collect();
-
-                    for consumer in barrel_consumers {
-                        if is_target_consumer(&consumer) {
-                            continue;
-                        }
-                        if all_consumers.insert(consumer.clone()) {
-                            to_visit.push_back(consumer);
-                        }
-                    }
-                }
+                all_consumers.insert(consumer, 1);
             }
 
             // Convert consumer paths to SliceFile objects
-            for consumer_path in all_consumers {
+            for (consumer_path, depth) in all_consumers {
                 if is_target_consumer(&consumer_path) {
                     continue;
                 }
@@ -596,11 +846,14 @@ impl HolographicSlice {
                     .find(|f| f.path == consumer_path || strip_extension(&f.path) == consumer_path);
 
                 if let Some(file) = file {
-                    // Avoid duplicates (shouldn't happen with HashSet, but safety check)
-                    if !slice.consumers.iter().any(|c| c.path == file.path) {
+                    // Full and extensionless graph paths can identify the same file.
+                    if let Some(existing) = slice.consumers.iter_mut().find(|c| c.path == file.path)
+                    {
+                        existing.depth = existing.depth.min(depth);
+                    } else {
                         slice
                             .consumers
-                            .push(SliceFile::from_analysis(file, "consumers", 1));
+                            .push(SliceFile::from_analysis(file, "consumers", depth));
                     }
                 }
             }
@@ -690,6 +943,9 @@ impl HolographicSlice {
 
         println!("Slice for: {}", self.target);
         println!();
+        for note in self.consumer_coverage.notes() {
+            println!("{note}");
+        }
 
         println!(
             "Core ({} files, {} LOC):",
@@ -829,6 +1085,7 @@ impl HolographicSlice {
             "core": self.core,
             "deps": self.deps,
             "consumers": self.consumers,
+            "consumerCoverage": self.consumer_coverage,
             "symbolConsumers": self.symbol_consumers,
             "coreSymbols": self.core_symbols,
             "authorityLabels": self.authority_labels,
@@ -845,32 +1102,32 @@ impl HolographicSlice {
 /// Snapshot creation is a thin call into the freshness authority
 /// (`crate::snapshot::acquire_snapshot`): missing snapshots are created with
 /// the same unified file universe as `loct`.
-fn ensure_snapshot(root: &Path, parsed: &ParsedArgs) -> io::Result<bool> {
+fn ensure_snapshot(
+    root: &Path,
+    options: &crate::snapshot::AcquireOptions,
+) -> io::Result<Option<Snapshot>> {
     // Refuse before any scan: no git checkout ⇒ no snapshot creation
     // (unless --force-non-git-repository-snapshot).
-    crate::snapshot::require_git_scan_root_with(root, parsed.force_non_git)?;
+    crate::snapshot::require_git_scan_root_with(root, options.force_non_git)?;
 
     let snapshot_path = crate::snapshot::Snapshot::snapshot_path(root);
-    let create = |print_summary: bool| -> io::Result<()> {
+    let create = |print_summary: bool| -> io::Result<Snapshot> {
         crate::snapshot::acquire_snapshot(
             &[root.to_path_buf()],
-            crate::snapshot::SnapshotReusePolicy::TrustExisting,
+            crate::snapshot::SnapshotReusePolicy::Strict,
             &crate::snapshot::AcquireOptions {
-                print_scan_summary: print_summary,
-                force_non_git: parsed.force_non_git,
-                include_ignored: parsed.include_ignored,
-                ..Default::default()
+                print_scan_summary: print_summary && !(options.json || options.quiet),
+                ..options.clone()
             },
         )
-        .map(|_| ())
     };
 
     if !std::io::stdin().is_terminal() {
         // Non-interactive: auto-create snapshot only inside a git checkout
         // (guarded above). Still never for bare `/` or non-git folders.
-        create(false)?;
+        let snapshot = create(false)?;
         eprintln!();
-        return Ok(true);
+        return Ok(Some(snapshot));
     }
 
     eprintln!("No snapshot found at {}", snapshot_path.display());
@@ -883,11 +1140,11 @@ fn ensure_snapshot(root: &Path, parsed: &ParsedArgs) -> io::Result<bool> {
     io::stdin().read_line(&mut input)?;
 
     if input.trim().is_empty() || input.trim().to_lowercase() == "y" {
-        create(true)?;
+        let snapshot = create(true)?;
         eprintln!();
-        Ok(true)
+        Ok(Some(snapshot))
     } else {
-        Ok(false)
+        Ok(None)
     }
 }
 
@@ -959,6 +1216,7 @@ pub fn run_slice(
     json_output: bool,
     parsed: &ParsedArgs,
 ) -> io::Result<()> {
+    let target_path = assemble_slice_target_path(target)?;
     // Anchor on the provided root only — never fall back to process cwd when
     // an explicit `--root` was given (cwd pollution used to re-home agent
     // slices onto a different project). Resolution order:
@@ -975,64 +1233,56 @@ pub fn run_slice(
         None => crate::snapshot::require_git_scan_root_with(root, parsed.force_non_git)?,
     };
 
-    // Host-safety: never auto-scan just because a relative target is missing
-    // outside a snapshot. Missing target + no snapshot ⇒ refuse before scan.
-    if !Snapshot::exists(&effective_root) {
-        // `join` keeps an absolute target as-is and anchors a relative one at
-        // the root; `SanitizedPath::within` then requires it to exist AND to
-        // canonicalize underneath the root — which is exactly what the error
-        // below promises ("under <root>").
-        let candidate = effective_root.join(target);
-        if crate::fs_utils::SanitizedPath::within(&effective_root, &candidate).is_err() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "refused: slice target '{}' does not exist under '{}' and no snapshot is cached — refusing auto-scan",
-                    target,
-                    effective_root.display()
-                ),
-            ));
-        }
+    // Reject invalid targets before any cold, drift, or override acquisition.
+    let candidate = root.join(target_path);
+    if crate::fs_utils::SanitizedPath::within(&effective_root, &candidate).is_err()
+        || !candidate.is_file()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "refused: slice target '{}' does not exist as a file under '{}' — refusing auto-scan",
+                target,
+                effective_root.display()
+            ),
+        ));
     }
 
-    // Force rescan if --rescan flag is set (for uncommitted files)
-    if parsed.slice_rescan {
+    let acquire_options = crate::snapshot::AcquireOptions {
+        fresh: parsed.slice_rescan || parsed.slice_acquire_options.fresh,
+        json: json_output,
+        print_scan_summary: !(json_output || parsed.slice_acquire_options.quiet),
+        force_non_git: parsed.force_non_git,
+        include_ignored: parsed.include_ignored,
+        ..parsed.slice_acquire_options.clone()
+    };
+    let mut snapshot = if acquire_options.fresh {
         if !std::io::stdin().is_terminal() {
             eprintln!("[loct] Rescanning for new files...");
         }
         crate::snapshot::acquire_snapshot(
             std::slice::from_ref(&effective_root),
-            crate::snapshot::SnapshotReusePolicy::TrustExisting,
-            &crate::snapshot::AcquireOptions {
-                fresh: true,
-                quiet: true,
-                print_scan_summary: true,
-                force_non_git: parsed.force_non_git,
-                include_ignored: parsed.include_ignored,
-                ..Default::default()
-            },
-        )?;
-    } else if !Snapshot::exists(&effective_root) {
+            crate::snapshot::SnapshotReusePolicy::Strict,
+            &acquire_options,
+        )?
+    } else if !Snapshot::exists(&effective_root)
+        && !acquire_options.no_scan
+        && !acquire_options.fail_stale
+    {
         // Check if snapshot exists, prompt to create if not
-        if ensure_snapshot(&effective_root, parsed)? {
-            // Snapshot was created, continue
-        } else {
-            return Err(io::Error::new(
+        ensure_snapshot(&effective_root, &acquire_options)?.ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::NotFound,
                 "No snapshot found. Run `loctree` first to create one.",
-            ));
-        }
-    }
-
-    let mut snapshot = crate::snapshot::acquire_snapshot(
-        std::slice::from_ref(&effective_root),
-        crate::snapshot::SnapshotReusePolicy::Strict,
-        &crate::snapshot::AcquireOptions {
-            include_ignored: parsed.include_ignored,
-            force_non_git: parsed.force_non_git,
-            ..Default::default()
-        },
-    )?;
+            )
+        })?
+    } else {
+        crate::snapshot::acquire_snapshot(
+            std::slice::from_ref(&effective_root),
+            crate::snapshot::SnapshotReusePolicy::Strict,
+            &acquire_options,
+        )?
+    };
 
     let config = SliceConfig {
         include_consumers,
@@ -1119,6 +1369,7 @@ mod tests {
         Snapshot {
             metadata: SnapshotMetadata {
                 schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_string(),
+                analysis_generation: crate::snapshot::ANALYSIS_GENERATION.to_string(),
                 generated_at: "2025-01-01T00:00:00Z".to_string(),
                 roots: vec!["/test".to_string()],
                 languages: ["rust".to_string()].into_iter().collect(),
@@ -1547,6 +1798,7 @@ mod tests {
             }],
             deps: vec![],
             consumers: vec![],
+            consumer_coverage: ConsumerCoverage::default(),
             symbol_consumers: vec![],
             core_symbols: vec![],
             authority_labels: vec![],
@@ -1571,6 +1823,16 @@ mod tests {
         assert_eq!(deser.target, "src/main.rs");
         assert_eq!(deser.core.len(), 1);
         assert_eq!(deser.stats.core_loc, 100);
+        let mut legacy = serde_json::to_value(&slice).expect("serialize legacy fixture");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("consumer_coverage");
+        let legacy: HolographicSlice = serde_json::from_value(legacy).expect("old slice");
+        assert_eq!(
+            legacy.consumer_coverage.status,
+            ConsumerCoverageStatus::NotMeasured
+        );
     }
 
     #[test]
@@ -1578,6 +1840,7 @@ mod tests {
         let snapshot = Snapshot {
             metadata: SnapshotMetadata {
                 schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_string(),
+                analysis_generation: crate::snapshot::ANALYSIS_GENERATION.to_string(),
                 generated_at: "2025-01-01T00:00:00Z".to_string(),
                 roots: vec!["/test".to_string()],
                 languages: ["rust".to_string()].into_iter().collect(),
@@ -1651,14 +1914,207 @@ mod tests {
     }
 
     #[test]
+    fn test_slice_reexport_requires_resolved_identity() {
+        use crate::types::{ImportEntry, ImportKind, ImportSymbol, ReexportEntry};
+
+        let mut snapshot = create_test_snapshot();
+        let target = FileAnalysis::new("src/target.ts".to_string());
+        let mut barrel = FileAnalysis::new("src/barrel.ts".to_string());
+        barrel.reexports.push(ReexportEntry {
+            source: "./target".to_string(),
+            kind: ReexportKind::Named(vec![("a".to_string(), "publicA".to_string())]),
+            resolved: None,
+        });
+        let mut user = FileAnalysis::new("src/user.ts".to_string());
+        user.imports.push(ImportEntry {
+            resolved_path: Some(barrel.path.clone()),
+            symbols: vec![ImportSymbol {
+                name: "publicA".to_string(),
+                alias: Some("local".to_string()),
+                is_default: false,
+            }],
+            ..ImportEntry::new("./barrel".to_string(), ImportKind::Static)
+        });
+        snapshot.files = vec![target, barrel, user];
+        snapshot.edges = vec![
+            GraphEdge {
+                from: "src/barrel.ts".into(),
+                to: "src/target.ts".into(),
+                label: "reexport".into(),
+            },
+            GraphEdge {
+                from: "src/user.ts".into(),
+                to: "src/barrel.ts".into(),
+                label: "import".into(),
+            },
+        ];
+
+        for resolved in [None, Some("other/target.ts".to_string())] {
+            let unresolved = resolved.is_none();
+            snapshot.files[1].reexports[0].resolved = resolved;
+            let slice =
+                HolographicSlice::from_path(&snapshot, "src/target.ts", &SliceConfig::default())
+                    .expect("slice");
+            assert_eq!(slice.consumers.len(), 1);
+            assert_eq!(slice.consumers[0].path, "src/barrel.ts");
+            assert_eq!(slice.consumers[0].depth, 1);
+            let coverage =
+                serde_json::to_value(&slice).expect("library JSON")["consumer_coverage"].clone();
+            assert_eq!(
+                coverage["diagnostics"]
+                    .as_array()
+                    .expect("diagnostics")
+                    .iter()
+                    .any(|row| row["reason"] == "unresolved_reexports"
+                        && row["scope"] == "snapshot_global"
+                        && row["count"] == 1),
+                unresolved
+            );
+        }
+
+        snapshot.files[1].reexports[0].resolved = Some("src/target.ts".to_string());
+        let slice =
+            HolographicSlice::from_path(&snapshot, "src/target.ts", &SliceConfig::default())
+                .expect("resolved slice");
+        assert_eq!(slice.consumers.len(), 2);
+        assert_eq!(
+            slice.consumer_coverage.status,
+            ConsumerCoverageStatus::Modeled
+        );
+        assert!(slice.consumer_coverage.diagnostics.is_empty());
+        assert_eq!(
+            slice
+                .consumers
+                .iter()
+                .find(|file| file.path == "src/user.ts")
+                .expect("resolved consumer")
+                .depth,
+            2
+        );
+
+        snapshot.files[2].imports[0].symbols.clear();
+        let partial =
+            HolographicSlice::from_path(&snapshot, "src/target.ts", &SliceConfig::default())
+                .expect("partial slice");
+        assert_eq!(
+            partial.consumers.len(),
+            1,
+            "an edge without binding metadata is not proof of target-specific usage"
+        );
+        let json = serde_json::to_value(&partial).expect("serialized library slice");
+        assert_eq!(json["consumer_coverage"]["status"], "partial");
+        assert_eq!(
+            json["consumer_coverage"]["diagnostics"][0]["reason"],
+            "missing_binding_metadata"
+        );
+        assert_eq!(
+            partial.to_json()["consumerCoverage"],
+            json["consumer_coverage"]
+        );
+    }
+
+    #[test]
+    fn test_slice_coverage_wildcard_serialization_and_projection() {
+        use crate::types::{ExportSymbol, ImportEntry, ImportKind, ImportSymbol, ReexportEntry};
+
+        let mut snapshot = create_test_snapshot();
+        let mut target = FileAnalysis::new("target.ts".into());
+        target.exports = ["a", "b"]
+            .into_iter()
+            .map(|name| ExportSymbol {
+                name: name.into(),
+                kind: "var".into(),
+                export_type: "named".into(),
+                line: Some(1),
+                params: vec![],
+                symbol_id: Default::default(),
+            })
+            .collect();
+        let mut barrel = FileAnalysis::new("barrel.ts".into());
+        barrel.reexports.push(ReexportEntry {
+            source: "./target".into(),
+            kind: ReexportKind::Star,
+            resolved: Some(target.path.clone()),
+        });
+        let mut user = FileAnalysis::new("user.ts".into());
+        user.imports.push(ImportEntry {
+            resolved_path: Some(barrel.path.clone()),
+            symbols: vec![ImportSymbol {
+                name: "*".into(),
+                alias: Some("api".into()),
+                is_default: false,
+            }],
+            ..ImportEntry::new("./barrel".into(), ImportKind::Static)
+        });
+        snapshot.files = vec![target, barrel, user];
+        snapshot.edges.clear();
+        let slice = HolographicSlice::from_path(&snapshot, "target.ts", &SliceConfig::default())
+            .expect("slice");
+        let coverage = &slice.consumer_coverage;
+        assert_eq!(coverage.status, ConsumerCoverageStatus::Partial);
+        assert_eq!(coverage.reachable_barrels, 1);
+        assert_eq!(coverage.snapshot_reexports, 1);
+        assert_eq!(coverage.diagnostics.len(), 2);
+        assert!(
+            coverage
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.count == 1)
+        );
+        assert_eq!(
+            serde_json::to_value(&slice).expect("library JSON")["consumer_coverage"],
+            slice.to_json()["consumerCoverage"]
+        );
+
+        let opts = crate::ContextOptions {
+            file: Some("target.ts".into()),
+            no_aicx: true,
+            ..Default::default()
+        };
+        let structural = crate::pack::compose_structural_slice(&opts, &snapshot);
+        assert_eq!(structural.consumer_coverage["target.ts"], *coverage);
+        let pack =
+            crate::pack::compose_context_pack_from_snapshot(&opts, Path::new("."), &snapshot)
+                .expect("context pack");
+        let markdown = crate::pack::format_context_pack_markdown(&pack);
+        assert!(
+            markdown
+                .find("Consumer coverage (")
+                .expect("human qualification")
+                < markdown
+                    .find("## Where You Are")
+                    .expect("detailed enumeration")
+        );
+        assert_eq!(
+            serde_json::to_value(&pack).expect("pack JSON")["structural"]["consumer_coverage"]["target.ts"],
+            slice.to_json()["consumerCoverage"]
+        );
+        let no_consumers = HolographicSlice::from_path(
+            &snapshot,
+            "target.ts",
+            &SliceConfig {
+                include_consumers: false,
+                ..Default::default()
+            },
+        )
+        .expect("slice without consumers");
+        assert_eq!(
+            no_consumers.consumer_coverage.status,
+            ConsumerCoverageStatus::NotRequested
+        );
+        assert!(no_consumers.consumer_coverage.diagnostics.is_empty());
+    }
+
+    #[test]
     fn test_slice_consumers_through_barrel() {
-        use crate::types::{FileAnalysis, ReexportEntry, ReexportKind};
+        use crate::types::{FileAnalysis, ImportEntry, ImportSymbol, ReexportEntry, ReexportKind};
 
         // Create a test snapshot with barrel file re-export chain:
         // Component.tsx -> features/index.ts (barrel) -> App.tsx
         let snapshot = Snapshot {
             metadata: SnapshotMetadata {
                 schema_version: crate::snapshot::SNAPSHOT_SCHEMA_VERSION.to_string(),
+                analysis_generation: crate::snapshot::ANALYSIS_GENERATION.to_string(),
                 generated_at: "2025-01-01T00:00:00Z".to_string(),
                 roots: vec!["/test".to_string()],
                 languages: ["typescript".to_string()].into_iter().collect(),
@@ -1703,6 +2159,18 @@ mod tests {
                     path: "src/App.tsx".to_string(),
                     loc: 150,
                     language: "typescript".to_string(),
+                    imports: vec![ImportEntry {
+                        resolved_path: Some("src/features/index.ts".to_string()),
+                        symbols: vec![ImportSymbol {
+                            name: "MyComponent".to_string(),
+                            alias: None,
+                            is_default: false,
+                        }],
+                        ..ImportEntry::new(
+                            "./features".to_string(),
+                            crate::types::ImportKind::Static,
+                        )
+                    }],
                     ..FileAnalysis::new("src/App.tsx".to_string())
                 },
             ],
@@ -1752,6 +2220,34 @@ mod tests {
         assert!(
             consumer_paths.contains(&"src/features/index.ts"),
             "Barrel should be a consumer (directly re-exports)"
+        );
+
+        assert_eq!(
+            slice
+                .consumers
+                .iter()
+                .find(|file| file.path == "src/App.tsx")
+                .expect("App consumer")
+                .depth,
+            2
+        );
+        let mut snapshot = snapshot;
+        snapshot.edges.push(GraphEdge {
+            from: "src/App".to_string(),
+            to: "src/Component".to_string(),
+            label: "import".to_string(),
+        });
+        let direct = HolographicSlice::from_path(&snapshot, "src/Component.tsx", &config)
+            .expect("direct and barrel slice");
+        assert_eq!(direct.consumers.len(), 2);
+        assert_eq!(
+            direct
+                .consumers
+                .iter()
+                .find(|file| file.path == "src/App.tsx")
+                .expect("direct App consumer")
+                .depth,
+            1
         );
     }
 }

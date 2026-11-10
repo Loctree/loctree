@@ -205,6 +205,23 @@ fn render_tldr(input: &PillInput<'_>, m: &Metrics) -> Section {
     lines.push(what);
     lines.push(String::new());
 
+    let qualified: Vec<_> = input
+        .pack
+        .structural
+        .consumer_coverage
+        .iter()
+        .filter(|(_, coverage)| !coverage.diagnostics.is_empty())
+        .collect();
+    for (target, coverage) in qualified.iter().take(2) {
+        lines.push(format!(
+            "`{target}`: {} (LoctreeDerived).",
+            coverage.notes().join(" ")
+        ));
+    }
+    if qualified.len() > 2 {
+        lines.push(format!("+ {} more target coverage qualifications; `loct context --full` for all scopes/counts.", qualified.len() - 2));
+    }
+
     // Where you stand
     let branch = input.scope.branch.as_deref().unwrap_or("<detached>");
     let stand = if git_is_unknown(input) {
@@ -1380,6 +1397,38 @@ mod tests {
         assert!(live_pos < memory_pos);
         assert!(memory_pos < action_pos);
         assert!(action_pos < authority_pos);
+    }
+
+    #[test]
+    fn pill_preserves_evidence_specific_consumer_qualification() {
+        use crate::slicer::{
+            ConsumerCoverage, ConsumerDiagnostic, ConsumerDiagnosticReason, ConsumerDiagnosticScope,
+        };
+
+        let mut pack = fixture_pack();
+        let scope = fixture_scope();
+        assert!(
+            !render_pill(input_with(&pack, &scope, AicxRenderStatus::Disabled))
+                .contains("Consumer coverage (")
+        );
+        pack.structural.consumer_coverage.insert(
+            "target.ts".into(),
+            ConsumerCoverage {
+                diagnostics: vec![ConsumerDiagnostic {
+                    reason: ConsumerDiagnosticReason::UnresolvedReexports,
+                    scope: ConsumerDiagnosticScope::SnapshotGlobal,
+                    count: 3,
+                    message: "Unresolved re-exports; not measured missing target consumers.".into(),
+                }],
+                ..Default::default()
+            },
+        );
+        let markdown = render_pill(input_with(&pack, &scope, AicxRenderStatus::Disabled));
+        assert!(markdown.contains("snapshot-global, target relevance unknown, 3 observations"));
+        assert!(
+            markdown.find("Consumer coverage (").expect("coverage")
+                < markdown.find("## Where You Are").expect("body")
+        );
     }
 
     #[test]

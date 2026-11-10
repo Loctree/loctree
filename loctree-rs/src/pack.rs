@@ -17,6 +17,11 @@
 //! dispatch edges, reachability, env contracts, Tauri bridges, framework
 //! hints). The `AuthorityLabel` enum was introduced by T1 and is reused here.
 
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -281,6 +286,9 @@ pub struct StructuralSlice {
     pub symbols: Vec<StructuralSymbol>,
     pub imports: Vec<StructuralImport>,
     pub consumers: Vec<StructuralConsumer>,
+    /// Per-target qualifications; do not sum snapshot-global counts across targets.
+    #[serde(default)]
+    pub consumer_coverage: std::collections::BTreeMap<String, crate::slicer::ConsumerCoverage>,
     pub entrypoints: Vec<StructuralEntrypoint>,
 }
 
@@ -1360,7 +1368,7 @@ fn load_latest_snapshot(root: &Path) -> io::Result<Option<Snapshot>> {
 }
 
 fn loct_cache_max_age() -> Duration {
-    std::env::var("LOCT_CACHE_MAX_AGE")
+    env::var("LOCT_CACHE_MAX_AGE")
         .ok()
         .and_then(|raw| parse_duration_env(&raw))
         .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60))
@@ -1584,6 +1592,9 @@ pub fn compose_structural_slice(opts: &ContextOptions, snapshot: &Snapshot) -> S
         symbols,
         imports,
         consumers,
+        consumer_coverage: [(target_path, slice.consumer_coverage)]
+            .into_iter()
+            .collect(),
         entrypoints,
     }
 }
@@ -2595,7 +2606,8 @@ pub fn compose_risk_slice(
     let current_head = current_git_head(&snapshot_root);
     let git_dirty = git_worktree_dirty(&snapshot_root);
     let git_unknown = git_dirty.is_none();
-    let stale_snapshot = snapshot_commit_is_stale(snapshot, current_head.as_deref());
+    let stale_snapshot = !snapshot.analysis_is_compatible()
+        || snapshot_commit_is_stale(snapshot, current_head.as_deref());
     let dirty_worktree = git_dirty.unwrap_or(false);
     let cache_scope = cache_scope_for(
         snapshot,
@@ -3155,7 +3167,7 @@ pub(crate) fn gate_authority_on_oracle(
 }
 
 fn memory_limit() -> usize {
-    std::env::var("LOCT_CONTEXT_MEMORY_LIMIT")
+    env::var("LOCT_CONTEXT_MEMORY_LIMIT")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -3169,7 +3181,7 @@ fn memory_hours() -> u64 {
     // default 5 s timeout on busy stores. Operators can widen with
     // `LOCT_CONTEXT_MEMORY_HOURS=720` (or higher) when forensic context
     // is more important than freshness.
-    std::env::var("LOCT_CONTEXT_MEMORY_HOURS")
+    env::var("LOCT_CONTEXT_MEMORY_HOURS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|n| *n > 0)
@@ -3186,7 +3198,7 @@ fn memory_hours() -> u64 {
 ///    `limit.saturating_mul(2)` so the relevance filter still has
 ///    headroom over the final `--limit`.
 fn memory_raw_limit(hours: u64, limit: usize) -> usize {
-    if let Some(override_n) = std::env::var("LOCT_CONTEXT_MEMORY_RAW_LIMIT")
+    if let Some(override_n) = env::var("LOCT_CONTEXT_MEMORY_RAW_LIMIT")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|n| *n > 0)
@@ -3876,7 +3888,7 @@ fn relevant_tests_for_top_hubs(snapshot: &Snapshot, top_n: usize) -> Vec<String>
 }
 
 fn likely_tests_limit() -> usize {
-    std::env::var("LOCT_CONTEXT_LIKELY_TESTS_LIMIT")
+    env::var("LOCT_CONTEXT_LIKELY_TESTS_LIMIT")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|limit| *limit > 0)
@@ -4468,6 +4480,7 @@ fn merge_structural(dest: &mut StructuralSlice, src: StructuralSlice) {
     dest.symbols.extend(src.symbols);
     dest.imports.extend(src.imports);
     dest.consumers.extend(src.consumers);
+    dest.consumer_coverage.extend(src.consumer_coverage);
     dest.entrypoints.extend(src.entrypoints);
 }
 
@@ -4840,6 +4853,11 @@ pub fn format_context_pack_markdown(pack: &ContextPack) -> String {
     // synthesis-first; --full was enumeration wall first. Move Risk+Action here
     // (after identity, before bulk Files/Symbols/Imports/Consumers tables).
     // Full enumeration follows as drill-down.
+    for (target, coverage) in &pack.structural.consumer_coverage {
+        for note in coverage.notes() {
+            md.push_str(&format!("- `{target}`: {note}\n"));
+        }
+    }
     md.push_str(
         "## Risk Slice (synthesis-first — survives truncation in --full)
 
@@ -6468,6 +6486,22 @@ mod tests {
         assert!(!risk.stale_snapshot);
     }
 
+    #[test]
+    fn compose_risk_slice_incompatible_analysis_cannot_claim_freshness() {
+        let tmp = tempfile::tempdir().expect("project");
+        let mut snapshot = Snapshot::new(vec![tmp.path().display().to_string()]);
+        snapshot.metadata.analysis_generation.clear();
+        let opts = ContextOptions {
+            project: Some(tmp.path().to_path_buf()),
+            ..ContextOptions::default()
+        };
+        let structural = compose_structural_slice(&opts, &snapshot);
+        let risk = compose_risk_slice(&opts, &snapshot, &structural);
+        assert!(risk.stale_snapshot);
+        assert_ne!(risk.snapshot_health.as_deref(), Some("fresh"));
+        assert_ne!(risk.snapshot_health.as_deref(), Some("empty_snapshot"));
+    }
+
     fn twelve_file_universe() -> Snapshot {
         let mut snapshot = Snapshot::new(vec!["src".to_string()]);
         for i in 0..12 {
@@ -6731,6 +6765,7 @@ mod tests {
                 authority: AuthorityLabel::RepoVerified,
             }],
             entrypoints: vec![],
+            consumer_coverage: Default::default(),
         };
 
         let opts = ContextOptions {
@@ -7402,10 +7437,8 @@ python_version = "3.12"
     //
     // The composer integrates with the external `aicx` CLI through the
     // [`AicxClient`] wrapper. Tests fake the binary by writing a small shell
-    // script to a tempdir and pointing `LOCT_AICX_BINARY` at it. They are
-    // serialised via `serial_test::serial(aicx_env)` because they mutate the
-    // process-global env, which would otherwise interleave with the wrapper
-    // tests in `crate::aicx`.
+    // script to a tempdir and injecting `LOCT_AICX_BINARY` for this test
+    // thread. Child-process settings are explicit; the host env is untouched.
     // -----------------------------------------------------------------------
 
     #[cfg(unix)]
@@ -7449,6 +7482,7 @@ python_version = "3.12"
             imports: Vec::new(),
             consumers: Vec::new(),
             entrypoints: Vec::new(),
+            consumer_coverage: Default::default(),
         }
     }
 

@@ -30,8 +30,10 @@ intentionally **not** a member of the Rust Cargo workspace.
   `.jsx`, `.mjs`, `.cjs`, `.rs`, `.py`, `.go`) still flows through the native
   `LspServerSupportProvider`, but the tool window and custom requests no longer
   wait for a file-open event.
-- Standard LSP features (diagnostics, hover, go-to-definition,
-  references, code actions, code lenses) are handled by the platform.
+- The platform handles Loctree's pushed diagnostics and advertised code actions.
+  Code lenses are opt-in. Hover, go-to-definition and references remain owned
+  by the IDE's native language providers; loctree-lsp does not advertise those
+  standard providers. Loctree's structural navigation uses the custom requests below.
 - Loctree-specific tooling goes through a typed gateway
   (`LoctreeLspGateway`) issuing custom `loctree/*` requests:
   `health`, `find`, `body`, `impact`, `slice`, `contextAtlas`, `contextPack`,

@@ -115,11 +115,6 @@ pub(super) fn suggested_next(query: &str, occurrences: &[LiteralOccurrence]) -> 
                     .to_string(),
             });
         }
-        out.push(SuggestedNext {
-            command: format!("loct find {quoted_query} --json"),
-            reason: "confirm literal parity before narrowing to structural interpretation"
-                .to_string(),
-        });
         if !out.iter().any(|s| s.command.contains("where-symbol")) {
             out.push(SuggestedNext {
                 command: format!("loct query where-symbol {quoted_query} --json"),
@@ -127,13 +122,16 @@ pub(super) fn suggested_next(query: &str, occurrences: &[LiteralOccurrence]) -> 
             });
         }
     }
-    if let Some(first) = occurrences.first()
+    if let Some(first) = occurrences
+        .iter()
+        .find(|hit| hit.match_role == MatchRole::Definition)
+        .or_else(|| occurrences.first())
         && !out.iter().any(|s| s.command.starts_with("loct slice "))
     {
         out.push(SuggestedNext {
             command: format!("loct slice {}", shell_quote(&first.file)),
             reason:
-                "inspect imports, dependencies, and consumers around the first literal-hit file"
+                "inspect imports, dependencies, and consumers around the defining file or first literal hit"
                     .to_string(),
         });
     }
@@ -488,6 +486,31 @@ pub fn group_by_entity(occurrences: &[LiteralOccurrence]) -> Vec<GroupedEntity> 
 mod grouping_tests {
     use super::super::{ScanOptions, scan_files_with_scope};
     use super::*;
+
+    #[test]
+    fn discovery_advances_to_definition_structure_instead_of_repeating_find() {
+        let res = scan_files_with_scope(
+            [
+                ("docs/GUIDE.md", "Use widget here.\n"),
+                ("src/lib.rs", "pub fn widget() {}\n"),
+            ],
+            "widget",
+            ScanOptions::default(),
+            super::super::FileScope::default(),
+        );
+        let steps = suggested_next("widget", &res.occurrences);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.command == "loct slice 'src/lib.rs'")
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.command.starts_with("loct find "))
+        );
+        assert!(steps.iter().any(|step| step.command == "loct follow all"));
+    }
 
     #[test]
     fn group_by_entity_lists_production_callers_and_collapses_test_hits() {

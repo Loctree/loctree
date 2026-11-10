@@ -1,5 +1,8 @@
 //! Bundle distribution analysis using source maps.
 
+#[cfg(test)]
+use crate::test_env as env;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -1339,7 +1342,7 @@ mod tests {
         fn set_path(key: &'static str, value: &Path) -> Self {
             let guard = Self {
                 key,
-                original: std::env::var_os(key),
+                original: env::var_os(key),
             };
             set_env_var(key, value.as_os_str());
             guard

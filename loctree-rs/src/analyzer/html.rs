@@ -1,6 +1,6 @@
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use report_leptos::types::{ContextAtlasCardInfo, ContextAtlasInfo};
 
@@ -10,42 +10,35 @@ use super::assets::{
     LAYOUT_BASE_JS,
 };
 
-/// Attempt to load a materialized Context Atlas pointer.
-///
-/// Atlas now always lives at `<repo_root>/.loctree/context-atlas/manifest.json`
-/// (Plan 01 — atlas-per-repo). The `artifacts_dir` here is the directory
-/// containing `report.html`, which may be either:
-///   - `<repo_root>/.loctree/` itself (auto flow drops report next to atlas), or
-///   - a global cache bucket (deprecated fallback — atlas not reachable).
-///
-/// Strategy: if artifacts_dir ends in `.loctree`, look directly; otherwise
-/// walk ancestors searching for `<ancestor>/.loctree/context-atlas/manifest.json`.
-/// Returns `None` when atlas not materialized or unreachable.
-fn load_atlas_info(artifacts_dir: &Path) -> Option<ContextAtlasInfo> {
-    let manifest_json = if artifacts_dir.ends_with(".loctree") {
-        let candidate = artifacts_dir.join("context-atlas").join("manifest.json");
-        if candidate.exists() {
-            candidate
-        } else {
-            return None;
-        }
-    } else {
-        artifacts_dir.ancestors().find_map(|ancestor| {
-            let candidate = ancestor
-                .join(".loctree")
-                .join("context-atlas")
-                .join("manifest.json");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        })?
-    };
+/// Resolve HTML Atlas identity solely from the section's explicit source root.
+/// Output location and manifest-supplied display paths are not authorities.
+/// This projection uses absolute, confined paths without changing the on-disk
+/// manifest or the analyzer's public report payload.
+fn load_atlas_info(source_root: &Path) -> Option<ContextAtlasInfo> {
+    if source_root.as_os_str().is_empty() {
+        return None;
+    }
+    let source_root = source_root.canonicalize().ok()?;
+    let atlas_dir = source_root
+        .join(".loctree/context-atlas")
+        .canonicalize()
+        .ok()?;
+    if !atlas_dir.starts_with(&source_root) {
+        return None;
+    }
+    let manifest_json = resolve_atlas_path(&atlas_dir, Path::new("manifest.json"))?;
     let content = fs::read_to_string(&manifest_json).ok()?;
     let value: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let atlas_dir_path = manifest_json.parent().map(Path::to_path_buf);
-    let cards = value
+    // Older manifests have no project field; their exact source-local location
+    // remains the identity. Reject a supplied identity for any other repository.
+    if let Some(project) = value.get("project") {
+        let project = Path::new(project.as_str()?);
+        // A manifest identity must stand on its own, independent of report cwd.
+        if !project.is_absolute() || project.canonicalize().ok()? != source_root {
+            return None;
+        }
+    }
+    let cards: Vec<ContextAtlasCardInfo> = value
         .get("cards")
         .and_then(|c| c.as_array())
         .map(|cards| {
@@ -62,16 +55,17 @@ fn load_atlas_info(artifacts_dir: &Path) -> Option<ContextAtlasInfo> {
                     // and the report would embed it. Only read card files that
                     // resolve INSIDE the context-atlas directory.
                     let card_file = Path::new(&path);
-                    let body = atlas_dir_path
-                        .as_ref()
-                        .and_then(|dir| read_card_within(dir, card_file));
+                    let resolved = resolve_atlas_path(&atlas_dir, card_file);
+                    let body = read_card_within(&atlas_dir, card_file);
                     let lines = body.as_ref().map(|b| b.lines().count()).unwrap_or_else(|| {
                         card.get("lines").and_then(|v| v.as_u64()).unwrap_or(0) as usize
                     });
                     Some(ContextAtlasCardInfo {
                         id: card.get("id")?.as_str()?.to_string(),
                         title: card.get("title")?.as_str()?.to_string(),
-                        path,
+                        path: resolved
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default(),
                         lines,
                         why: card
                             .get("why")
@@ -84,11 +78,25 @@ fn load_atlas_info(artifacts_dir: &Path) -> Option<ContextAtlasInfo> {
                 .collect()
         })
         .unwrap_or_default();
+    let recommended_start = value
+        .get("recommended_start")
+        .and_then(|path| path.as_str())
+        .and_then(|path| resolve_atlas_path(&atlas_dir, Path::new(path)))
+        .map(|path| path.display().to_string())
+        .or_else(|| {
+            cards
+                .iter()
+                .find(|card| !card.path.is_empty())
+                .map(|card| card.path.clone())
+        })
+        .unwrap_or_default();
     Some(ContextAtlasInfo {
-        atlas_dir: value.get("atlas_dir")?.as_str()?.to_string(),
-        manifest: value.get("manifest")?.as_str()?.to_string(),
-        manifest_json: value.get("manifest_json")?.as_str()?.to_string(),
-        recommended_start: value.get("recommended_start")?.as_str()?.to_string(),
+        manifest: resolve_atlas_path(&atlas_dir, Path::new("manifest.md"))
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        atlas_dir: atlas_dir.display().to_string(),
+        manifest_json: manifest_json.display().to_string(),
+        recommended_start,
         message: value
             .get("message")
             .and_then(|v| v.as_str())
@@ -98,10 +106,8 @@ fn load_atlas_info(artifacts_dir: &Path) -> Option<ContextAtlasInfo> {
     })
 }
 
-/// Read a card body only when the candidate path resolves inside the
-/// context-atlas directory. Absolute or `..`-laden manifest paths that escape
-/// the atlas dir yield `None` instead of embedding arbitrary local files.
-fn read_card_within(atlas_dir: &Path, candidate: &Path) -> Option<String> {
+/// One confinement boundary for both embedded bodies and copied HTML paths.
+fn resolve_atlas_path(atlas_dir: &Path, candidate: &Path) -> Option<PathBuf> {
     let base = atlas_dir.canonicalize().ok()?;
     let joined = if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -109,15 +115,29 @@ fn read_card_within(atlas_dir: &Path, candidate: &Path) -> Option<String> {
         base.join(candidate)
     };
     let resolved = joined.canonicalize().ok()?;
-    if resolved.starts_with(&base) {
-        fs::read_to_string(resolved).ok()
+    if resolved.starts_with(&base) && resolved.is_file() {
+        Some(resolved)
     } else {
         None
     }
 }
 
+/// Read a card body only when the candidate path resolves inside the
+/// context-atlas directory. Absolute, symlink or `..` escapes yield `None`.
+fn read_card_within(atlas_dir: &Path, candidate: &Path) -> Option<String> {
+    fs::read_to_string(resolve_atlas_path(atlas_dir, candidate)?).ok()
+}
+
 /// Render HTML report using Leptos SSR
 pub(crate) fn render_html_report(path: &Path, sections: &[ReportSection]) -> io::Result<()> {
+    // Complete filesystem admission from the original source sections before
+    // entering the JSON presentation bridge. Decoded renderer data is never a
+    // source of filesystem authority; it receives only these typed projections.
+    let source_atlases: Vec<Option<ContextAtlasInfo>> = sections
+        .iter()
+        .map(|section| load_atlas_info(Path::new(&section.root)))
+        .collect();
+
     // Only write JS assets if there's an actual parent directory (not empty path)
     if let Some(dir) = path.parent()
         && !dir.as_os_str().is_empty()
@@ -142,12 +162,10 @@ pub(crate) fn render_html_report(path: &Path, sections: &[ReportSection]) -> io:
             )
         })?;
 
-    // Attach materialized Context Atlas pointer (when `loct auto` produced
-    // `<artifacts_dir>/context-atlas/manifest.json` next to the report).
-    if let Some(atlas_info) = path.parent().and_then(load_atlas_info) {
-        for section in &mut leptos_sections {
-            section.context_atlas = Some(atlas_info.clone());
-        }
+    // Each section owns its Atlas, including explicit absence. Never retain an
+    // unverified pointer supplied by the JSON bridge or borrow an output ancestor.
+    for (atlas, section) in source_atlases.into_iter().zip(&mut leptos_sections) {
+        section.context_atlas = atlas;
     }
 
     // Configure JS asset paths (relative to output file)
@@ -428,6 +446,286 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    fn atlas_test_section(root: &std::path::Path) -> ReportSection {
+        ReportSection {
+            root: root.display().to_string(),
+            files_analyzed: 1,
+            total_loc: 1,
+            reexport_files_count: 0,
+            dynamic_imports_count: 0,
+            ranked_dups: Vec::new(),
+            cascades: Vec::new(),
+            circular_imports: Vec::new(),
+            lazy_circular_imports: Vec::new(),
+            dynamic: Vec::new(),
+            analyze_limit: 0,
+            generated_at: None,
+            schema_name: None,
+            schema_version: None,
+            loctree_version: None,
+            missing_handlers: Vec::new(),
+            unregistered_handlers: Vec::new(),
+            unused_handlers: Vec::new(),
+            command_counts: (0, 0),
+            command_bridges: Vec::new(),
+            open_base: None,
+            tree: None,
+            graph: None,
+            graph_warning: None,
+            insights: Vec::new(),
+            git_branch: None,
+            git_commit: None,
+            priority_tasks: Vec::new(),
+            hub_files: Vec::new(),
+            hotspots: Vec::new(),
+            crowds: Vec::new(),
+            dead_exports: Vec::new(),
+            dist: None,
+            twins_data: None,
+            coverage_gaps: Vec::new(),
+            health_score: None,
+            refactor_plan: None,
+            context_atlas: None,
+        }
+    }
+
+    fn write_test_atlas(root: &std::path::Path, canary: &str) -> std::path::PathBuf {
+        let atlas = root.join(".loctree/context-atlas");
+        fs::create_dir_all(&atlas).expect("create atlas");
+        let atlas = atlas.canonicalize().expect("canonical atlas");
+        fs::write(atlas.join("00-core-map.md"), format!("# {canary}\nbody\n")).expect("write card");
+        fs::write(atlas.join("manifest.md"), "# Atlas\n").expect("write manifest");
+        fs::write(
+            atlas.join("manifest.json"),
+            serde_json::json!({
+                "project": root.canonicalize().expect("canonical root"),
+                "atlas_dir": atlas,
+                "manifest": atlas.join("manifest.md"),
+                "manifest_json": atlas.join("manifest.json"),
+                "recommended_start": atlas.join("00-core-map.md"),
+                "message": canary,
+                "cards": [{
+                    "id": "core", "title": canary, "path": "00-core-map.md",
+                    "lines": 999, "why": "source identity regression"
+                }]
+            })
+            .to_string(),
+        )
+        .expect("write atlas json");
+        atlas
+    }
+
+    #[test]
+    fn atlas_relocated_report_uses_source_not_foreign_output_ancestor() {
+        let source = tempdir().expect("source");
+        let foreign = tempdir().expect("foreign output");
+        let source_atlas = write_test_atlas(source.path(), "SOURCE_A_CANARY");
+        write_test_atlas(foreign.path(), "FOREIGN_B_CANARY");
+        let output = foreign.path().join("elsewhere/report.html");
+        fs::create_dir_all(output.parent().expect("output parent")).expect("output dir");
+        render_html_report(&output, &[atlas_test_section(source.path())]).expect("render");
+        let html = fs::read_to_string(output).expect("html");
+        assert!(html.contains("# SOURCE_A_CANARY\nbody\n"));
+        assert!(!html.contains("FOREIGN_B_CANARY"));
+        for target in ["00-core-map.md", "manifest.md"] {
+            assert!(html.contains(&format!(
+                "data-copy=\"{}\"",
+                source_atlas.join(target).display()
+            )));
+        }
+        assert!(html.contains(&format!("data-copy=\"{}\"", source_atlas.display())));
+        assert!(html.contains("2 lines"));
+        assert!(!html.contains("data-copy=\"00-core-map.md\""));
+    }
+
+    #[test]
+    fn atlas_absent_source_never_borrows_output_ancestor() {
+        let source = tempdir().expect("source");
+        let foreign = tempdir().expect("foreign output");
+        write_test_atlas(foreign.path(), "FOREIGN_ONLY_CANARY");
+        let output = foreign.path().join("report.html");
+        render_html_report(&output, &[atlas_test_section(source.path())]).expect("render");
+        let html = fs::read_to_string(output).expect("html");
+        assert!(!html.contains("FOREIGN_ONLY_CANARY"));
+        assert!(!html.contains("Context Atlas Ready"));
+        assert!(html.contains("6 cards · template"));
+    }
+
+    #[test]
+    fn atlas_multiroot_sections_keep_independent_source_identity() {
+        let first = tempdir().expect("first");
+        let second = tempdir().expect("second");
+        let absent = tempdir().expect("absent");
+        let first_atlas = write_test_atlas(first.path(), "FIRST_REPO_CANARY");
+        let second_atlas = write_test_atlas(second.path(), "SECOND_REPO_CANARY");
+        let output = first.path().join("report.html");
+        render_html_report(
+            &output,
+            &[
+                atlas_test_section(first.path()),
+                atlas_test_section(second.path()),
+                atlas_test_section(absent.path()),
+            ],
+        )
+        .expect("render");
+        let html = fs::read_to_string(output).expect("html");
+        assert!(html.contains("# FIRST_REPO_CANARY\nbody\n"));
+        assert!(html.contains("# SECOND_REPO_CANARY\nbody\n"));
+        assert_eq!(html.matches("class=\"context-atlas-panel\"").count(), 2);
+        for atlas in [first_atlas, second_atlas] {
+            assert!(html.contains(&format!(
+                "data-copy=\"{}\"",
+                atlas.join("00-core-map.md").display()
+            )));
+        }
+    }
+
+    #[test]
+    fn atlas_rejects_mismatched_or_invalid_manifest_identity() {
+        let source = tempdir().expect("source");
+        let other = tempdir().expect("other source");
+        let atlas = write_test_atlas(source.path(), "WRONG_IDENTITY_CANARY");
+        let manifest = atlas.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).expect("manifest"))
+                .expect("manifest json");
+        for identity in [
+            serde_json::json!(other.path()),
+            serde_json::json!("."),
+            serde_json::Value::Null,
+        ] {
+            value["project"] = identity;
+            fs::write(&manifest, value.to_string()).expect("mismatched manifest");
+            assert!(super::load_atlas_info(source.path()).is_none());
+            let output = source.path().join("report.html");
+            render_html_report(&output, &[atlas_test_section(source.path())]).expect("render");
+            let html = fs::read_to_string(output).expect("html");
+            assert!(!html.contains("WRONG_IDENTITY_CANARY"));
+            assert!(!html.contains(&format!("data-copy=\"{}", atlas.display())));
+        }
+        assert!(super::load_atlas_info(std::path::Path::new("")).is_none());
+    }
+
+    #[test]
+    fn atlas_json_presentation_payload_cannot_supply_filesystem_authority() {
+        let source = tempdir().expect("source");
+        let output_dir = tempdir().expect("output");
+        let mut section = atlas_test_section(source.path());
+        section.context_atlas = Some(super::super::report::ContextAtlasInfo {
+            atlas_dir: "/unadmitted/atlas".into(),
+            manifest: "/unadmitted/manifest.md".into(),
+            manifest_json: "/unadmitted/manifest.json".into(),
+            recommended_start: "/unadmitted/card.md".into(),
+            message: "FORGED_PRESENTATION_CANARY".into(),
+            cards: Vec::new(),
+        });
+        let output = output_dir.path().join("report.html");
+        render_html_report(&output, std::slice::from_ref(&section)).expect("absent atlas");
+        let html = fs::read_to_string(&output).expect("html");
+        assert!(!html.contains("FORGED_PRESENTATION_CANARY"));
+        assert!(!html.contains("/unadmitted/"));
+
+        let atlas = write_test_atlas(source.path(), "REAL_SOURCE_CANARY");
+        render_html_report(&output, &[section]).expect("source-local atlas");
+        let html = fs::read_to_string(output).expect("html");
+        assert!(html.contains("# REAL_SOURCE_CANARY\nbody\n"));
+        assert!(html.contains(&format!("data-copy=\"{}\"", atlas.display())));
+        assert!(!html.contains("FORGED_PRESENTATION_CANARY"));
+        assert!(!html.contains("/unadmitted/"));
+    }
+
+    #[test]
+    fn atlas_display_paths_cannot_redirect_admitted_source() {
+        let source = tempdir().expect("source");
+        let foreign = tempdir().expect("foreign");
+        let atlas = write_test_atlas(source.path(), "ADMITTED_SOURCE_CANARY");
+        let foreign_atlas = write_test_atlas(foreign.path(), "FOREIGN_DISPLAY_CANARY");
+        let manifest = atlas.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).expect("manifest"))
+                .expect("manifest json");
+        for field in [
+            "atlas_dir",
+            "manifest",
+            "manifest_json",
+            "recommended_start",
+        ] {
+            value[field] = serde_json::json!(foreign_atlas.join("00-core-map.md"));
+        }
+        fs::write(&manifest, value.to_string()).expect("poisoned display paths");
+        let info = super::load_atlas_info(source.path()).expect("admitted source");
+        assert_eq!(info.atlas_dir, atlas.display().to_string());
+        assert_eq!(
+            info.manifest,
+            atlas.join("manifest.md").display().to_string()
+        );
+        assert_eq!(info.manifest_json, manifest.display().to_string());
+        assert_eq!(info.recommended_start, info.cards[0].path);
+        assert_eq!(
+            info.cards[0].body.as_deref(),
+            Some("# ADMITTED_SOURCE_CANARY\nbody\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atlas_symlink_escapes_and_unavailable_paths_have_no_body_or_copy_payload() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempdir().expect("source");
+        let foreign = tempdir().expect("foreign");
+        let atlas = write_test_atlas(source.path(), "LOCAL_CARD");
+        let foreign_atlas = write_test_atlas(foreign.path(), "FOREIGN_LINK_CANARY");
+        let manifest = atlas.join("manifest.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).expect("manifest"))
+                .expect("manifest json");
+        symlink(
+            foreign_atlas.join("00-core-map.md"),
+            atlas.join("escape.md"),
+        )
+        .expect("escaping card symlink");
+        fs::remove_file(atlas.join("manifest.md")).expect("remove manifest markdown");
+        symlink(foreign_atlas.join("manifest.md"), atlas.join("manifest.md"))
+            .expect("escaping manifest symlink");
+        for path in ["escape.md", "../../missing.md", "absent.md", "."] {
+            value["cards"][0]["path"] = serde_json::json!(path);
+            value["recommended_start"] = serde_json::json!(path);
+            fs::write(&manifest, value.to_string()).expect("invalid pointers");
+            let info = super::load_atlas_info(source.path()).expect("local atlas");
+            assert!(info.cards[0].body.is_none());
+            assert!(info.cards[0].path.is_empty());
+            assert!(info.manifest.is_empty());
+            assert!(info.recommended_start.is_empty());
+            let output = source.path().join("report.html");
+            render_html_report(&output, &[atlas_test_section(source.path())]).expect("render");
+            let html = fs::read_to_string(output).expect("html");
+            assert!(!html.contains("FOREIGN_LINK_CANARY"));
+            assert!(
+                !html.contains("data-copy=\"\""),
+                "empty copy targets: {:?}",
+                html.match_indices("data-copy=\"\"")
+                    .map(|(offset, _)| &html[offset.saturating_sub(80)..offset + 80])
+                    .collect::<Vec<_>>()
+            );
+            assert!(html.contains("disabled title=\"Copy card path\""));
+        }
+        // A symlinked manifest JSON cannot import an otherwise valid foreign Atlas.
+        fs::remove_file(&manifest).expect("remove manifest json");
+        symlink(foreign_atlas.join("manifest.json"), &manifest).expect("manifest json link");
+        assert!(super::load_atlas_info(source.path()).is_none());
+
+        // Nor can the entire source-local Atlas directory point outside the source.
+        let no_atlas = tempdir().expect("source without atlas");
+        fs::create_dir(no_atlas.path().join(".loctree")).expect("local loctree");
+        symlink(
+            &foreign_atlas,
+            no_atlas.path().join(".loctree/context-atlas"),
+        )
+        .expect("atlas directory link");
+        assert!(super::load_atlas_info(no_atlas.path()).is_none());
+    }
+
     #[test]
     fn renders_basic_report() {
         let tmp_dir = tempdir().expect("tmp dir");
@@ -632,7 +930,7 @@ mod tests {
         )
         .unwrap();
 
-        let info = super::load_atlas_info(&loctree_dir).expect("atlas attached");
+        let info = super::load_atlas_info(tmp.path()).expect("atlas attached");
         assert_eq!(info.cards.len(), 1);
         // 999 is the stale manifest lie; 7 is what the file actually holds.
         assert_eq!(info.cards[0].lines, 7);
@@ -641,9 +939,11 @@ mod tests {
 
         // Unreadable card: keep the manifest count, ship no body.
         std::fs::remove_file(atlas_dir.join("00-core-map.md")).unwrap();
-        let info = super::load_atlas_info(&loctree_dir).expect("atlas attached");
+        let info = super::load_atlas_info(tmp.path()).expect("atlas attached");
         assert_eq!(info.cards[0].lines, 999);
         assert!(info.cards[0].body.is_none());
+        assert!(info.cards[0].path.is_empty());
+        assert!(info.recommended_start.is_empty());
     }
 
     #[test]
@@ -687,9 +987,10 @@ mod tests {
         )
         .unwrap();
 
-        let info = super::load_atlas_info(&loctree_dir).expect("atlas attached");
+        let info = super::load_atlas_info(tmp.path()).expect("atlas attached");
         assert_eq!(info.cards.len(), 2);
         for card in &info.cards {
+            assert!(card.path.is_empty(), "escaping paths must not be copied");
             assert!(
                 card.body.is_none(),
                 "card '{}' escaped the atlas dir and got embedded",

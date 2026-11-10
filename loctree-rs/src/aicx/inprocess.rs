@@ -15,8 +15,20 @@ pub struct AicxInProcessClient {
 
 impl AicxInProcessClient {
     pub fn from_env() -> Result<Self, anyhow::Error> {
-        let base = aicx::api::Aicx::from_env()?;
-        let store_root = base.store_root().join("store");
+        #[cfg(test)]
+        let store_root = {
+            // Unit tests inject stores explicitly and never consult the user's
+            // AICX bootstrap config, even when the injected setting is absent.
+            static DEFAULT_STORE: std::sync::LazyLock<tempfile::TempDir> =
+                std::sync::LazyLock::new(|| tempfile::tempdir().expect("test AICX store"));
+            crate::test_env::injected_value("AICX_HOME")
+                .filter(|home| !home.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| DEFAULT_STORE.path().to_path_buf())
+                .join("store")
+        };
+        #[cfg(not(test))]
+        let store_root = aicx::api::Aicx::from_env()?.store_root().join("store");
         Ok(Self {
             client: aicx::api::Aicx::with_store_root(store_root),
         })
@@ -37,11 +49,14 @@ impl AicxInProcessClient {
 
         let scope = scope.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
+        let operation = move || {
             let result = Self::from_env()
                 .and_then(|client| client.intents_unbounded(&scope, window_hours, limit));
             let _ = tx.send(result);
-        });
+        };
+        #[cfg(test)]
+        let operation = crate::test_env::inherit(operation);
+        std::thread::spawn(operation);
 
         match rx.recv_timeout(cap) {
             Ok(Ok(rows)) => Ok(rows),

@@ -156,12 +156,12 @@ pub fn AtlasView(
                             <div class="atlas-path-row">
                                 <span class="atlas-path-label">"Manifest"</span>
                                 <code class="atlas-path">{manifest.clone()}</code>
-                                <button class="copy-btn" data-copy=manifest_copy title="Copy manifest path">"Copy"</button>
+                                <button class="copy-btn" disabled=manifest.is_empty() data-copy=(!manifest_copy.is_empty()).then_some(manifest_copy) title="Copy manifest path">"Copy"</button>
                             </div>
                             <div class="atlas-path-row">
                                 <span class="atlas-path-label">"Start here"</span>
                                 <code class="atlas-path">{recommended_start.clone()}</code>
-                                <button class="copy-btn" data-copy=start_copy title="Copy first card path">"Copy"</button>
+                                <button class="copy-btn" disabled=recommended_start.is_empty() data-copy=(!start_copy.is_empty()).then_some(start_copy) title="Copy first card path">"Copy"</button>
                             </div>
                         </div>
                     }
@@ -176,6 +176,7 @@ pub fn AtlasView(
                         .get(&id_key)
                         .cloned()
                         .unwrap_or_else(|| spec.filename.to_string());
+                    let path = if path.is_empty() { "Unavailable".to_string() } else { path };
                     let body = real_bodies.get(&id_key).cloned();
                     let meta = view! {
                         <footer class="atlas-card-meta">

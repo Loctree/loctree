@@ -106,6 +106,9 @@ pub enum Command {
     /// Compare two snapshots and show delta.
     Diff(DiffOptions),
 
+    /// Browse a bounded Git timeline.
+    History(HistoryOptions),
+
     /// Detect functional crowds (similar files clustering).
     Crowd(CrowdOptions),
 
@@ -141,7 +144,7 @@ pub enum Command {
     /// Focus on a directory - extract holographic context for all files.
     Focus(FocusOptions),
 
-    /// Show import frequency heatmap - which files are core vs peripheral.
+    /// Show static dependency degree by file.
     Hotspots(HotspotsOptions),
 
     /// Unified signal follower matching the MCP follow tool.

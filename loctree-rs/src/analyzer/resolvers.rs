@@ -1498,7 +1498,7 @@ fn resolve_path_dependency_import(
 /// G4.3: does the importing crate's own manifest declare `ident` as a
 /// dependency (registry or path — either way, the identifier belongs to an
 /// external crate, not a local module)?
-fn is_declared_external_dependency(ident: &str, crate_root: &Path, root: &Path) -> bool {
+pub(crate) fn is_declared_external_dependency(ident: &str, crate_root: &Path, root: &Path) -> bool {
     let Some(manifest_path) =
         crate::analyzer::cargo_manifest::find_nearest_crate_manifest(crate_root, root)
     else {

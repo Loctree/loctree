@@ -9,86 +9,21 @@ use std::path::Path;
 
 use strsim::levenshtein;
 
+use crate::cli::command::Command;
 use crate::types::ColorMode;
-
-/// Known subcommand names for the new CLI interface.
-pub(crate) const SUBCOMMANDS: &[&str] = &[
-    "auto",
-    "agent",
-    "scan",
-    "watch",
-    "tree",
-    "slice",
-    "s", // alias for slice
-    "context",
-    "repo-view",
-    "find",
-    "f", // alias for find
-    "occurrences",
-    "findings",
-    "dead",
-    "d", // alias for dead
-    "unused",
-    "cycles",
-    "c", // alias for cycles
-    "trace",
-    "commands",
-    "events",
-    "pipelines",
-    "insights",
-    "manifests",
-    "info",
-    "anchors",
-    "lint",
-    "report",
-    "prism",
-    "help",
-    "query",
-    "q", // alias for query
-    "body",
-    "diff",
-    "crowd",
-    "tagmap",
-    "twins",
-    "t", // alias for twins
-    "suppress",
-    "suppressions",
-    "routes",
-    "dist",
-    "coverage",
-    "impact",
-    "i", // alias for impact
-    "focus",
-    "hotspots",
-    "follow",
-    "layoutmap",
-    "health",
-    "h", // alias for health
-    "audit",
-    "doctor",
-    "env-truth",
-    "envtruth",
-    "plan",
-    "p", // alias for plan
-    "cache",
-    "prune-old-artifacts",
-    "snapshot-path",
-    "inventory",
-    "atlas",
-];
 
 const LEGACY_POSITIONAL_COMMANDS: &[&str] = &["tauri", "styles", "init", "search", "git", "for-ai"];
 
 /// Check if an argument looks like a new-style subcommand.
 pub fn is_subcommand(arg: &str) -> bool {
-    SUBCOMMANDS.contains(&arg)
+    Command::canonical_subcommand(arg).is_some()
 }
 
 pub(super) fn should_treat_unknown_as_subcommand(args: &[String], input: &str) -> bool {
     if input.is_empty()
         || input.starts_with('-')
         || is_jq_filter(input)
-        || SUBCOMMANDS.contains(&input)
+        || is_subcommand(input)
         || LEGACY_POSITIONAL_COMMANDS.contains(&input)
         || Path::new(input).exists()
     {
@@ -109,9 +44,9 @@ pub(super) fn suggest_similar_command(input: &str) -> Option<&'static str> {
     let mut best_match: Option<(&str, usize)> = None;
     let max_distance = if input_lower.len() >= 5 { 3 } else { 2 };
 
-    for &cmd in SUBCOMMANDS {
+    for cmd in Command::subcommand_names() {
         let distance = levenshtein(&input_lower, cmd);
-        if distance <= max_distance {
+        if distance > 0 && distance <= max_distance {
             if let Some((best_cmd, best_dist)) = best_match {
                 if distance < best_dist
                     || (distance == best_dist
@@ -145,6 +80,7 @@ pub(super) fn format_unknown_subcommand_error(input: &str) -> String {
 /// Help-topic refusal: parser-rejected names (retired `sniff`/`zombie`, typos)
 /// must not look like a live command. Suggest a live neighbour when one is close.
 pub(crate) fn format_unknown_help_topic(topic: &str) -> String {
+    let retirement = Command::retired_command_message(topic);
     let suggestion = match topic {
         "sniff" | "zombie" => Some("findings"),
         _ => suggest_similar_command(topic),
@@ -154,6 +90,10 @@ pub(crate) fn format_unknown_help_topic(topic: &str) -> String {
         message.push_str(&format!(", did you mean '{suggestion}'?"));
     } else {
         message.push('.');
+    }
+    if let Some(retirement) = retirement {
+        message.push('\n');
+        message.push_str(retirement.trim_end());
     }
     message.push_str("\nRun 'loct --help' for available commands.");
     message
@@ -270,6 +210,49 @@ mod tests {
     }
 
     #[test]
+    fn every_live_parser_name_has_topic_help_and_full_reference_entry() {
+        use crate::cli::command::Command;
+
+        let full = Command::format_help_full();
+        for name in Command::subcommand_names() {
+            let text = Command::format_command_help(name)
+                .unwrap_or_else(|| panic!("live parser name {name} has no topic help"));
+            assert!(text.contains("USAGE:"), "{name}: {text}");
+            assert!(
+                full.lines().any(|line| {
+                    line.trim()
+                        .strip_prefix("loct ")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        == Some(name)
+                }),
+                "live parser name {name} is missing from full reference"
+            );
+            for args in [
+                vec![name.into(), "--help".into()],
+                vec!["help".into(), name.into()],
+            ] {
+                let parsed = super::super::core::parse_command(&args)
+                    .expect("live command help parses")
+                    .expect("new command syntax is recognized");
+                assert!(
+                    matches!(parsed.command, Command::Help(_)),
+                    "{name} executes an action"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retired_help_explains_migration_without_claiming_live_support() {
+        for name in ["sniff", "zombie"] {
+            let message = format_unknown_help_topic(name);
+            assert!(message.contains("has been retired"), "{message}");
+            assert!(message.contains("loct findings"), "{message}");
+            assert!(!suggest_similar_command(name).is_some_and(|suggestion| suggestion == name));
+        }
+    }
+
+    #[test]
     fn w4_01_help_matches_parser_vocabulary() {
         use crate::cli::command::Command;
 
@@ -290,7 +273,7 @@ mod tests {
         }
 
         let extra_topics = ["jq", "sniff", "zombie"];
-        for topic in SUBCOMMANDS.iter().copied().chain(extra_topics) {
+        for topic in Command::subcommand_names().chain(extra_topics) {
             let Some(text) = Command::format_command_help(topic) else {
                 continue;
             };

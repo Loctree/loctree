@@ -8,9 +8,10 @@ mod usages;
 
 // Re-export public items
 pub use imports::CrateModuleMap;
+pub(crate) use usages::qualified_call_paths;
 
 // Imports from submodules
-use imports::{parse_rust_brace_names, split_use_prefix_and_braces};
+pub(crate) use imports::{parse_rust_brace_names, split_use_prefix_and_braces};
 use naming::exposed_command_name;
 use preprocess::{
     find_balanced_bracket, strip_cfg_attributes, strip_cfg_test_modules, strip_function_body_uses,
@@ -1311,9 +1312,8 @@ pub(crate) fn analyze_rust_file(
     analysis.event_emits = event_emits;
     analysis.event_listens = event_listens;
 
-    // Axum route registrations (H3a) — the detector scans the stripped
-    // event buffer so routes inside doc comments / #[cfg(test)] don't count.
-    analysis.routes = crate::semantic::rust::rust_routes::detect_axum_routes(&event_scan_content);
+    // Route syntax spans must refer to the original, unshortened source.
+    analysis.routes = crate::semantic::rust::rust_routes::detect_axum_routes(content);
 
     // Detect Rust entry points using proper regex (not contains - avoids false positives in comments/strings)
     if regex_rust_fn_main().is_match(content) {

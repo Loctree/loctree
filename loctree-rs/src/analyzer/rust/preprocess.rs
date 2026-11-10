@@ -398,7 +398,7 @@ pub(crate) fn strip_string_spans(content: &str) -> String {
 /// `'\''`, `'\\'`), and a unicode escape (`'\u{1F600}'`). Returns `None` for
 /// anything that does not close this way — in particular a lifetime
 /// (`'a`, `'static`) never has a bare closing `'` and is left alone.
-fn char_literal_end(chars: &[char], start: usize) -> Option<usize> {
+pub(super) fn char_literal_end(chars: &[char], start: usize) -> Option<usize> {
     let mut i = start + 1;
     if chars.get(i) == Some(&'\\') {
         i += 1;

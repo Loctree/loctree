@@ -2,12 +2,11 @@
 //!
 //! 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI
 
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
 
-use super::{RefactorPlan, RiskLevel, Shim};
+use super::{RefactorPlan, RiskLevel, execution_blockers};
 
 // ============================================================================
 // Markdown Output
@@ -25,6 +24,24 @@ pub fn format_as_markdown(plan: &RefactorPlan) -> String {
 
     // Header
     md.push_str(&format!("# Refactor Plan: {}\n\n", plan.target));
+    md.push_str("Path layers are candidate evidence, not permission to reorganize a repository. Kept/unresolved files require a represented relocation contract.\n\n");
+    let blockers = execution_blockers(std::slice::from_ref(plan));
+    if !blockers.is_empty() {
+        md.push_str("## Execution withheld\n\n");
+        for blocker in &blockers {
+            md.push_str(&format!("- {blocker}\n"));
+        }
+    }
+    md.push_str("## Kept / unresolved candidates\n\n");
+    for candidate in &plan.unresolved {
+        md.push_str(&format!(
+            "- `{}` ({}): {}\n",
+            candidate.source,
+            candidate.layer.display_name(),
+            candidate.reason
+        ));
+    }
+    md.push_str("\nSupported execution: explicit same-package literal-export ESM leaves only, preserving relative topology and old-path shims. TypeScript requires a simple explicit ESM emitting tsconfig whose rootDir/include/exclude cover both source and destination; native/noEmit, JSONC/extended/project-reference configurations are withheld. Rust/Python relocation, dependency/asset rewriting, runtime modules and other syntax are withheld. The script requires Python 3, Git and the recorded repository root; use --dry first.\n\n");
 
     // Summary
     md.push_str("## Summary\n\n");
@@ -69,7 +86,7 @@ pub fn format_as_markdown(plan: &RefactorPlan) -> String {
     // Cyclic Dependencies Warning
     if !plan.cyclic_groups.is_empty() {
         md.push_str("## ⚠️ Cyclic Dependencies\n\n");
-        md.push_str("The following groups of files have circular imports. Move these together or break the cycle first:\n\n");
+        md.push_str("The following groups have circular imports. Cycle membership alone does not authorize relocation; resolve their module contracts before proposing moves:\n\n");
         for (i, group) in plan.cyclic_groups.iter().enumerate() {
             md.push_str(&format!("**Cycle {}:**\n", i + 1));
             for file in group {
@@ -91,17 +108,14 @@ pub fn format_as_markdown(plan: &RefactorPlan) -> String {
         md.push_str(&format!("{} file(s)\n\n", phase.moves.len()));
 
         // Moves table
-        md.push_str("| File | From | To | LOC | Consumers | Reason |\n");
+        md.push_str("| Source | Destination | Layer | LOC | Consumers | Reason |\n");
         md.push_str("|------|------|----|----|-----------|--------|\n");
 
         for mv in &phase.moves {
             md.push_str(&format!(
                 "| `{}` | {} | {} | {} | {} | {} |\n",
-                Path::new(&mv.source)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&mv.source),
-                mv.current_layer.display_name(),
+                mv.source,
+                mv.target,
                 mv.target_layer.display_name(),
                 mv.loc,
                 mv.direct_consumers,
@@ -112,14 +126,20 @@ pub fn format_as_markdown(plan: &RefactorPlan) -> String {
 
         // Git commands
         md.push_str("**Commands:**\n\n```bash\n");
-        md.push_str(&phase.git_script);
+        if blockers.is_empty() {
+            md.push_str(&super::build_git_script(&phase.moves));
+        } else {
+            md.push_str("# Withheld: execution contract rejected this plan.");
+        }
         md.push_str("\n```\n\n");
     }
 
     // Shimming Strategy
     if !plan.shims.is_empty() {
         md.push_str("## Shimming Strategy\n\n");
-        md.push_str("Create re-export shims for heavily-imported files to maintain backward compatibility:\n\n");
+        md.push_str(
+            "Preserve every old module path, including consumers absent from the import graph:\n\n",
+        );
 
         for shim in &plan.shims {
             md.push_str(&format!(
@@ -148,6 +168,9 @@ pub fn output_bundle_as_markdown(plans: &[RefactorPlan], path: &Path) -> io::Res
 /// Format multiple refactor plans as a single markdown string.
 pub fn format_bundle_as_markdown(plans: &[RefactorPlan]) -> String {
     let mut md = String::new();
+    for blocker in execution_blockers(plans) {
+        md.push_str(&format!("- Execution withheld: {blocker}\n"));
+    }
     for (idx, plan) in plans.iter().enumerate() {
         if idx > 0 {
             md.push_str("\n\n---\n\n");
@@ -163,26 +186,39 @@ pub fn format_bundle_as_markdown(plans: &[RefactorPlan]) -> String {
 
 /// Output refactor plan as JSON.
 pub fn output_as_json(plan: &RefactorPlan, path: &Path) -> io::Result<()> {
-    let json = serde_json::to_string_pretty(plan)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(path, json)
+    fs::write(path, format_as_json(plan))
 }
 
 /// Format refactor plan as JSON string.
 pub fn format_as_json(plan: &RefactorPlan) -> String {
-    serde_json::to_string_pretty(plan).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string_pretty(&json_plan(
+        plan,
+        &execution_blockers(std::slice::from_ref(plan)),
+    ))
+    .expect("refactor plan is serializable")
 }
 
 /// Output multiple refactor plans as JSON.
 pub fn output_bundle_as_json(plans: &[RefactorPlan], path: &Path) -> io::Result<()> {
-    let json = serde_json::to_string_pretty(plans)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(path, json)
+    fs::write(path, format_bundle_as_json(plans))
 }
 
 /// Format multiple refactor plans as JSON string.
 pub fn format_bundle_as_json(plans: &[RefactorPlan]) -> String {
-    serde_json::to_string_pretty(plans).unwrap_or_else(|_| "[]".to_string())
+    let blockers = execution_blockers(plans);
+    let values: Vec<_> = plans
+        .iter()
+        .map(|plan| json_plan(plan, &blockers))
+        .collect();
+    serde_json::to_string_pretty(&values).expect("refactor plans are serializable")
+}
+
+fn json_plan(plan: &RefactorPlan, blockers: &[String]) -> serde_json::Value {
+    let mut value = serde_json::to_value(plan).expect("refactor plan is serializable");
+    value["execution"] = serde_json::json!({"blockers": blockers, "supported": blockers.is_empty(),
+        "mode": if !blockers.is_empty() { "withheld" } else if plan.moves.is_empty() { "analysis_only" } else { "guarded_moves" },
+        "contract": "explicit same-package literal-export ESM leaves; topology and old-path shims preserved"});
+    value
 }
 
 // ============================================================================
@@ -208,156 +244,7 @@ pub fn output_as_script(plan: &RefactorPlan, path: &Path) -> io::Result<()> {
 
 /// Format refactor plan as shell script string.
 pub fn format_as_script(plan: &RefactorPlan) -> String {
-    let mut script = String::new();
-
-    // Shebang and header
-    script.push_str("#!/bin/bash\n");
-    script.push_str("# Refactor Plan - Generated by loctree\n");
-    script.push_str(&format!("# Target: {}\n", plan.target));
-    script.push_str(&format!(
-        "# Generated: {}\n",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    ));
-    script.push_str("#\n");
-    script.push_str("# 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI\n");
-    script.push_str("#\n");
-    script.push_str("# Usage:\n");
-    script.push_str("#   ./refactor.sh         # Execute all phases\n");
-    script.push_str("#   ./refactor.sh --dry   # Show commands without executing\n");
-    script.push_str("#   ./refactor.sh 1       # Execute only phase 1\n");
-    script.push('\n');
-
-    // Safety settings
-    script.push_str("set -e  # Exit on error\n");
-    script.push_str("set -u  # Error on undefined variables\n");
-    script.push('\n');
-
-    // Color definitions
-    script.push_str("# Colors\n");
-    script.push_str("RED='\\033[0;31m'\n");
-    script.push_str("GREEN='\\033[0;32m'\n");
-    script.push_str("YELLOW='\\033[0;33m'\n");
-    script.push_str("NC='\\033[0m' # No Color\n");
-    script.push('\n');
-
-    // Dry run flag
-    script.push_str("DRY_RUN=false\n");
-    script.push_str("PHASE_FILTER=\"\"\n");
-    script.push('\n');
-    script.push_str("# Parse arguments\n");
-    script.push_str("for arg in \"$@\"; do\n");
-    script.push_str("    case $arg in\n");
-    script.push_str("        --dry)\n");
-    script.push_str("            DRY_RUN=true\n");
-    script.push_str("            ;;\n");
-    script.push_str("        [0-9]*)\n");
-    script.push_str("            PHASE_FILTER=\"$arg\"\n");
-    script.push_str("            ;;\n");
-    script.push_str("    esac\n");
-    script.push_str("done\n");
-    script.push('\n');
-
-    // Run function
-    script.push_str("run() {\n");
-    script.push_str("    if [ \"$DRY_RUN\" = true ]; then\n");
-    script.push_str("        echo \"[DRY] $*\"\n");
-    script.push_str("    else\n");
-    script.push_str("        echo \"[RUN] $*\"\n");
-    script.push_str("        \"$@\"\n");
-    script.push_str("    fi\n");
-    script.push_str("}\n");
-    script.push('\n');
-
-    // Phase functions
-    for (i, phase) in plan.phases.iter().enumerate() {
-        let phase_num = i + 1;
-        let risk_color = match phase.risk {
-            RiskLevel::Low => "GREEN",
-            RiskLevel::Medium => "YELLOW",
-            RiskLevel::High => "RED",
-        };
-
-        script.push_str(&format!("phase_{} () {{\n", phase_num));
-        script.push_str(&format!(
-            "    echo -e \"${{{}}}=== {} ===${{NC}}\"\n",
-            risk_color, phase.name
-        ));
-        script.push_str(&format!(
-            "    echo \"Moving {} files...\"\n",
-            phase.moves.len()
-        ));
-        script.push('\n');
-
-        for mv in &phase.moves {
-            // Create parent directory
-            if let Some(parent) = Path::new(&mv.target).parent() {
-                script.push_str(&format!("    run mkdir -p \"{}\"\n", parent.display()));
-            }
-            // Move file
-            script.push_str(&format!(
-                "    run git mv \"{}\" \"{}\"\n",
-                mv.source, mv.target
-            ));
-        }
-
-        script.push('\n');
-        script.push_str(&format!(
-            "    echo -e \"${{GREEN}}✓ Phase {} complete${{NC}}\"\n",
-            phase_num
-        ));
-        script.push_str("}\n\n");
-    }
-
-    // Shim creation function
-    if !plan.shims.is_empty() {
-        script.push_str("create_shims() {\n");
-        script.push_str("    echo \"=== Creating Shims ===\"\n");
-
-        for shim in &plan.shims {
-            // Escape the shim code for heredoc
-            let escaped_code = shim.code.replace('$', "\\$").replace('`', "\\`");
-            script.push_str(&format!("\n    cat > \"{}\" <<'SHIMEOF'\n", shim.old_path));
-            script.push_str(&escaped_code);
-            script.push_str("\nSHIMEOF\n");
-        }
-
-        script.push_str("\n    echo -e \"${GREEN}✓ Shims created${NC}\"\n");
-        script.push_str("}\n\n");
-    }
-
-    // Main execution
-    script.push_str("# Main execution\n");
-    script.push_str("echo \"Refactor Plan Execution\"\n");
-    script.push_str(&format!("echo \"Target: {}\"\n", plan.target));
-    script.push_str(&format!("echo \"Phases: {}\"\n", plan.phases.len()));
-    script.push_str("echo \"\"\n");
-    script.push('\n');
-
-    // Execute phases
-    for (i, _) in plan.phases.iter().enumerate() {
-        let phase_num = i + 1;
-        script.push_str(&format!(
-            "if [ -z \"$PHASE_FILTER\" ] || [ \"$PHASE_FILTER\" = \"{}\" ]; then\n",
-            phase_num
-        ));
-        script.push_str(&format!("    phase_{}\n", phase_num));
-        script.push_str("fi\n\n");
-    }
-
-    // Create shims at the end
-    if !plan.shims.is_empty() {
-        script.push_str("if [ -z \"$PHASE_FILTER\" ]; then\n");
-        script.push_str("    create_shims\n");
-        script.push_str("fi\n\n");
-    }
-
-    // Summary
-    script.push_str("echo \"\"\n");
-    script.push_str("echo -e \"${GREEN}=== Refactoring Complete ===${NC}\"\n");
-    script.push_str("echo \"Run 'git status' to review changes\"\n");
-    script.push_str("echo \"Run 'loct health' to verify structure\"\n");
-
-    script
+    format_bundle_as_script(std::slice::from_ref(plan))
 }
 
 /// Output multiple refactor plans as a single executable shell script.
@@ -379,178 +266,154 @@ pub fn output_bundle_as_script(plans: &[RefactorPlan], path: &Path) -> io::Resul
 
 /// Format multiple refactor plans as a single shell script string.
 pub fn format_bundle_as_script(plans: &[RefactorPlan]) -> String {
-    let mut script = String::new();
-
-    // Shebang and header
-    script.push_str("#!/bin/bash\n");
-    script.push_str("# Refactor Plan (multi-target) - Generated by loctree\n");
-    script.push_str("# Targets:\n");
-    for plan in plans {
-        script.push_str(&format!("#   - {}\n", plan.target));
+    let blockers = execution_blockers(plans);
+    if !blockers.is_empty() {
+        return format!(
+            "#!/bin/bash\n# Execution withheld: invalid relocation contract.\nprintf '%s\\n' '{}' >&2\nexit 2\n",
+            blockers.join("; ").replace('\'', "'\\''")
+        );
     }
-    script.push_str(&format!(
-        "# Generated: {}\n",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    ));
-    script.push_str("#\n");
-    script.push_str("# 𝚅𝚒𝚋𝚎𝚌𝚛𝚊𝚏𝚝𝚎𝚍. with AI Agents by Vetcoders (c)2024-2026 LibraxisAI\n");
-    script.push_str("#\n");
-    script.push_str("# Usage:\n");
-    script.push_str("#   ./refactor.sh         # Execute all phases\n");
-    script.push_str("#   ./refactor.sh --dry   # Show commands without executing\n");
-    script.push_str("#   ./refactor.sh 1       # Execute only phase 1\n");
-    script.push('\n');
-
-    // Safety settings
-    script.push_str("set -e  # Exit on error\n");
-    script.push_str("set -u  # Error on undefined variables\n");
-    script.push('\n');
-
-    // Color definitions
-    script.push_str("# Colors\n");
-    script.push_str("RED='\\033[0;31m'\n");
-    script.push_str("GREEN='\\033[0;32m'\n");
-    script.push_str("YELLOW='\\033[0;33m'\n");
-    script.push_str("NC='\\033[0m' # No Color\n");
-    script.push('\n');
-
-    // Dry run flag
-    script.push_str("DRY_RUN=false\n");
-    script.push_str("PHASE_FILTER=\"\"\n");
-    script.push('\n');
-    script.push_str("# Parse arguments\n");
-    script.push_str("for arg in \"$@\"; do\n");
-    script.push_str("    case $arg in\n");
-    script.push_str("        --dry)\n");
-    script.push_str("            DRY_RUN=true\n");
-    script.push_str("            ;;\n");
-    script.push_str("        [0-9]*)\n");
-    script.push_str("            PHASE_FILTER=\"$arg\"\n");
-    script.push_str("            ;;\n");
-    script.push_str("    esac\n");
-    script.push_str("done\n");
-    script.push('\n');
-
-    // Run function
-    script.push_str("run() {\n");
-    script.push_str("    if [ \"$DRY_RUN\" = true ]; then\n");
-    script.push_str("        echo \"[DRY] $*\"\n");
-    script.push_str("    else\n");
-    script.push_str("        echo \"[RUN] $*\"\n");
-    script.push_str("        \"$@\"\n");
-    script.push_str("    fi\n");
-    script.push_str("}\n");
-    script.push('\n');
-
-    // Phase functions (flatten across plans)
-    let mut phase_num = 1usize;
-    for plan in plans {
-        for phase in &plan.phases {
-            let risk_color = match phase.risk {
-                RiskLevel::Low => "GREEN",
-                RiskLevel::Medium => "YELLOW",
-                RiskLevel::High => "RED",
-            };
-
-            script.push_str(&format!("phase_{} () {{\n", phase_num));
-            script.push_str(&format!(
-                "    echo -e \"${{{}}}=== [{}] {} ===${{NC}}\"\n",
-                risk_color, plan.target, phase.name
-            ));
-            script.push_str(&format!(
-                "    echo \"Moving {} files...\"\n",
-                phase.moves.len()
-            ));
-            script.push('\n');
-
-            for mv in &phase.moves {
-                // Create parent directory
-                if let Some(parent) = Path::new(&mv.target).parent() {
-                    script.push_str(&format!("    run mkdir -p \"{}\"\n", parent.display()));
-                }
-                // Move file
-                script.push_str(&format!(
-                    "    run git mv \"{}\" \"{}\"\n",
-                    mv.source, mv.target
-                ));
-            }
-
-            script.push('\n');
-            script.push_str(&format!(
-                "    echo -e \"${{GREEN}}✓ Phase {} complete${{NC}}\"\n",
-                phase_num
-            ));
-            script.push_str("}\n\n");
-
-            phase_num += 1;
-        }
-    }
-
-    let total_phases = phase_num.saturating_sub(1);
-
-    // Shim creation function
-    let mut shims: HashMap<String, Shim> = HashMap::new();
-    for plan in plans {
-        for shim in &plan.shims {
-            shims
-                .entry(shim.old_path.clone())
-                .or_insert_with(|| shim.clone());
-        }
-    }
-
-    if !shims.is_empty() {
-        script.push_str("create_shims() {\n");
-        script.push_str("    echo \"=== Creating Shims ===\"\n");
-
-        let mut keys: Vec<String> = shims.keys().cloned().collect();
-        keys.sort();
-        for key in keys {
-            if let Some(shim) = shims.get(&key) {
-                // Escape the shim code for heredoc
-                let escaped_code = shim.code.replace('$', "\\$").replace('`', "\\`");
-                script.push_str(&format!("\n    cat > \"{}\" <<'SHIMEOF'\n", shim.old_path));
-                script.push_str(&escaped_code);
-                script.push_str("\nSHIMEOF\n");
-            }
-        }
-
-        script.push_str("\n    echo -e \"${GREEN}✓ Shims created${NC}\"\n");
-        script.push_str("}\n\n");
-    }
-
-    // Main execution
-    script.push_str("# Main execution\n");
-    script.push_str("echo \"Refactor Plan Execution\"\n");
-    script.push_str(&format!("echo \"Targets: {}\"\n", plans.len()));
-    script.push_str(&format!("echo \"Phases: {}\"\n", total_phases));
-    script.push_str("echo \"\"\n");
-    script.push('\n');
-
-    // Execute phases
-    for phase_num in 1..=total_phases {
-        script.push_str(&format!(
-            "if [ -z \"$PHASE_FILTER\" ] || [ \"$PHASE_FILTER\" = \"{}\" ]; then\n",
-            phase_num
-        ));
-        script.push_str(&format!("    phase_{}\n", phase_num));
-        script.push_str("fi\n\n");
-    }
-
-    // Create shims at the end
-    if !shims.is_empty() {
-        script.push_str("if [ -z \"$PHASE_FILTER\" ]; then\n");
-        script.push_str("    create_shims\n");
-        script.push_str("fi\n\n");
-    }
-
-    // Summary
-    script.push_str("echo \"\"\n");
-    script.push_str("echo -e \"${GREEN}=== Refactoring Complete ===${NC}\"\n");
-    script.push_str("echo \"Run 'git status' to review changes\"\n");
-    script.push_str("echo \"Run 'loct health' to verify structure\"\n");
-
+    let payload = serde_json::to_string(plans).expect("plans are serializable");
+    // JSON is data, not Python source or shell interpolation. Its lines cannot
+    // terminate the quoted heredoc, even when paths or shim strings are hostile.
+    let mut script = String::from(
+        "#!/bin/bash\n# Guarded refactor plan: --dry first; optional numeric phase filter.\n# Requires Python 3 and Git. No rollback is promised on external failures.\nset -euo pipefail\npython3 - \"$@\" <<'LOCTREE_EXECUTION_PY'\nimport hashlib, json, os, pathlib, subprocess, sys\nplans = json.loads(",
+    );
+    script.push_str(&serde_json::to_string(&payload).expect("JSON payload is serializable"));
+    script.push_str(")\n");
+    script.push_str(EXECUTION_ENGINE);
+    script.push_str("\nLOCTREE_EXECUTION_PY\n");
     script
 }
+
+const EXECUTION_ENGINE: &str = r#"
+def fail(message):
+    sys.exit('Refactor withheld: ' + message)
+
+args = sys.argv[1:]
+dry = '--dry' in args
+filters = [arg for arg in args if arg != '--dry']
+if len(filters) > 1 or any(not arg.isdecimal() for arg in filters):
+    fail('usage: refactor.sh [--dry] [PHASE]')
+selected = int(filters[0]) if filters else None
+steps = []
+phase_number = 0
+for plan in plans:
+    for phase in plan['phases']:
+        phase_number += 1
+        for move in phase['moves']:
+            shim = next(s for s in plan['shims'] if s['old_path'] == move['source'])
+            steps.append((phase_number, move, shim, plan['source_hashes'][move['source']]))
+if selected is not None and not 1 <= selected <= phase_number:
+    fail('unknown phase')
+if not steps:
+    print('Analysis only: no justified executable moves; inspect kept/unresolved candidates.')
+    for plan in plans:
+        for candidate in plan['unresolved']:
+            print('Kept ' + candidate['source'] + ': ' + candidate['reason'])
+    sys.exit(0)
+root = pathlib.Path(plans[0]['repository_root'])
+if pathlib.Path.cwd().resolve() != root:
+    fail('run from the recorded repository root: ' + str(root))
+git_root = subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], text=True).strip()
+if pathlib.Path(git_root).resolve() != root:
+    fail('Git root differs from the recorded repository root')
+
+def inspect(path, destination):
+    current = root
+    parts = pathlib.PurePosixPath(path).parts
+    for index, part in enumerate(parts):
+        if current.is_dir():
+            for entry in current.iterdir():
+                if entry.name.casefold() == part.casefold():
+                    if entry.name != part or destination and index == len(parts) - 1:
+                        fail('existing or case-colliding destination: ' + str(entry))
+        current = current / part
+        if current.is_symlink() or index < len(parts) - 1 and current.exists() and not current.is_dir():
+            fail('symlink or non-directory ancestor: ' + str(current))
+
+def boundary(path):
+    for parent in (root / path).parents:
+        if any((parent / name).exists() for name in ('package.json', 'Cargo.toml', 'pyproject.toml', '__init__.py')):
+            return parent
+        if parent == root:
+            break
+
+sources = {move['source'] for _, move, _, _ in steps}
+contract_inputs = {}
+for plan in plans:
+    contract_inputs.update(plan['source_hashes'])
+    for path, digest in plan['source_hashes'].items():
+        if path not in sources:
+            inspect(path, False)
+            if hashlib.sha256((root / path).read_bytes()).hexdigest() != digest:
+                fail('manifest/compiler contract changed since planning: ' + path)
+
+def inspect_compiler_scope(move):
+    if not move['source'].endswith('.ts'):
+        return
+    scopes = []
+    for path in (move['source'], move['target']):
+        for parent in (root / path).parents:
+            config = parent / 'tsconfig.json'
+            if config.exists():
+                relative = config.relative_to(root).as_posix()
+                if relative not in contract_inputs:
+                    fail('unrepresented compiler scope: ' + relative)
+                scopes.append(relative)
+                break
+            if parent == root:
+                break
+    if len(scopes) != 2 or scopes[0] != scopes[1]:
+        fail('compiler scope differs between source and destination')
+
+def completed(move, shim, digest):
+    source, target = root / move['source'], root / move['target']
+    return (source.is_file() and target.is_file() and not source.is_symlink() and not target.is_symlink()
+            and source.read_bytes() == shim['code'].encode('utf-8')
+            and hashlib.sha256(target.read_bytes()).hexdigest() == digest)
+
+# Preflight the complete bundle before any mutation, even with a phase filter.
+# Completed phases are verified, never executed again or overwritten.
+pending = []
+for phase, move, shim, digest in steps:
+    source, target = move['source'], move['target']
+    inspect_compiler_scope(move)
+    if completed(move, shim, digest):
+        inspect(source, False)
+        inspect(target, False)
+        if not boundary(source) or boundary(source) != boundary(target):
+            fail('completed move package boundary changed: ' + source)
+        continue
+    inspect(source, False)
+    inspect(target, True)
+    if not boundary(source) or boundary(source) != boundary(target):
+        fail('package boundary changed: ' + source)
+    if hashlib.sha256((root / source).read_bytes()).hexdigest() != digest:
+        fail('source changed since planning: ' + source)
+    subprocess.run(['git', 'ls-files', '--error-unmatch', '--', source], check=True, stdout=subprocess.DEVNULL)
+    pending.append((phase, move, shim, digest))
+
+for phase, move, shim, digest in pending:
+    if selected is not None and selected != phase:
+        continue
+    source, target = move['source'], move['target']
+    print(('[DRY] ' if dry else '[RUN] ') + 'phase_' + str(phase) + ': git mv ' + repr(source) + ' ' + repr(target), flush=True)
+    if dry:
+        print('[DRY] create exclusive compatibility shim: ' + source)
+        continue
+    inspect(source, False)
+    inspect(target, True)
+    if hashlib.sha256((root / source).read_bytes()).hexdigest() != digest:
+        fail('source changed during execution: ' + source)
+    (root / target).parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['git', 'mv', '--', source, target], check=True)
+    if os.path.lexists(root / source):
+        fail('move did not complete; refusing to overwrite source with shim: ' + source)
+    with (root / source).open('x', encoding='utf-8') as output:
+        output.write(shim['code'])
+print('Dry run complete; no files changed.' if dry else 'Moves and shims written; review Git status and run language checks. Shims are not staged.')
+"#;
 
 // ============================================================================
 // Print to stdout
@@ -563,6 +426,10 @@ pub fn print_plan_summary(plan: &RefactorPlan) {
     println!(
         "  Files: {} total, {} to move",
         plan.stats.total_files, plan.stats.files_to_move
+    );
+    println!(
+        "  Kept/unresolved: {} (path heuristics alone never authorize moves)",
+        plan.unresolved.len()
     );
 
     if !plan.stats.by_risk.is_empty() {
@@ -608,6 +475,9 @@ mod tests {
     fn mock_plan() -> RefactorPlan {
         RefactorPlan {
             target: "src/features".to_string(),
+            repository_root: String::new(),
+            source_hashes: HashMap::new(),
+            unresolved: vec![],
             moves: vec![Move {
                 source: "src/features/utils.ts".to_string(),
                 target: "src/features/infra/utils.ts".to_string(),
@@ -669,9 +539,8 @@ mod tests {
         let script = format_as_script(&plan);
 
         assert!(script.starts_with("#!/bin/bash"));
-        assert!(script.contains("set -e"));
-        assert!(script.contains("phase_1"));
-        assert!(script.contains("git mv"));
+        assert!(script.contains("Execution withheld"));
+        assert!(!script.contains("git mv"));
     }
 
     #[test]

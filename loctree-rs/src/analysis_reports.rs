@@ -18,7 +18,7 @@ use crate::analyzer::crowd::detect_all_crowds;
 use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
 use crate::analyzer::dead_parrots::{DeadFilterConfig, find_dead_exports};
 use crate::analyzer::findings::{Findings, FindingsConfig, FindingsSummary};
-use crate::analyzer::health_inputs::canonical_exact_twins;
+use crate::analyzer::health_inputs::canonical_exact_twins_with_sources;
 use crate::analyzer::root_scan::scan_results_from_snapshot;
 use crate::analyzer::test_coverage::{TestCoverageReport, analyze_test_coverage};
 use crate::analyzer::twins::build_symbol_registry;
@@ -150,10 +150,11 @@ pub fn health_report(
         })
         .collect();
 
-    let twins = canonical_exact_twins(
+    let twins = canonical_exact_twins_with_sources(
         &snapshot.files,
         snapshot.semantic_facts.as_ref(),
         options.include_tests,
+        &mut crate::analyzer::twins::TwinSources::for_request(snapshot, root),
     );
     let mut twin_examples: Vec<(String, usize)> = twins
         .iter()
@@ -246,10 +247,11 @@ pub fn audit_findings(
     )
     .dead;
 
-    let twins = canonical_exact_twins(
+    let twins = canonical_exact_twins_with_sources(
         &snapshot.files,
         snapshot.semantic_facts.as_ref(),
         options.include_tests,
+        &mut crate::analyzer::twins::TwinSources::for_request(snapshot, root),
     );
 
     let mut in_degree: HashMap<String, usize> = HashMap::new();

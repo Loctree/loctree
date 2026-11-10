@@ -21,12 +21,14 @@ fn write_msg(stdin: &mut impl Write, value: &Value) {
 }
 
 /// Read one framed LSP message from the server's stdout.
-fn read_msg(reader: &mut BufReader<ChildStdout>) -> Value {
+fn read_msg(reader: &mut BufReader<ChildStdout>) -> Option<Value> {
     let mut content_length = 0usize;
     loop {
         let mut line = String::new();
         let n = reader.read_line(&mut line).expect("read header line");
-        assert!(n > 0, "server closed stdout before a complete message");
+        if n == 0 {
+            return None;
+        }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break; // end of headers
@@ -37,15 +39,33 @@ fn read_msg(reader: &mut BufReader<ChildStdout>) -> Value {
     }
     let mut buf = vec![0u8; content_length];
     reader.read_exact(&mut buf).expect("read message body");
-    serde_json::from_slice(&buf).expect("parse message json")
+    Some(serde_json::from_slice(&buf).expect("parse message json"))
+}
+
+/// Drain frames on a reader thread so a silent/stuck child cannot block the
+/// test forever. ServerGuard reaps the owned child if the deadline panics.
+fn response_stream(stdout: ChildStdout) -> std::sync::mpsc::Receiver<Value> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        while let Some(message) = read_msg(&mut reader) {
+            if sender.send(message).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 /// Read framed messages until one with `id == want_id` (a response) arrives,
 /// skipping interleaved notifications. Bounded so a stuck server fails the test
 /// rather than hanging forever.
-fn read_response(reader: &mut BufReader<ChildStdout>, want_id: i64) -> Value {
+fn read_response(reader: &mut std::sync::mpsc::Receiver<Value>, want_id: i64) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     for _ in 0..500 {
-        let msg = read_msg(reader);
+        let msg = reader
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("server response within 15 seconds");
         if msg.get("id").and_then(Value::as_i64) == Some(want_id) {
             return msg;
         }
@@ -58,6 +78,279 @@ impl Drop for ServerGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn literal_protocol_semantics_use_shared_metadata_and_keep_full_pages() {
+    let dir = tempfile::tempdir().expect("literal protocol project");
+    let cache = tempfile::tempdir().expect("private cache");
+    let files = [
+        (
+            "packs.ts",
+            "export function getGlyphPack(id: string) { return id; }\ngetGlyphPack('a');\nfunction load(source: getGlyphPack = fallback) {}\nconst event = { getGlyphPack };\n// getGlyphPack\nconst label = 'getGlyphPack';\n",
+        ),
+        (
+            "app.ts",
+            "import { getGlyphPack as glyph } from './packs';\nglyph('b');\n",
+        ),
+        (
+            "unrelated.ts",
+            "getGlyphPack('heuristic-call');\nconst unresolved = getGlyphPack;\n",
+        ),
+        (
+            "routes.rs",
+            "pub fn detect_axum_routes() {}\nfn run() { detect_axum_routes(); }\n",
+        ),
+        (
+            "transcribe.py",
+            "def transcribe_audio():\n    pass\ntranscribe_audio()\n",
+        ),
+    ];
+    for (path, source) in files {
+        std::fs::write(dir.path().join(path), source).expect("write fixture");
+    }
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loctree-lsp"))
+        .args(["--stdio", "--root"])
+        .arg(dir.path())
+        .env("LOCT_CACHE_DIR", cache.path())
+        .env("LOCT_OPEN_BROWSER", "0")
+        .env(loctree::snapshot::LOCT_ALLOW_NON_GIT_ROOT_ENV, "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn literal server");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut reader = response_stream(child.stdout.take().expect("stdout"));
+    let mut guard = ServerGuard(child);
+    let mut id = 0;
+    let mut request = |method: &str, params: Value| {
+        id += 1;
+        write_msg(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
+        );
+        read_response(&mut reader, id)
+    };
+    let init = request(
+        "initialize",
+        json!({
+            "rootUri": format!("file://{}", dir.path().display()), "capabilities": {},
+            "initializationOptions": {"loctree.watcher.enabled":false, "loctree.workspaces.maxDepth":0}
+        }),
+    );
+    assert!(init["result"]["capabilities"]["definitionProvider"].is_null());
+    drop(request);
+    write_msg(
+        &mut stdin,
+        &json!({"jsonrpc":"2.0", "method":"initialized", "params":{}}),
+    );
+    let mut request = |method: &str, params: Value| {
+        id += 1;
+        write_msg(
+            &mut stdin,
+            &json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
+        );
+        read_response(&mut reader, id)
+    };
+    let mut ready = None;
+    for _ in 0..40 {
+        let response = request(
+            "loctree/find",
+            json!({"query":"getGlyphPack", "mode":"literal", "limit":50}),
+        );
+        if response["error"]["code"] != -32001 {
+            ready = Some(response);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    let response = ready.expect("snapshot ready");
+    assert!(response.get("error").is_none(), "{response}");
+    let full = &response["result"]["literal_matches"];
+    assert_eq!(full["total"], 9);
+    let hits = full["occurrences"].as_array().expect("full hits");
+    let hit = |file: &str, line: u64| {
+        hits.iter()
+            .find(|hit| hit["file"] == file && hit["line"] == line)
+            .expect("expected hit")
+    };
+    assert_eq!(hit("packs.ts", 1)["match_role"], "definition");
+    assert_eq!(hit("packs.ts", 1)["confidence"], "high");
+    assert_eq!(hit("packs.ts", 3)["match_role"], "reference");
+    assert_eq!(hit("packs.ts", 4)["match_role"], "field_emission");
+    assert_eq!(hit("app.ts", 1)["match_role"], "import");
+    assert_eq!(
+        hit("app.ts", 1)["resolved_definition"]["name"],
+        "getGlyphPack"
+    );
+    assert_eq!(hit("unrelated.ts", 1)["match_role"], "reference");
+    // The shared engine permits a same-language call-shaped fallback, but a
+    // bare read cannot resolve merely because a global name is unique.
+    assert_eq!(
+        hit("unrelated.ts", 1)["resolved_definition"]["name"],
+        "getGlyphPack"
+    );
+    assert_eq!(hit("unrelated.ts", 2)["match_role"], "reference");
+    assert!(hit("unrelated.ts", 2)["resolved_definition"].is_null());
+    let repeat = request(
+        "loctree/find",
+        json!({"query":"getGlyphPack", "mode":"literal", "limit":50}),
+    );
+    assert_eq!(repeat["result"]["literal_matches"], *full, "cache hit");
+    for (query, file) in [
+        ("detect_axum_routes", "routes.rs"),
+        ("transcribe_audio", "transcribe.py"),
+    ] {
+        let control = request(
+            "loctree/find",
+            json!({"query":query,"mode":"literal","file":file}),
+        );
+        assert_eq!(
+            control["result"]["literal_matches"]["occurrences"][0]["match_role"], "definition",
+            "{control}"
+        );
+        assert_eq!(
+            control["result"]["literal_matches"]["occurrences"][0]["confidence"],
+            "high"
+        );
+    }
+    let alias = request("loctree/find", json!({"query":"glyph","mode":"literal"}));
+    assert_eq!(
+        alias["result"]["literal_matches"]["occurrences"][0]["match_role"],
+        "import"
+    );
+    assert_eq!(
+        alias["result"]["literal_matches"]["occurrences"][0]["resolved_definition"]["name"],
+        "getGlyphPack"
+    );
+    let scoped_full = request(
+        "loctree/find",
+        json!({"query":"getGlyphPack","mode":"literal","file":"packs.ts","limit":50,"group_by_file":true}),
+    );
+    let page = request(
+        "loctree/find",
+        json!({"query":"getGlyphPack","mode":"literal","file":"packs.ts","limit":5,"chunk_size":5,"group_by_file":true}),
+    );
+    let page = &page["result"]["literal_matches"];
+    assert_eq!(page["total"], 6);
+    assert_eq!(page["emitted"], 5);
+    assert_eq!(page["page"]["has_more"], true);
+    let tail = request(
+        "loctree/find",
+        json!({"query":"getGlyphPack","mode":"literal","file":"packs.ts","limit":5,"offset":5,"group_by_file":true}),
+    );
+    let tail = &tail["result"]["literal_matches"];
+    assert_eq!(tail["total"], 6);
+    assert_eq!(tail["emitted"], 1);
+    assert_eq!(tail["universe"], page["universe"]);
+    assert_eq!(tail["role_summary"], page["role_summary"]);
+    let mut combined = page["occurrences"].as_array().expect("page hits").clone();
+    combined.extend(
+        tail["occurrences"]
+            .as_array()
+            .expect("tail hits")
+            .iter()
+            .cloned(),
+    );
+    // Usage counts are scoped to the scan, so compare full rows against the
+    // unpaged SAME file scope, rather than a repository-wide enrichment.
+    let expected = scoped_full["result"]["literal_matches"]["occurrences"]
+        .as_array()
+        .expect("unpaged scoped hits");
+    assert_eq!(
+        &combined, expected,
+        "full rows, including coordinates, survive paging"
+    );
+    let counts = request(
+        "loctree/find",
+        json!({"query":"getGlyphPack","mode":"literal","file":"packs.ts","count_only":true,"group_by_file":true}),
+    );
+    assert_eq!(counts["result"]["literal_matches"]["total"], 6);
+    assert_eq!(
+        counts["result"]["literal_matches"]["occurrences"],
+        json!([])
+    );
+    assert_eq!(
+        counts["result"]["literal_matches"]["role_summary"],
+        page["role_summary"]
+    );
+    let context = request(
+        "loctree/symbolContext",
+        json!({"symbol":"getGlyphPack","file":"packs.ts","position":{"line":0,"character":16},"same_file_only":true,"occurrence_limit":5}),
+    );
+    assert_eq!(context["result"]["occurrences"]["same_file_total"], 6);
+    assert_eq!(
+        context["result"]["occurrences"]["returned"]
+            .as_array()
+            .expect("context page")
+            .len(),
+        5
+    );
+    assert_eq!(context["result"]["occurrences"]["next_offset"], 5);
+    let context_tail = request(
+        "loctree/symbolContext",
+        json!({"symbol":"getGlyphPack","file":"packs.ts","position":{"line":0,"character":16},"same_file_only":true,"occurrence_limit":5,"offset":5}),
+    );
+    assert_eq!(
+        context_tail["result"]["occurrences"]["returned"]
+            .as_array()
+            .expect("context tail")
+            .len(),
+        1
+    );
+    assert_eq!(context_tail["result"]["occurrences"]["has_more"], false);
+    std::fs::write(
+        dir.path().join("packs.ts"),
+        "// getGlyphPack after saved dirty invalidation\n",
+    )
+    .expect("save dirty edit");
+    let changed = request(
+        "loctree/find",
+        json!({"query":"getGlyphPack","mode":"literal","file":"packs.ts"}),
+    );
+    assert_eq!(changed["result"]["literal_matches"]["total"], 1);
+    assert_eq!(
+        changed["result"]["literal_matches"]["occurrences"][0]["match_role"],
+        "comment"
+    );
+    assert_eq!(
+        changed["result"]["literal_matches"]["occurrences"][0]["line"],
+        1
+    );
+    assert_eq!(
+        changed["result"]["literal_matches"]["occurrences"][0]["column"],
+        4
+    );
+    let changed_context = request(
+        "loctree/symbolContext",
+        json!({"symbol":"getGlyphPack","file":"packs.ts","position":{"line":0,"character":4},"same_file_only":true}),
+    );
+    assert_eq!(
+        changed_context["result"]["occurrences"]["same_file_total"],
+        1
+    );
+    assert_eq!(
+        changed_context["result"]["occurrences"]["returned"][0]["kind"],
+        "comment"
+    );
+    let shutdown = request("shutdown", Value::Null);
+    assert!(shutdown.get("error").is_none(), "{shutdown}");
+    drop(request);
+    write_msg(&mut stdin, &json!({"jsonrpc":"2.0","method":"exit"}));
+    drop(stdin);
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = guard.0.try_wait().expect("server exit status") {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < exit_deadline,
+            "server exit within 3 seconds"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -102,7 +395,7 @@ fn symbol_context_over_real_stdio_jsonrpc() {
         .expect("spawn loctree-lsp --stdio");
 
     let mut stdin = child.stdin.take().expect("child stdin");
-    let mut reader = BufReader::new(child.stdout.take().expect("child stdout"));
+    let mut reader = response_stream(child.stdout.take().expect("child stdout"));
     let _guard = ServerGuard(child);
 
     // initialize → wait for the result.

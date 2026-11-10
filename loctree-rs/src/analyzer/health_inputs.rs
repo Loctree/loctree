@@ -70,12 +70,13 @@
 use std::collections::HashSet;
 
 use crate::analyzer::barrels::analyze_barrel_chaos;
-use crate::analyzer::cycles::{ClassifiedCycle, CycleClassification, find_cycles_with_lazy};
+use crate::analyzer::cycles::{ClassifiedCycle, CycleCompilability, find_cycles_with_lazy};
 use crate::analyzer::dead_parrots::DeadExport;
 use crate::analyzer::health_score::HealthMetrics;
 use crate::analyzer::twins::{
-    ExactTwin, TwinCategory, categorize_twin, detect_exact_twins, filter_idiom_twins,
-    find_dead_parrots, omit_from_duplicate_groups,
+    ExactTwin, TwinCategory, TwinSources, categorize_twin, detect_exact_twins,
+    detect_exact_twins_with_sources, filter_idiom_twins, find_dead_parrots,
+    omit_from_duplicate_groups,
 };
 use crate::semantic::SemanticFacts;
 use crate::snapshot::Snapshot;
@@ -106,6 +107,22 @@ pub fn canonical_exact_twins(
     include_tests: bool,
 ) -> Vec<ExactTwin> {
     let raw = detect_exact_twins(files, include_tests);
+    match semantic_facts {
+        Some(facts) => filter_idiom_twins(raw, facts),
+        None => raw,
+    }
+}
+
+/// Canonical pipeline with explicit source ownership. Snapshot roots are used
+/// for snapshot-only consumers; request-scoped consumers pass their effective
+/// root via `TwinSources::for_root`. No display path becomes I/O authority.
+pub fn canonical_exact_twins_with_sources(
+    files: &[FileAnalysis],
+    semantic_facts: Option<&SemanticFacts>,
+    include_tests: bool,
+    sources: &mut TwinSources,
+) -> Vec<ExactTwin> {
+    let raw = detect_exact_twins_with_sources(files, include_tests, None, sources);
     match semantic_facts {
         Some(facts) => filter_idiom_twins(raw, facts),
         None => raw,
@@ -211,17 +228,14 @@ pub fn structural_defects(
     let mut breaking_cycles = 0usize;
     let mut structural_cycles = 0usize;
     for nodes in strict_cycles {
-        match ClassifiedCycle::new(nodes, &edges).classification {
-            CycleClassification::HardBidirectional => breaking_cycles += 1,
-            CycleClassification::FanPattern => {} // diamond — shared dependency, not a defect
-            CycleClassification::ModuleSelfReference
-            | CycleClassification::TraitBased
-            | CycleClassification::CfgGated
-            | CycleClassification::WildcardImport
-            | CycleClassification::Unknown => structural_cycles += 1,
+        match ClassifiedCycle::new(nodes, &edges).compilability {
+            CycleCompilability::Breaking => breaking_cycles += 1,
+            CycleCompilability::Structural => structural_cycles += 1,
+            CycleCompilability::DiamondDependency => {}
         }
     }
-    // Lazy cycles are broken by dynamic import at runtime; they are listed,
+
+    // Lazy cycles contain deferred dependency edges; they are listed,
     // never scored. (`findings.rs` maps them to a `"lazy"` entry which no
     // severity dimension reads.)
     let _ = lazy_cycles;
@@ -243,8 +257,12 @@ pub fn structural_defects(
     // W2-01: the same evidence that keeps a group out of `duplicate_groups`
     // keeps it out of the SMELL dimension. `text` on two SwiftUI views is a
     // name the framework dictates; scoring it as a smell scores the parser.
-    let exact_twins =
-        canonical_exact_twins(&snapshot.files, snapshot.semantic_facts.as_ref(), false);
+    let exact_twins = canonical_exact_twins_with_sources(
+        &snapshot.files,
+        snapshot.semantic_facts.as_ref(),
+        false,
+        &mut TwinSources::for_snapshot(snapshot),
+    );
     let omitted: HashSet<&str> = exact_twins
         .iter()
         .filter(|twin| omit_from_duplicate_groups(twin))
@@ -326,12 +344,8 @@ mod tests {
         assert!(!counts_as_dead_defect(&candidate("main", "high", true)));
     }
 
-    /// The single biggest contributor to the 85-vs-72 split: `for_ai.rs` fed
-    /// `section.circular_imports` — every strict cycle the walker found — into
-    /// `breaking_cycles`. On this repository that was 16 CERTAIN issues where
-    /// the classifier said 5. A cycle is only breaking when it is hard
-    /// bidirectional; a fan/diamond is a shared dependency and not a defect at
-    /// all, and the rest are compilable smells.
+    /// Raw strict cycles are coupling. Only the canonical evidence owner can
+    /// assign a failure bucket; graph topology never provides that proof.
     #[test]
     fn cycles_are_classified_not_counted_raw() {
         let mut snapshot = Snapshot::new(vec![".".to_string()]);
@@ -347,7 +361,7 @@ mod tests {
                 label: "import".to_string(),
             });
         };
-        // Hard bidirectional pair — the only genuine CERTAIN issue here.
+        // Mutual imports: coupling, not a CERTAIN failure.
         edge("a.ts", "b.ts");
         edge("b.ts", "a.ts");
         // Three-node ring — the classifier reads it as a fan/diamond: a shared
@@ -370,8 +384,8 @@ mod tests {
 
         assert_eq!(
             defects.breaking_cycles,
-            1,
-            "only the hard bidirectional pair is breaking; charging all {} \
+            0,
+            "topology does not prove failure; charging any of {} \
              strict cycles to CERTAIN is exactly the drift this module exists \
              to prevent",
             strict.len()

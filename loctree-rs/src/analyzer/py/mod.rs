@@ -25,7 +25,7 @@ pub(crate) use stdlib::python_stdlib_set;
 
 // Private imports from submodules
 use concurrency::detect_py_race_indicators;
-use decorators::{extract_decorator_type_usages, is_framework_decorator, parse_route_decorator};
+use decorators::{collect_python_routes, extract_decorator_type_usages, is_framework_decorator};
 use dynamic::{detect_dynamic_exec_templates, detect_sys_modules_injection};
 use exports::{extract_getattr_lazy_reexports, parse_all_list, read_all_from_resolved};
 use helpers::{is_valid_python_identifier, parse_module_const_target};
@@ -705,7 +705,6 @@ pub(crate) fn analyze_py_file(
     let mut pending_callback_decorator = false;
     let mut pending_framework_decorator = false;
     let mut pending_fixture_decorator = false;
-    let mut pending_routes: Vec<crate::types::RouteInfo> = Vec::new();
     let mut pending_fixture_name: Option<String> = None;
     let mut in_docstring = false;
     // State for multiline imports: (module, accumulated_symbols, start_line, is_type_checking, is_lazy)
@@ -780,9 +779,6 @@ pub(crate) fn analyze_py_file(
             // Track framework decorators that mark functions as "used"
             if is_framework_decorator(trimmed) {
                 pending_framework_decorator = true;
-            }
-            if let Some(route) = parse_route_decorator(trimmed, line_num) {
-                pending_routes.push(route);
             }
             // pytest fixtures: treat next def as used
             if trimmed.contains("pytest.fixture") {
@@ -1040,16 +1036,6 @@ pub(crate) fn analyze_py_file(
                     analysis.local_uses.push(name.to_string());
                     pending_fixture_name = Some(name.to_string());
                 }
-                if valid_name && !pending_routes.is_empty() {
-                    for mut r in pending_routes.drain(..) {
-                        if r.name.is_none() {
-                            r.name = Some(name.to_string());
-                        }
-                        analysis.routes.push(r);
-                    }
-                } else {
-                    pending_routes.clear();
-                }
                 pending_callback_decorator = false;
                 pending_framework_decorator = false;
                 pending_fixture_decorator = false;
@@ -1079,9 +1065,15 @@ pub(crate) fn analyze_py_file(
 
                 // Reset decorator flags if we hit a non-decorator, non-def, non-class line
                 pending_framework_decorator = false;
-                pending_routes.clear();
                 pending_fixture_name = None;
             }
+        }
+    }
+
+    analysis.routes = collect_python_routes(content);
+    for route in &analysis.routes {
+        if let Some(name) = &route.name {
+            analysis.local_uses.push(name.clone());
         }
     }
 

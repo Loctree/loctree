@@ -4,6 +4,11 @@
 //! - `loctree init` or bare `loctree` scans the project and saves a snapshot
 //! - Subsequent queries load the snapshot for instant context slicing
 
+#[cfg(test)]
+use crate::test_env as env;
+#[cfg(not(test))]
+use std::env;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -21,6 +26,12 @@ use fs4::fs_std::FileExt;
 
 /// Current schema version for snapshot format.
 pub const SNAPSHOT_SCHEMA_VERSION: &str = "0.11.0";
+
+/// Reusable parser AND derived structural-fact semantics, independent of the
+/// JSON schema, release version, Git revision, and CLI/MCP/LSP build identity.
+/// Bump deliberately when an analyzer change makes persisted facts obsolete.
+/// Missing, empty, older and future generations are readable but not reusable.
+pub const ANALYSIS_GENERATION: &str = "loctree-structural-v2";
 
 /// Extract major.minor from a semver string (e.g. "0.8.10" -> "0.8")
 /// Patch bumps don't change the snapshot schema, so we only compare major.minor.
@@ -58,7 +69,7 @@ const REUSE_FENCE_ALGORITHM: &str = "sha256:loctree-reuse-fence-v1";
 /// 2. Platform default: `~/Library/Caches/loctree` (macOS) or `$XDG_CACHE_HOME/loctree` (Linux)
 /// 3. Fallback: OS temp dir (for environments without a home/cache directory)
 pub fn cache_base_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var(LOCT_CACHE_DIR_ENV) {
+    if let Ok(custom) = env::var(LOCT_CACHE_DIR_ENV) {
         let custom = custom.trim();
         if !custom.is_empty() {
             return PathBuf::from(custom);
@@ -111,7 +122,7 @@ pub fn project_cache_dir(root: &Path) -> PathBuf {
     // If LOCT_CACHE_DIR is set:
     // - Relative path => interpret relative to the project root (so scans from subdirs still write to root/.loctree)
     // - Absolute path => treat as a multi-project cache base (we still namespace by project_id)
-    if let Ok(custom) = std::env::var(LOCT_CACHE_DIR_ENV) {
+    if let Ok(custom) = env::var(LOCT_CACHE_DIR_ENV) {
         let custom = custom.trim();
         if !custom.is_empty() {
             let custom_path = PathBuf::from(custom);
@@ -579,13 +590,13 @@ fn gitignore_is_tracked(root: &Path) -> bool {
 /// Explicit opt-in override for H10's polarity flip: forces the gitignore
 /// append even when `.gitignore` is tracked by git. Off by default.
 fn gitignore_force_mutation_enabled() -> bool {
-    std::env::var_os("LOCT_FORCE_GITIGNORE_MUTATION")
+    env::var_os("LOCT_FORCE_GITIGNORE_MUTATION")
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// True when `LOCT_NO_GITIGNORE` opts out of the first-scan gitignore append.
 fn gitignore_append_disabled() -> bool {
-    std::env::var_os("LOCT_NO_GITIGNORE").is_some_and(|value| !value.is_empty() && value != "0")
+    env::var_os("LOCT_NO_GITIGNORE").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 fn cache_write_error(path: &Path, err: io::Error) -> io::Error {
@@ -655,7 +666,7 @@ fn normalize_root_dir(root: &Path) -> PathBuf {
 }
 
 fn non_git_scan_allowed() -> bool {
-    match std::env::var(LOCT_ALLOW_NON_GIT_ROOT_ENV) {
+    match env::var(LOCT_ALLOW_NON_GIT_ROOT_ENV) {
         Ok(v) => {
             let v = v.trim();
             v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
@@ -679,7 +690,7 @@ fn is_filesystem_root(path: &Path) -> bool {
 }
 
 fn is_home_directory(path: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+    let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) else {
         return false;
     };
     let home = PathBuf::from(home);
@@ -1420,6 +1431,10 @@ pub struct SnapshotMetadata {
     /// Schema version for compatibility checking
     #[serde(default)]
     pub schema_version: String,
+    /// Analysis semantics that produced these facts. Empty means unknown legacy
+    /// data, never the current generation. Only a source scan may set this.
+    #[serde(default)]
+    pub analysis_generation: String,
     /// Timestamp when snapshot was generated (ISO 8601)
     #[serde(default)]
     pub generated_at: String,
@@ -1756,6 +1771,9 @@ pub struct SnapshotAuthority {
     pub roots: Vec<String>,
     pub git: SnapshotGitMetadata,
     pub staleness: SnapshotStaleness,
+    pub analysis_generation: String,
+    pub expected_analysis_generation: String,
+    pub analysis_compatible: bool,
 }
 
 /// Information about a barrel file (index.ts re-exporting)
@@ -1789,6 +1807,7 @@ impl Snapshot {
         Self {
             metadata: SnapshotMetadata {
                 schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+                analysis_generation: ANALYSIS_GENERATION.to_string(),
                 generated_at,
                 roots,
                 languages: HashSet::new(),
@@ -1984,6 +2003,11 @@ impl Snapshot {
         let mut hasher = Sha256::new();
         field(&mut hasher, "algorithm", REUSE_FENCE_ALGORITHM);
         field(&mut hasher, "schema_version", &self.metadata.schema_version);
+        field(
+            &mut hasher,
+            "analysis_generation",
+            &self.metadata.analysis_generation,
+        );
 
         let mut files: Vec<_> = self.files.iter().collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2030,6 +2054,9 @@ impl Snapshot {
 
     /// Return true when the current indexed file contents match the saved fence.
     pub fn reuse_fence_matches(&self, root: &Path) -> io::Result<bool> {
+        if !self.analysis_is_compatible() {
+            return Ok(false);
+        }
         let path = self.reuse_fence_path_for_snapshot(root);
         let saved = match read_text_under_cache_root(root, &path) {
             Ok(contents) => contents,
@@ -2121,10 +2148,15 @@ impl Snapshot {
                 scan_id: git.scan_id,
             },
             staleness: SnapshotStaleness {
-                stale: commit_stale || dirty_worktree.unwrap_or(false),
+                stale: !self.analysis_is_compatible()
+                    || commit_stale
+                    || dirty_worktree.unwrap_or(false),
                 commit_stale,
                 dirty_worktree,
             },
+            analysis_generation: self.metadata.analysis_generation.clone(),
+            expected_analysis_generation: ANALYSIS_GENERATION.to_string(),
+            analysis_compatible: self.analysis_is_compatible(),
         }
     }
 
@@ -2137,6 +2169,11 @@ impl Snapshot {
         }
 
         field(hasher, "schema_version", &self.metadata.schema_version);
+        field(
+            hasher,
+            "analysis_generation",
+            &self.metadata.analysis_generation,
+        );
         for root in BTreeSet::from_iter(self.metadata.roots.iter().map(String::as_str)) {
             field(hasher, "root", root);
         }
@@ -2843,9 +2880,9 @@ impl Snapshot {
     /// Use `is_commit_stale()` for a cheaper check that ignores dirty worktree
     /// (suitable for CLI commands where rescanning on every dirty state is too aggressive).
     ///
-    /// Returns `false` for non-git directories (no staleness concept without VCS).
+    /// Analysis incompatibility is stale even without VCS or source drift.
     pub fn is_stale(&self, root: &Path) -> bool {
-        if self.is_commit_stale(root) {
+        if !self.analysis_is_compatible() || self.is_commit_stale(root) {
             return true;
         }
         // Check dirty worktree: uncommitted changes mean snapshot may not
@@ -2865,7 +2902,7 @@ impl Snapshot {
     /// A positive result means the snapshot should be refreshed through the normal
     /// incremental scan path; unchanged files will still come from cached analyses.
     pub fn is_stale_by_mtime(&self, root: &Path) -> bool {
-        self.files_changed_since_scan(root, 100).unwrap_or(0) > 0
+        !self.analysis_is_compatible() || self.files_changed_since_scan(root, 100).unwrap_or(0) > 0
     }
 
     /// Count sampled files whose filesystem mtime is newer than snapshot generation time.
@@ -2962,9 +2999,37 @@ impl Snapshot {
         Ok(())
     }
 
-    /// Load snapshot from disk (used by VS2 slice module)
+    /// Load reusable facts from disk. Legacy JSON remains deserializable, but
+    /// incompatible analysis semantics require a source scan, not restamping.
     pub fn load(root: &Path) -> io::Result<Self> {
-        let _cache_lock = acquire_snapshot_cache_lock(root)?;
+        Self::load_with_options(root, false, false)
+    }
+
+    // Only acquisition's explicit stale-permitted mode may serve incompatible
+    // facts. Read-only callers must neither migrate legacy data nor create a
+    // lock file. Existing locks still serialize reads against writers/cleanup;
+    // absent locks imply there is no participating writer yet, and JSON writes
+    // are atomic. Keep this escape hatch private to the freshness authority.
+    fn load_with_options(
+        root: &Path,
+        allow_incompatible: bool,
+        read_only: bool,
+    ) -> io::Result<Self> {
+        let _cache_lock = if read_only {
+            match OpenOptions::new()
+                .read(true)
+                .open(project_cache_lock_path(root))
+            {
+                Ok(file) => {
+                    FileExt::lock_exclusive(&file)?;
+                    Some(SnapshotCacheLock { file })
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+                Err(err) => return Err(err),
+            }
+        } else {
+            Some(acquire_snapshot_cache_lock(root)?)
+        };
         let cache_candidates = Self::cache_snapshot_paths(root);
         let legacy_candidates = Self::legacy_snapshot_paths(root);
         let cache_snapshot = Self::first_existing_path(&cache_candidates);
@@ -2976,18 +3041,7 @@ impl Snapshot {
                 cache_path
             }
             (Some(cache_path), None) => cache_path,
-            (None, Some(legacy_path)) => {
-                match Self::migrate_legacy_snapshot_to_cache(root, &legacy_path) {
-                    Ok(migrated) => migrated,
-                    Err(err) => {
-                        eprintln!(
-                            "[loctree][warn] Failed to migrate legacy snapshot to cache, using legacy path: {}",
-                            err
-                        );
-                        legacy_path
-                    }
-                }
-            }
+            (None, Some(legacy_path)) => legacy_path,
             (None, None) => {
                 let primary = Self::snapshot_path(root);
                 return Err(io::Error::new(
@@ -3021,6 +3075,20 @@ impl Snapshot {
             );
         }
 
+        if !allow_incompatible {
+            snapshot.require_compatible_analysis()?;
+        }
+
+        // Migration follows compatibility validation. Strict no-scan/fail-stale
+        // and explicit stale reads leave both local and global caches untouched.
+        if !read_only
+            && snapshot.analysis_is_compatible()
+            && legacy_candidates.contains(&snapshot_path)
+            && let Err(err) = Self::migrate_legacy_snapshot_to_cache(root, &snapshot_path)
+        {
+            eprintln!("[loctree][warn] Failed to migrate legacy snapshot to cache: {err}");
+        }
+
         Ok(snapshot)
     }
 
@@ -3047,10 +3115,34 @@ impl Snapshot {
 
     /// Get map of file path -> FileAnalysis for incremental reuse
     pub fn cached_analyses(&self) -> HashMap<String, FileAnalysis> {
+        if !self.analysis_is_compatible() {
+            return HashMap::new();
+        }
         self.files
             .iter()
             .map(|f| (f.path.clone(), f.clone()))
             .collect()
+    }
+
+    pub fn analysis_is_compatible(&self) -> bool {
+        self.metadata.analysis_generation == ANALYSIS_GENERATION
+    }
+
+    fn require_compatible_analysis(&self) -> io::Result<()> {
+        if self.analysis_is_compatible() {
+            return Ok(());
+        }
+        let found = if self.metadata.analysis_generation.is_empty() {
+            "unknown (legacy)"
+        } else {
+            &self.metadata.analysis_generation
+        };
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Snapshot analysis generation is incompatible: found {found}, expected {ANALYSIS_GENERATION}. Run 'loct scan' (or retry without --no-scan/--fail-stale) to rebuild from source."
+            ),
+        ))
     }
 
     /// Update metadata after scan
@@ -3330,6 +3422,9 @@ pub fn unified_scan_args_with_ignore(
 /// the watcher is responsible for freshness and the guardian may trust the
 /// snapshot without re-hashing the tree.
 pub fn watch_keeps_snapshot_fresh(snapshot: &Snapshot, snapshot_root: &Path) -> bool {
+    if !snapshot.analysis_is_compatible() {
+        return false;
+    }
     let Some(snapshot_scan_id) = snapshot.metadata.git_scan_id.as_deref() else {
         return false;
     };
@@ -3388,6 +3483,13 @@ pub fn acquire_snapshot(
     let requested_roots = normalize_requested_roots_for_scope_compare(roots);
     let mut rebuild_invalid_cache = false;
 
+    if opts.fresh && (opts.no_scan || opts.fail_stale) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--fresh conflicts with read-only --no-scan/--fail-stale. Remove --fresh to validate the cached analysis generation, or remove the read-only flags to rebuild from source.",
+        ));
+    }
+
     // `--include-ignored`: build an ephemeral, non-persisted superset that also
     // contains `.loctignore`-excluded files (marked `ignored=true`). The cached
     // project snapshot is intentionally never read or written here, so default
@@ -3414,7 +3516,7 @@ pub fn acquire_snapshot(
     }
 
     if !opts.fresh {
-        match Snapshot::load(&snapshot_root) {
+        match Snapshot::load_with_options(&snapshot_root, true, opts.no_scan || opts.fail_stale) {
             Ok(s) => {
                 // Guard against stale scope reuse: if snapshot roots differ from
                 // requested roots, force a rescan (or fail with --no-scan).
@@ -3437,6 +3539,28 @@ pub fn acquire_snapshot(
                             snapshot_roots.join(", ")
                         );
                     }
+                } else if !s.analysis_is_compatible() {
+                    if opts.no_scan && opts.no_scan_uses_stale && !opts.fail_stale {
+                        if !opts.quiet {
+                            eprintln!(
+                                "[loct] Using explicitly permitted stale snapshot: {}",
+                                s.require_compatible_analysis()
+                                    .expect_err("incompatible analysis")
+                            );
+                        }
+                        return Ok(s);
+                    }
+                    let err = s
+                        .require_compatible_analysis()
+                        .expect_err("incompatible analysis");
+                    if opts.no_scan || opts.fail_stale {
+                        return Err(err);
+                    }
+                    if !opts.quiet {
+                        eprintln!("[loct] {err} Rebuilding analysis...");
+                    }
+                    // Rebuild raw parser facts as well as the projected graph.
+                    rebuild_invalid_cache = true;
                 } else if policy == SnapshotReusePolicy::TrustExisting {
                     // Read-verbs: any scope-matching snapshot is good enough.
                     return Ok(s);
@@ -3630,8 +3754,28 @@ pub(crate) fn build_snapshot_for_strategy(
     snapshot_strategy: SnapshotRootStrategy,
     persist: bool,
 ) -> io::Result<Snapshot> {
+    build_snapshot_with_cache(
+        root_list,
+        parsed,
+        quiet_summary,
+        snapshot_strategy,
+        persist,
+        None,
+    )
+}
+
+/// Use the canonical scan and complete snapshot finalization with watch's raw
+/// analysis cache. Persisted, already-reduced analyses are never mixed into it.
+pub(crate) fn build_snapshot_with_cache(
+    root_list: &[PathBuf],
+    parsed: &ParsedArgs,
+    quiet_summary: bool,
+    snapshot_strategy: SnapshotRootStrategy,
+    persist: bool,
+    raw_cache: Option<&crate::analyzer::root_scan::RawAnalysisCache>,
+) -> io::Result<Snapshot> {
     use crate::analyzer::coverage::{compute_command_gaps, normalize_cmd_name};
-    use crate::analyzer::root_scan::{ScanConfig, scan_roots};
+    use crate::analyzer::root_scan::{ScanConfig, scan_roots_with_cache};
     use crate::analyzer::runner::default_analyzer_exts;
     use crate::analyzer::scan::{opt_globset, python_stdlib};
     use crate::config::LoctreeConfig;
@@ -3672,51 +3816,51 @@ pub(crate) fn build_snapshot_for_strategy(
     // Only reuse cached analyses if the old snapshot is from the same git branch —
     // cross-branch cache reuse can contaminate results (different file contents,
     // same mtimes after branch switch).
-    let cached_analyses: Option<HashMap<String, FileAnalysis>> = if !parsed.full_scan
-        && Snapshot::exists(&snapshot_root)
-    {
-        match Snapshot::load(&snapshot_root) {
-            Ok(old_snapshot) => {
-                // Validate git context: only reuse cache from same branch.
-                // After branch switch, files may differ despite same mtimes.
-                let current_ctx = Snapshot::git_context_for(&snapshot_root);
-                let same_branch = match (&old_snapshot.metadata.git_branch, &current_ctx.branch) {
-                    (Some(old_b), Some(cur_b)) => old_b == cur_b,
-                    (None, None) => true, // Non-git: always reuse
-                    _ => false,
-                };
-                if same_branch {
-                    if parsed.verbose {
-                        eprintln!(
-                            "[loctree][incremental] Loaded existing snapshot ({} files cached)",
-                            old_snapshot.files.len()
-                        );
+    let cached_analyses: Option<HashMap<String, FileAnalysis>> =
+        if raw_cache.is_none() && !parsed.full_scan && Snapshot::exists(&snapshot_root) {
+            match Snapshot::load(&snapshot_root) {
+                Ok(old_snapshot) => {
+                    // Validate git context: only reuse cache from same branch.
+                    // After branch switch, files may differ despite same mtimes.
+                    let current_ctx = Snapshot::git_context_for(&snapshot_root);
+                    let same_branch = match (&old_snapshot.metadata.git_branch, &current_ctx.branch)
+                    {
+                        (Some(old_b), Some(cur_b)) => old_b == cur_b,
+                        (None, None) => true, // Non-git: always reuse
+                        _ => false,
+                    };
+                    if same_branch {
+                        if parsed.verbose {
+                            eprintln!(
+                                "[loctree][incremental] Loaded existing snapshot ({} files cached)",
+                                old_snapshot.files.len()
+                            );
+                        }
+                        Some(old_snapshot.cached_analyses())
+                    } else {
+                        if parsed.verbose {
+                            eprintln!(
+                                "[loctree][incremental] Branch changed ({} → {}), full rescan",
+                                old_snapshot.metadata.git_branch.as_deref().unwrap_or("?"),
+                                current_ctx.branch.as_deref().unwrap_or("?"),
+                            );
+                        }
+                        None
                     }
-                    Some(old_snapshot.cached_analyses())
-                } else {
+                }
+                Err(e) => {
                     if parsed.verbose {
                         eprintln!(
-                            "[loctree][incremental] Branch changed ({} → {}), full rescan",
-                            old_snapshot.metadata.git_branch.as_deref().unwrap_or("?"),
-                            current_ctx.branch.as_deref().unwrap_or("?"),
+                            "[loctree][warn] Could not load snapshot for incremental: {}",
+                            e
                         );
                     }
                     None
                 }
             }
-            Err(e) => {
-                if parsed.verbose {
-                    eprintln!(
-                        "[loctree][warn] Could not load snapshot for incremental: {}",
-                        e
-                    );
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     // Log scan mode for clarity (especially in CI)
     let scan_mode = if parsed.full_scan {
@@ -3800,7 +3944,7 @@ pub(crate) fn build_snapshot_for_strategy(
     };
 
     // Perform the scan
-    let scan_results = scan_roots(scan_config)?;
+    let scan_results = scan_roots_with_cache(scan_config, raw_cache)?;
 
     // Second spinner for building snapshot (can take a while for large codebases)
     let build_spinner = if quiet_summary {
@@ -4910,11 +5054,12 @@ pub(crate) fn write_auto_artifacts(
 ///
 /// Any test that triggers a snapshot save/load through the env-resolved
 /// `cache_base_dir()` MUST hold an `EnvVarGuard` pointing `LOCT_CACHE_DIR`
-/// at a `TempDir` (and be `#[serial]` — process env is global). Otherwise
+/// at a `TempDir` through this thread's test configuration. Otherwise
 /// the test writes fixture snapshots into the operator-global cache
 /// (`~/Library/Caches/loctree`), shadowing the real project snapshot.
 #[cfg(test)]
 pub(crate) mod test_env {
+    use crate::test_env as env;
     use std::ffi::OsString;
     use std::path::Path;
 
@@ -4928,7 +5073,7 @@ pub(crate) mod test_env {
         pub(crate) fn set_path(key: &'static str, value: &Path) -> Self {
             let guard = Self {
                 key,
-                original: std::env::var_os(key),
+                original: env::var_os(key),
             };
             set_env_var(key, value.as_os_str());
             guard
@@ -4937,7 +5082,7 @@ pub(crate) mod test_env {
         pub(crate) fn clear(key: &'static str) -> Self {
             let guard = Self {
                 key,
-                original: std::env::var_os(key),
+                original: env::var_os(key),
             };
             remove_env_var(key);
             guard
@@ -4979,7 +5124,7 @@ pub(crate) mod test_env {
         pub(crate) fn set_str(key: &'static str, value: &str) -> Self {
             let guard = Self {
                 key,
-                original: std::env::var_os(key),
+                original: env::var_os(key),
             };
             set_env_var(key, value);
             guard
@@ -5440,6 +5585,118 @@ mod tests {
                 .fingerprint(),
             acquired.fingerprint()
         );
+    }
+
+    #[test]
+    #[serial]
+    fn analysis_generation_fences_direct_load_raw_reuse_and_explicit_stale_reads() {
+        let (_cache, _guard) = test_env::isolated_cache();
+        let tmp = TempDir::new().expect("project");
+        let root = tmp.path();
+        std::fs::write(root.join("lib.rs"), "pub fn current() {}\n").expect("source");
+        init_git_repo(root);
+        let mut snapshot = Snapshot::new(vec![root.display().to_string()]);
+        snapshot.files.push(FileAnalysis::new("lib.rs".into()));
+        for generation in [
+            "",
+            "loctree-structural-v0",
+            "loctree-structural-v1",
+            "loctree-structural-v999",
+        ] {
+            snapshot.metadata.analysis_generation = generation.into();
+            snapshot
+                .save(root)
+                .expect("save old facts without restamping");
+            let path = Snapshot::snapshot_path(root);
+            let bytes = std::fs::read(&path).expect("cache bytes");
+            assert!(!snapshot.analysis_is_compatible());
+            assert!(snapshot.is_stale(root));
+            assert!(snapshot.is_stale_by_mtime(root));
+            assert!(!snapshot.reuse_fence_matches(root).expect("fence"));
+            assert!(snapshot.cached_analyses().is_empty());
+            assert_eq!(
+                Snapshot::load(root)
+                    .expect_err("reject direct reuse")
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            let stale = acquire_snapshot(
+                &[root.to_path_buf()],
+                SnapshotReusePolicy::Strict,
+                &AcquireOptions {
+                    no_scan: true,
+                    no_scan_uses_stale: true,
+                    quiet: true,
+                    strategy: SnapshotRootStrategy::Exact,
+                    ..Default::default()
+                },
+            )
+            .expect("explicit stale permission");
+            assert_eq!(stale.metadata.analysis_generation, generation);
+            let authority = stale.authority_report(root);
+            assert!(!authority.analysis_compatible);
+            assert!(authority.staleness.stale);
+            assert_eq!(authority.expected_analysis_generation, ANALYSIS_GENERATION);
+            assert_eq!(std::fs::read(path).expect("unchanged cache"), bytes);
+        }
+        // Persisted old JSON stays deserializable; absence must not default to current.
+        let old: Snapshot =
+            serde_json::from_str(include_str!("../tests/fixtures/snapshot_v0_10_2.json"))
+                .expect("legitimate older schema");
+        assert!(old.metadata.analysis_generation.is_empty());
+        assert!(!old.analysis_is_compatible());
+    }
+
+    #[test]
+    #[serial]
+    fn analysis_generation_precedes_watch_and_all_acquisition_reuse_policies() {
+        let (_cache, _guard) = test_env::isolated_cache();
+        let tmp = TempDir::new().expect("project");
+        let root = tmp.path();
+        std::fs::write(root.join("lib.rs"), "pub fn source_truth() {}\n").expect("source");
+        init_git_repo(root);
+        let _watch = crate::watch_lock::acquire(root, crate::watch_lock::LockMode::Default)
+            .expect("owned watch lock");
+        let mut snapshot = Snapshot::new(vec![root.display().to_string()]);
+        assert!(watch_keeps_snapshot_fresh(&snapshot, root));
+        snapshot.metadata.analysis_generation = "obsolete".into();
+        assert!(!watch_keeps_snapshot_fresh(&snapshot, root));
+        for policy in [
+            SnapshotReusePolicy::TrustExisting,
+            SnapshotReusePolicy::ReuseFence,
+            SnapshotReusePolicy::Strict,
+        ] {
+            snapshot.save(root).expect("old facts");
+            let error = acquire_snapshot(
+                &[root.to_path_buf()],
+                policy,
+                &AcquireOptions {
+                    no_scan: true,
+                    quiet: true,
+                    strategy: SnapshotRootStrategy::Exact,
+                    ..Default::default()
+                },
+            )
+            .expect_err("watch cannot authorize old semantics");
+            assert!(error.to_string().contains("analysis generation"));
+            let rebuilt = acquire_snapshot(
+                &[root.to_path_buf()],
+                policy,
+                &AcquireOptions {
+                    quiet: true,
+                    strategy: SnapshotRootStrategy::Exact,
+                    ..Default::default()
+                },
+            )
+            .expect("source rebuild before fast returns");
+            assert!(rebuilt.analysis_is_compatible());
+            assert!(
+                rebuilt
+                    .files
+                    .iter()
+                    .any(|f| f.exports.iter().any(|e| e.name == "source_truth"))
+            );
+        }
     }
 
     #[test]
@@ -6123,6 +6380,7 @@ mod tests {
     fn test_snapshot_metadata_serde() {
         let metadata = SnapshotMetadata {
             schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+            analysis_generation: ANALYSIS_GENERATION.to_string(),
             generated_at: "2025-01-01T00:00:00Z".to_string(),
             roots: vec!["src".to_string()],
             languages: HashSet::from(["ts".to_string()]),
@@ -7161,6 +7419,7 @@ mod cache_tests {
     fn snapshot_metadata_roundtrip_with_owner_repo() {
         let meta = SnapshotMetadata {
             schema_version: SNAPSHOT_SCHEMA_VERSION.to_string(),
+            analysis_generation: ANALYSIS_GENERATION.to_string(),
             generated_at: "2026-03-31T00:00:00Z".to_string(),
             roots: vec!["src".to_string()],
             languages: HashSet::from(["rust".to_string()]),

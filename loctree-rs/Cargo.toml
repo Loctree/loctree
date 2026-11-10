@@ -95,6 +95,7 @@ fs4 = "0.13"
 # C-family (Swift / ObjC / C / C++) symbol extraction — Wave B tree-sitter
 # grammars feeding the snapshot symbol_graph (loctree.symbol_graph.v1).
 tree-sitter = "0.25"
+tree-sitter-rust = "0.24.2"
 tree-sitter-swift = "0.7.3"
 tree-sitter-objc = "3.0.2"
 tree-sitter-c = "0.24.2"

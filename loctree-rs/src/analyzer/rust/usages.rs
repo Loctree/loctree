@@ -577,6 +577,133 @@ pub(super) fn extract_path_qualified_calls(content: &str, local_uses: &mut Vec<S
     }
 }
 
+/// Call leaves and their complete paths, not arbitrary identifier mentions.
+/// Keep this separate from the broad liveness collector above: a module or
+/// type reference can keep a symbol alive without being a call to that name.
+pub(crate) fn qualified_call_paths(content: &str) -> Vec<(Vec<String>, Vec<String>)> {
+    use super::preprocess::{char_literal_end, strip_cfg_test_modules, strip_string_spans};
+
+    let content = strip_comments(&strip_string_spans(&strip_cfg_test_modules(content)));
+    let mut chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\''
+            && let Some(end) = char_literal_end(&chars, i)
+        {
+            chars[i..=end].fill(' ');
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    let mut code = chars.into_iter().collect::<String>().into_bytes();
+    let mut i = 0;
+    // Attributes have call-like token trees, but are not runtime callees.
+    while i < code.len() {
+        if code[i] == b'#' {
+            let mut open = i + 1;
+            if code.get(open) == Some(&b'!') {
+                open += 1;
+            }
+            if code.get(open) == Some(&b'[') {
+                let mut depth = 1;
+                let mut end = open + 1;
+                while end < code.len() && depth > 0 {
+                    match code[end] {
+                        b'[' => depth += 1,
+                        b']' => depth -= 1,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                code[i..end].fill(b' ');
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let code = String::from_utf8(code).expect("masking preserves UTF-8");
+    static PATH: OnceLock<Regex> = OnceLock::new();
+    let pattern = PATH.get_or_init(|| {
+        Regex::new(r"(?:r#)?[A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*)+")
+            .expect("valid Rust call path regex")
+    });
+    let mut scope = Vec::new();
+    let mut scope_events = vec![(0, Vec::new())];
+    for (i, byte) in code.bytes().enumerate() {
+        match byte {
+            b'{' => scope.push(i),
+            b'}' => {
+                scope.pop();
+            }
+            _ => continue,
+        }
+        scope_events.push((i + 1, scope.clone()));
+    }
+    let scope_at = |offset: usize| {
+        let index = scope_events.partition_point(|(start, _)| *start <= offset) - 1;
+        scope_events[index].1.clone()
+    };
+    let import_scopes: Vec<_> = super::super::regexes::regex_rust_use()
+        .captures_iter(&code)
+        .filter_map(|import| import.get(1))
+        .map(|import| (import.as_str().trim().to_string(), scope_at(import.start())))
+        .collect();
+    let mut paths = Vec::new();
+    for path in pattern.find_iter(&code) {
+        let before = code[..path.start()].trim_end();
+        if before.ends_with([':', '.', '>'])
+            || code[..path.start()]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_' || ch == '#')
+        {
+            // Do not recover a suffix of a receiver/UFCS/generic path that
+            // this bounded extractor cannot identify in full.
+            continue;
+        }
+        let mut tail = code[path.end()..].trim_start();
+        if let Some(generic) = tail.strip_prefix("::").map(str::trim_start)
+            && generic.starts_with('<')
+        {
+            let mut depth = 0;
+            let mut end = None;
+            for (i, ch) in generic.char_indices() {
+                match ch {
+                    '<' => depth += 1,
+                    '>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(end) = end else { continue };
+            tail = generic[end..].trim_start();
+        }
+        if tail.starts_with('(') {
+            let call_scope = scope_at(path.start());
+            let visible_imports = import_scopes
+                .iter()
+                .filter(|(_, scope)| call_scope.starts_with(scope))
+                .map(|(source, _)| source.clone())
+                .collect();
+            paths.push((
+                path.as_str()
+                    .split("::")
+                    .map(|part| part.trim().trim_start_matches("r#").to_string())
+                    .collect(),
+                visible_imports,
+            ));
+        }
+    }
+    paths
+}
+
 /// Extract type alias qualified path usage patterns like `io::Result`, `fs::File`, etc.
 /// This tracks when type aliases from imported modules are used via qualified paths
 /// without explicit `use` statements for the type itself.

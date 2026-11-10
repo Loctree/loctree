@@ -231,97 +231,162 @@ pub(super) fn is_framework_decorator(line: &str) -> bool {
     false
 }
 
-/// Extract first quoted string literal content from text (single or double quotes).
-pub(super) fn extract_first_string_literal(text: &str) -> Option<String> {
-    let mut in_quote: Option<char> = None;
-    let mut buf = String::new();
-    for ch in text.chars() {
-        if let Some(q) = in_quote {
-            if ch == q {
-                return Some(buf);
-            } else {
-                buf.push(ch);
-            }
-        } else if ch == '"' || ch == '\'' {
-            in_quote = Some(ch);
-        }
+/// Inspect decorators attached to functions, never decorator-like string text.
+pub(super) fn collect_python_routes(source: &str) -> Vec<crate::types::RouteInfo> {
+    if !source.contains('@') {
+        return Vec::new();
     }
-    None
+    let Ok(parsed) =
+        loctree_ast::Parsers::new_default().parse_language("python", source.as_bytes())
+    else {
+        return Vec::new();
+    };
+    let mut routes = Vec::new();
+    let mut nodes = vec![parsed.tree.root_node()];
+    while let Some(node) = nodes.pop() {
+        if node.kind() == "decorated_definition"
+            && let Some(definition) = node.child_by_field_name("definition")
+            && definition.kind() == "function_definition"
+            && let Some(name) = definition.child_by_field_name("name")
+        {
+            let mut cursor = node.walk();
+            for decorator in node
+                .named_children(&mut cursor)
+                .filter(|node| node.kind() == "decorator")
+            {
+                if let Some(mut route) = parse_route_decorator(decorator, source) {
+                    route.name = Some(source[name.byte_range()].to_string());
+                    routes.push(route);
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        nodes.extend(node.named_children(&mut cursor));
+    }
+    routes.sort_by_key(|route| route.line);
+    routes
 }
 
-/// Parse a decorator line into a route if it matches common web frameworks.
-pub(super) fn parse_route_decorator(
-    line: &str,
-    line_num: usize,
+fn parse_route_decorator(
+    decorator: tree_sitter::Node<'_>,
+    source: &str,
 ) -> Option<crate::types::RouteInfo> {
-    let lower = line.to_lowercase();
-    let mut framework = None;
-    let mut method = None;
-    let mut methods_param: Option<String> = None;
-
-    for (pat, m) in [
-        ("@app.get", "GET"),
-        ("@app.post", "POST"),
-        ("@app.put", "PUT"),
-        ("@app.delete", "DELETE"),
-        ("@app.patch", "PATCH"),
-        ("@router.get", "GET"),
-        ("@router.post", "POST"),
-        ("@router.put", "PUT"),
-        ("@router.delete", "DELETE"),
-        ("@router.patch", "PATCH"),
-        ("@api_router.get", "GET"),
-        ("@api_router.post", "POST"),
-        ("@api_router.put", "PUT"),
-        ("@api_router.delete", "DELETE"),
-        ("@api_router.patch", "PATCH"),
-    ] {
-        if lower.contains(pat) {
-            framework = Some("fastapi");
-            method = Some(m);
-            break;
-        }
+    let call = decorator.named_child(0)?;
+    if call.kind() != "call" || call.has_error() {
+        return None;
     }
-
-    if framework.is_none()
-        && (lower.contains("@app.route")
-            || lower.contains("@blueprint.route")
-            || lower.contains(".route("))
+    let callee = call.child_by_field_name("function")?;
+    if callee.kind() != "attribute" {
+        return None;
+    }
+    let object = callee.child_by_field_name("object")?;
+    let attribute = callee.child_by_field_name("attribute")?;
+    let receiver = &source[object.byte_range()];
+    let method = &source[attribute.byte_range()];
+    let framework = if method == "route" {
+        // Flask's existing receiver-name-independent .route convention.
+        "flask"
+    } else if matches!(receiver, "app" | "router" | "api_router")
+        && matches!(method, "get" | "post" | "put" | "delete" | "patch")
     {
-        framework = Some("flask");
-        // Try to extract explicit methods list - use original line, not lowercased
-        if let Some(pos) = line.find("methods")
-            && let Some(start) = line[pos..].find('[')
-            && let Some(end) = line[pos + start + 1..].find(']')
-        {
-            let body = &line[pos + start + 1..pos + start + 1 + end];
-            let tokens: Vec<String> = body
-                .split([',', ' ', '\t'])
-                .filter_map(|p| {
-                    let trimmed = p.trim().trim_matches(|c| c == '"' || c == '\'');
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed.to_uppercase())
-                    }
-                })
-                .collect();
-            if !tokens.is_empty() {
-                methods_param = Some(tokens.join(","));
-            }
+        "fastapi"
+    } else {
+        return None;
+    };
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut cursor = arguments.walk();
+    let mut path = None;
+    let mut methods = None;
+    let mut positional = 0;
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.kind() == "comment" {
+            continue;
         }
-        method = Some(methods_param.as_deref().unwrap_or("route"));
+        if argument.kind() == "keyword_argument" {
+            let name = argument.child_by_field_name("name")?;
+            let value = argument.child_by_field_name("value")?;
+            match &source[name.byte_range()] {
+                "path" if framework == "fastapi" => {
+                    path = Some(python_route_literal(value, source)?)
+                }
+                "rule" if framework == "flask" => path = Some(python_route_literal(value, source)?),
+                "methods" if framework == "flask" => {
+                    if !matches!(value.kind(), "list" | "tuple") {
+                        return None;
+                    }
+                    let mut cursor = value.walk();
+                    let values: Option<Vec<_>> = value
+                        .named_children(&mut cursor)
+                        .filter(|node| node.kind() != "comment")
+                        .map(|node| {
+                            python_route_literal(node, source).map(|method| method.to_uppercase())
+                        })
+                        .collect();
+                    let values = values?;
+                    if values.is_empty() {
+                        return None;
+                    }
+                    methods = Some(values.join(","));
+                }
+                _ => {}
+            }
+        } else {
+            if positional == 0 {
+                path = Some(python_route_literal(argument, source)?);
+            }
+            positional += 1;
+        }
     }
-
-    let framework = framework?;
-    let method = method.unwrap_or("route");
-    let path = extract_first_string_literal(line);
-
     Some(crate::types::RouteInfo {
         framework: framework.to_string(),
-        method: method.to_string(),
-        path,
+        method: if framework == "flask" {
+            methods.unwrap_or_else(|| "route".to_string())
+        } else {
+            method.to_uppercase()
+        },
+        path: Some(path?),
         name: None,
-        line: line_num,
+        line: decorator.start_position().row + 1,
     })
+}
+
+fn python_route_literal(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "string" || node.has_error() {
+        return None;
+    }
+    let text = &source[node.byte_range()];
+    let quote = text.find(['\'', '"'])?;
+    let prefix = text[..quote].to_ascii_lowercase();
+    if !matches!(prefix.as_str(), "" | "r" | "u") {
+        return None;
+    }
+    let delimiter = if text[quote..].starts_with("\"\"\"") || text[quote..].starts_with("'''") {
+        3
+    } else {
+        1
+    };
+    let body = &text[quote + delimiter..text.len() - delimiter];
+    if prefix == "r" || !body.contains('\\') {
+        return Some(body.to_string());
+    }
+    // Decode the common literal escapes; dynamic/interpolated strings stay out.
+    let mut value = String::new();
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            value.push(ch);
+            continue;
+        }
+        match chars.next()? {
+            '\\' => value.push('\\'),
+            '\'' => value.push('\''),
+            '"' => value.push('"'),
+            'n' => value.push('\n'),
+            'r' => value.push('\r'),
+            't' => value.push('\t'),
+            '\n' => {}
+            _ => return None,
+        }
+    }
+    Some(value)
 }

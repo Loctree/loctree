@@ -207,7 +207,7 @@ fn build_follow_all_report(
 ) -> serde_json::Value {
     use crate::analyzer::cycles::find_cycles_classified_with_lazy;
     use crate::analyzer::dead_parrots::compute_dead_truth;
-    use crate::analyzer::twins::{detect_exact_twins_with_frameworks, find_dead_parrots};
+    use crate::analyzer::twins::{detect_exact_twins_with_sources, find_dead_parrots};
     use std::collections::HashMap;
 
     // Dead exports (canonical pipeline — same number as repo-view/health/twins).
@@ -227,7 +227,12 @@ fn build_follow_all_report(
     remaining = remaining.saturating_sub(cycle_top.len());
 
     // Structural twin signals.
-    let exact_twins = detect_exact_twins_with_frameworks(&snapshot.files, false, None);
+    let exact_twins = detect_exact_twins_with_sources(
+        &snapshot.files,
+        false,
+        None,
+        &mut crate::analyzer::twins::TwinSources::for_snapshot(snapshot),
+    );
     let dead_parrots = find_dead_parrots(&snapshot.files, false, false).dead_parrots;
 
     // Import hotspots (in/out degree), mirroring `handle_hotspots_command`.
@@ -1840,7 +1845,7 @@ pub fn handle_focus_command(opts: &FocusOptions, global: &GlobalOptions) -> Disp
     DispatchResult::Exit(0)
 }
 
-/// Distinct-importer degree rows for hotspot detection: `(path, in_degree,
+/// Distinct known-file dependency degree rows for hotspot detection: `(path, in_degree,
 /// out_degree, loc)`, one row per file that exists in the snapshot.
 ///
 /// F8 fixes three quiet bugs in what used to be inlined directly in
@@ -1895,13 +1900,13 @@ fn compute_hotspot_rows(
         .collect()
 }
 
-/// Handle the hotspots command - show import frequency heatmap
+/// Handle the hotspots command - show static dependency degree bands
 pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -> DispatchResult {
     use std::path::Path;
 
     // Show spinner unless in quiet/json mode
     let spinner = if !global.quiet && !global.json {
-        Some(Spinner::new("Analyzing import hotspots..."))
+        Some(Spinner::new("Analyzing dependency hotspots..."))
     } else {
         None
     };
@@ -1971,7 +1976,19 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
         );
     } else {
         println!();
-        println!("Import Hotspots ({} files analyzed)", snapshot.files.len());
+        println!(
+            "Dependency Hotspots ({} files analyzed)",
+            snapshot.files.len()
+        );
+        println!(
+            "Static indexed graph: distinct known-file incoming/outgoing neighbors, all edge kinds."
+        );
+        println!(
+            "Degree bands only. High degree suggests impact/follow inspection; low degree can include important entry points."
+        );
+        println!(
+            "No runtime call counts, hot paths, performance scores, dead-code proof or refactoring safety certificate."
+        );
         println!();
 
         // Group by category
@@ -1993,7 +2010,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
             .collect();
 
         if !core.is_empty() {
-            println!("CORE (10+ importers):");
+            println!("CORE (10+ incoming neighbors):");
             for (path, in_deg, out_deg, _loc) in &core {
                 if opts.coupling {
                     println!("  [in:{:<3} out:{:<3}] {}", in_deg, out_deg, path);
@@ -2005,7 +2022,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
         }
 
         if !shared.is_empty() {
-            println!("SHARED (3-9 importers):");
+            println!("SHARED (3-9 incoming neighbors):");
             for (path, in_deg, out_deg, _loc) in &shared {
                 if opts.coupling {
                     println!("  [in:{:<3} out:{:<3}] {}", in_deg, out_deg, path);
@@ -2017,7 +2034,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
         }
 
         if !peripheral.is_empty() {
-            println!("PERIPHERAL (1-2 importers):");
+            println!("PERIPHERAL (1-2 incoming neighbors):");
             for (path, in_deg, out_deg, _loc) in &peripheral {
                 if opts.coupling {
                     println!("  [in:{:<3} out:{:<3}] {}", in_deg, out_deg, path);
@@ -2029,7 +2046,7 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
         }
 
         if !leaves.is_empty() {
-            println!("LEAF (0 importers):");
+            println!("LEAF (0 incoming neighbors):");
             for (path, _, out_deg, _loc) in &leaves {
                 if opts.coupling {
                     println!("  [in:0   out:{:<3}] {}", out_deg, path);
@@ -2053,9 +2070,9 @@ pub fn handle_hotspots_command(opts: &HotspotsOptions, global: &GlobalOptions) -
             limit
         );
         if opts.leaves_only {
-            println!("Filtered to leaf nodes only (--leaves)");
+            println!("Filtered to zero incoming degree (--leaves; overrides --min)");
         } else if min_imports > 0 {
-            println!("Filtered to files with {} + importers (--min)", min_imports);
+            println!("Filtered to incoming degree >= {} (--min)", min_imports);
         }
     }
 
@@ -2228,7 +2245,7 @@ fn print_layoutmap_human(findings: &[crate::layoutmap::LayoutFinding], opts: &La
 /// Handle the zombie command - find all zombie code
 pub fn handle_zombie_command(opts: &ZombieOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::dead_parrots::DeadFilterConfig;
-    use crate::analyzer::health_inputs::canonical_exact_twins;
+    use crate::analyzer::health_inputs::canonical_exact_twins_with_sources;
     use crate::analyzer::twins::build_symbol_registry;
     use std::collections::HashMap;
     use std::path::Path;
@@ -2326,10 +2343,11 @@ pub fn handle_zombie_command(opts: &ZombieOptions, global: &GlobalOptions) -> Di
     orphan_files.sort_by_key(|b| std::cmp::Reverse(b.1));
 
     // 3. Find shadow exports (same symbol exported by multiple files where some have 0 imports)
-    let twins = canonical_exact_twins(
+    let twins = canonical_exact_twins_with_sources(
         &snapshot.files,
         snapshot.semantic_facts.as_ref(),
         opts.include_tests,
+        &mut crate::analyzer::twins::TwinSources::for_request(&snapshot, root),
     );
     let registry = build_symbol_registry(&snapshot.files, opts.include_tests);
 
@@ -2499,7 +2517,7 @@ fn is_entry_point(path: &str) -> bool {
 pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
     use crate::analyzer::dead_parrots::DeadFilterConfig;
-    use crate::analyzer::health_inputs::canonical_exact_twins;
+    use crate::analyzer::health_inputs::canonical_exact_twins_with_sources;
     use crate::colors::Painter;
     use std::collections::{HashMap, HashSet};
     use std::path::Path;
@@ -2595,10 +2613,11 @@ pub fn handle_health_command(opts: &HealthOptions, global: &GlobalOptions) -> Di
         .collect();
 
     // 3. Twins analysis
-    let twins = canonical_exact_twins(
+    let twins = canonical_exact_twins_with_sources(
         &snapshot.files,
         snapshot.semantic_facts.as_ref(),
         opts.include_tests,
+        &mut crate::analyzer::twins::TwinSources::for_request(&snapshot, root),
     );
     let twin_count = twins.len();
     let mut twin_examples: Vec<(String, usize)> = twins
@@ -2951,7 +2970,7 @@ pub fn handle_audit_command(opts: &AuditOptions, global: &GlobalOptions) -> Disp
 pub fn handle_doctor_command(opts: &DoctorOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::cycles::{CycleCompilability, find_cycles_classified_with_lazy};
     use crate::analyzer::dead_parrots::DeadFilterConfig;
-    use crate::analyzer::health_inputs::canonical_exact_twins;
+    use crate::analyzer::health_inputs::canonical_exact_twins_with_sources;
     use crate::colors::Painter;
     use std::path::Path;
 
@@ -3028,10 +3047,11 @@ pub fn handle_doctor_command(opts: &DoctorOptions, global: &GlobalOptions) -> Di
         .collect();
 
     // 3. Twins analysis
-    let twins = canonical_exact_twins(
+    let twins = canonical_exact_twins_with_sources(
         &snapshot.files,
         snapshot.semantic_facts.as_ref(),
         opts.include_tests,
+        &mut crate::analyzer::twins::TwinSources::for_request(&snapshot, root),
     );
 
     // 4. Categorize findings

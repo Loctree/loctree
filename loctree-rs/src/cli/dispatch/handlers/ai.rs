@@ -9,44 +9,7 @@ use super::super::{DispatchResult, GlobalOptions, is_test_file, load_or_create_s
 use super::deprecation::warn_deprecated;
 use crate::progress::Spinner;
 use crate::suppressions::{SuppressionType, Suppressions};
-
-fn tagmap_normalize(value: &str) -> String {
-    value
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-fn tagmap_matches(value: &str, keyword_lower: &str, keyword_normalized: &str) -> bool {
-    let value_lower = value.to_ascii_lowercase();
-    value_lower.contains(keyword_lower)
-        || (!keyword_normalized.is_empty()
-            && tagmap_normalize(&value_lower).contains(keyword_normalized))
-}
-
-/// G9: classify a symbol-usage fact match as a primary hit (the *name*
-/// itself matches the keyword) or a lower-confidence context-only hit (only
-/// the raw source line mentions the keyword — e.g. a doc-comment on the same
-/// line as an unrelated call). Previously `handle_tagmap_command` OR'd
-/// `usage.name` and `usage.context` into one bucket, so one line mentioning
-/// the keyword in a comment surfaced every usage sharing that line
-/// regardless of name. Returns `(kind_label, is_primary)`, or `None` when
-/// neither matches.
-fn tagmap_symbol_usage_kind(
-    usage_name: &str,
-    usage_context: &str,
-    keyword_lower: &str,
-    keyword_normalized: &str,
-) -> Option<(&'static str, bool)> {
-    if tagmap_matches(usage_name, keyword_lower, keyword_normalized) {
-        Some(("symbol-usage", true))
-    } else if tagmap_matches(usage_context, keyword_lower, keyword_normalized) {
-        Some(("symbol-usage-context", false))
-    } else {
-        None
-    }
-}
+use crate::tagmap::{collect_tagmap_facts, tagmap_matches, tagmap_normalize};
 
 /// Handle the crowd command - detect functional crowds
 pub fn handle_crowd_command(opts: &CrowdOptions, global: &GlobalOptions) -> DispatchResult {
@@ -228,106 +191,8 @@ pub fn handle_tagmap_command(opts: &TagmapOptions, global: &GlobalOptions) -> Di
         .filter(|f| tagmap_matches(&f.path, &keyword_lower, &keyword_normalized))
         .collect();
 
-    // 2. Recall indexed code facts already present in the snapshot.
-    // This keeps CLI tagmap in parity with MCP tagmap: literal-only, no
-    // semantic enrichment, but symbol/import/usage/string recall is expected.
-    let mut fact_matches = Vec::new();
-    for file in &files {
-        for export in &file.exports {
-            if tagmap_matches(&export.name, &keyword_lower, &keyword_normalized)
-                || tagmap_matches(&export.kind, &keyword_lower, &keyword_normalized)
-                || tagmap_matches(&export.export_type, &keyword_lower, &keyword_normalized)
-            {
-                fact_matches.push(serde_json::json!({
-                    "kind": "export",
-                    "file": file.path,
-                    "name": export.name,
-                    "symbol_kind": export.kind,
-                    "line": export.line
-                }));
-            }
-        }
-
-        for local in &file.local_symbols {
-            if tagmap_matches(&local.name, &keyword_lower, &keyword_normalized)
-                || tagmap_matches(&local.kind, &keyword_lower, &keyword_normalized)
-                || tagmap_matches(&local.context, &keyword_lower, &keyword_normalized)
-            {
-                fact_matches.push(serde_json::json!({
-                    "kind": "local-symbol",
-                    "file": file.path,
-                    "name": local.name,
-                    "symbol_kind": local.kind,
-                    "line": local.line,
-                    "context": local.context
-                }));
-            }
-        }
-
-        for usage in &file.symbol_usages {
-            if let Some((kind, is_primary)) = tagmap_symbol_usage_kind(
-                &usage.name,
-                &usage.context,
-                &keyword_lower,
-                &keyword_normalized,
-            ) {
-                fact_matches.push(serde_json::json!({
-                    "kind": kind,
-                    "file": file.path,
-                    "name": usage.name,
-                    "line": usage.line,
-                    "context": usage.context,
-                    "confidence": if is_primary { "high" } else { "low" }
-                }));
-            }
-        }
-
-        for import in &file.imports {
-            if tagmap_matches(&import.source, &keyword_lower, &keyword_normalized)
-                || tagmap_matches(&import.source_raw, &keyword_lower, &keyword_normalized)
-                || import
-                    .resolved_path
-                    .as_ref()
-                    .is_some_and(|path| tagmap_matches(path, &keyword_lower, &keyword_normalized))
-            {
-                fact_matches.push(serde_json::json!({
-                    "kind": "import-source",
-                    "file": file.path,
-                    "source": import.source,
-                    "source_raw": import.source_raw,
-                    "line": import.line
-                }));
-            }
-
-            for symbol in &import.symbols {
-                if tagmap_matches(&symbol.name, &keyword_lower, &keyword_normalized)
-                    || symbol.alias.as_ref().is_some_and(|alias| {
-                        tagmap_matches(alias, &keyword_lower, &keyword_normalized)
-                    })
-                {
-                    fact_matches.push(serde_json::json!({
-                        "kind": "import-symbol",
-                        "file": file.path,
-                        "name": symbol.name,
-                        "alias": symbol.alias,
-                        "source": import.source,
-                        "line": import.line
-                    }));
-                }
-            }
-        }
-
-        for literal in &file.string_literals {
-            if tagmap_matches(&literal.value, &keyword_lower, &keyword_normalized) {
-                fact_matches.push(serde_json::json!({
-                    "kind": "string-literal",
-                    "file": file.path,
-                    "value": literal.value,
-                    "line": literal.line
-                }));
-            }
-        }
-    }
+    // 2. Rank the complete shared evidence universe before applying --limit.
+    let fact_matches = collect_tagmap_facts(&files, &opts.keyword);
 
     // 3. Detect crowd for this keyword
     let crowd = detect_crowd_with_edges(&files, &opts.keyword, &snapshot.edges);
@@ -517,8 +382,8 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
     use crate::analyzer::frameworks::detect_frameworks;
     use crate::analyzer::route_twins::{detect_route_twins, print_route_twins_human};
     use crate::analyzer::twins::{
-        DEAD_PARROTS_PAGE_CAP, TwinCategory, categorize_twin, detect_exact_twins_with_frameworks,
-        detect_language, order_twins_for_page, page_family_windows, parse_twin_class_filter,
+        TwinCategory, categorize_twin, detect_exact_twins_with_sources, detect_language,
+        order_twins_for_page, page_family_windows, page_has_more, parse_twin_class_filter,
         print_exact_twins_human, print_twins_human, retain_twin_classes,
     };
     use std::path::Path;
@@ -635,7 +500,12 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
     };
 
     let mut twins = if !opts.dead_only {
-        detect_exact_twins_with_frameworks(&snapshot.files, opts.include_tests, frameworks_opt)
+        detect_exact_twins_with_sources(
+            &snapshot.files,
+            opts.include_tests,
+            frameworks_opt,
+            &mut crate::analyzer::twins::TwinSources::for_request(&snapshot, root),
+        )
     } else {
         Vec::new()
     };
@@ -687,10 +557,9 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
     });
     let total_findings = dead_count + twin_count + route_twin_count + barrel_count;
 
-    // Class partition, then class filter, then offset/limit. The limit
-    // spends on exact twins and then route twins. Dead parrots do not
-    // spend it: full `loct twins` caps them at DEAD_PARROTS_PAGE_CAP,
-    // `follow twins` emits none.
+    // One filtered census, walked in priority order: exact twins (class-ranked),
+    // routes, dead parrots, then missing barrels, deep chains and inconsistent
+    // paths. Every top-level finding spends the same offset/limit exactly once.
     order_twins_for_page(&mut twins);
     let twins_before_class = twins.len();
     retain_twin_classes(&mut twins, &class_filter);
@@ -702,7 +571,66 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
         route_twins.clear();
         dropped
     };
-    let windows = page_family_windows(&[twins.len(), route_twins.len()], opts.offset, opts.limit);
+    if opts.omit_dead_parrots {
+        dead_result.dead_parrots.clear();
+    }
+    for twin in &mut route_twins {
+        twin.locations.sort_by(|a, b| {
+            a.file
+                .cmp(&b.file)
+                .then(a.line.cmp(&b.line))
+                .then(a.handler.cmp(&b.handler))
+        });
+    }
+    dead_result.dead_parrots.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.line.cmp(&b.line))
+            .then(a.name.cmp(&b.name))
+            .then(a.kind.cmp(&b.kind))
+    });
+    // The detectors rank severity, but some use HashMap iteration for ties.
+    // Pin those ties here so separate CLI processes reconstruct one census.
+    if let Some(analysis) = barrel_analysis.as_mut() {
+        analysis.missing_barrels.sort_by(|a, b| {
+            b.external_import_count
+                .cmp(&a.external_import_count)
+                .then(a.directory.cmp(&b.directory))
+        });
+        analysis.deep_chains.sort_by(|a, b| {
+            b.depth
+                .cmp(&a.depth)
+                .then(a.symbol.cmp(&b.symbol))
+                .then(a.chain.cmp(&b.chain))
+        });
+        analysis.inconsistent_paths.sort_by(|a, b| {
+            b.alternative_paths
+                .len()
+                .cmp(&a.alternative_paths.len())
+                .then(a.symbol.cmp(&b.symbol))
+                .then(a.canonical_path.cmp(&b.canonical_path))
+                .then(a.alternative_paths.cmp(&b.alternative_paths))
+        });
+    }
+    let barrel_lengths = barrel_analysis.as_ref().map_or([0; 3], |analysis| {
+        [
+            analysis.missing_barrels.len(),
+            analysis.deep_chains.len(),
+            analysis.inconsistent_paths.len(),
+        ]
+    });
+    let windows = page_family_windows(
+        &[
+            twins.len(),
+            route_twins.len(),
+            dead_result.dead_parrots.len(),
+            barrel_lengths[0],
+            barrel_lengths[1],
+            barrel_lengths[2],
+        ],
+        opts.offset,
+        opts.limit,
+    );
     twins = twins
         .into_iter()
         .skip(windows[0].0)
@@ -713,39 +641,19 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
         .skip(windows[1].0)
         .take(windows[1].1)
         .collect();
-    if opts.omit_dead_parrots {
-        dead_result.dead_parrots.clear();
-    } else {
-        dead_result.dead_parrots.truncate(DEAD_PARROTS_PAGE_CAP);
-    }
-
-    let mut nested_findings_truncated = false;
-    if let Some(limit) = opts.limit {
-        // Barrels stay out of the twin-family budget. Cap each list at
-        // `limit` so a bounded request cannot dump the whole barrel report.
-        if let Some(analysis) = barrel_analysis.as_mut() {
-            analysis.missing_barrels.truncate(limit);
-            analysis.deep_chains.truncate(limit);
-            analysis.inconsistent_paths.truncate(limit);
-        }
-        for twin in &mut twins {
-            nested_findings_truncated |= twin.locations.len() > limit;
-            twin.locations.truncate(limit);
-        }
-        for twin in &mut route_twins {
-            nested_findings_truncated |= twin.locations.len() > limit;
-            twin.locations.truncate(limit);
-        }
-        if let Some(analysis) = barrel_analysis.as_mut() {
-            for chain in &mut analysis.deep_chains {
-                nested_findings_truncated |= chain.chain.len() > limit;
-                chain.chain.truncate(limit);
-            }
-            for import in &mut analysis.inconsistent_paths {
-                nested_findings_truncated |= import.alternative_paths.len() > limit;
-                import.alternative_paths.truncate(limit);
-            }
-        }
+    dead_result.dead_parrots = dead_result
+        .dead_parrots
+        .into_iter()
+        .skip(windows[2].0)
+        .take(windows[2].1)
+        .collect();
+    if let Some(analysis) = barrel_analysis.as_mut() {
+        analysis.missing_barrels.drain(..windows[3].0);
+        analysis.missing_barrels.truncate(windows[3].1);
+        analysis.deep_chains.drain(..windows[4].0);
+        analysis.deep_chains.truncate(windows[4].1);
+        analysis.inconsistent_paths.drain(..windows[5].0);
+        analysis.inconsistent_paths.truncate(windows[5].1);
     }
     let returned_findings = dead_result.dead_parrots.len()
         + twins.len()
@@ -850,18 +758,50 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
                 "high_similarity_groups": high_similarity_count,
             }
         });
-        if opts.limit.is_some() || opts.offset > 0 || opts.class.is_some() {
-            output["page"] = serde_json::json!({
-                "semantics": "global",
-                "limit": opts.limit,
-                "offset": opts.offset,
-                "returned": returned_findings,
-                "total": page_total,
-                "has_more": returned_findings < page_total,
-                "nested_item_limit": opts.limit,
-                "nested_truncated": nested_findings_truncated,
-            });
+        // Bound serialized detail, after classification and top-level paging.
+        // These counts describe nested arrays on emitted findings only; they
+        // neither spend the global finding budget nor change detection metadata.
+        let bound_nested = |item: &mut serde_json::Value, field: &str| -> usize {
+            let Some(items) = item[field].as_array_mut() else {
+                return 0;
+            };
+            let total = items.len();
+            if let Some(limit) = opts.limit {
+                items.truncate(limit);
+            }
+            let omitted = total - items.len();
+            item[format!("{field}_total")] = serde_json::json!(total);
+            item[format!("{field}_omitted")] = serde_json::json!(omitted);
+            item[format!("{field}_truncated")] = serde_json::json!(omitted > 0);
+            omitted
+        };
+        let mut nested_items_omitted = 0;
+        for (pointer, field) in [
+            ("/exact_twins", "locations"),
+            ("/route_twins", "locations"),
+            ("/barrel_chaos/deep_chains", "chain"),
+            ("/barrel_chaos/inconsistent_paths", "alternative_paths"),
+        ] {
+            if let Some(items) = output
+                .pointer_mut(pointer)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for item in items {
+                    nested_items_omitted += bound_nested(item, field);
+                }
+            }
         }
+        output["page"] = serde_json::json!({
+            "semantics": "global",
+            "limit": opts.limit,
+            "offset": opts.offset,
+            "returned": returned_findings,
+            "total": page_total,
+            "has_more": page_has_more(page_total, opts.offset, returned_findings),
+            "nested_item_limit": opts.limit,
+            "nested_truncated": nested_items_omitted > 0,
+            "nested_items_omitted": nested_items_omitted,
+        });
 
         println!("{}", serde_json::to_string_pretty(&output).unwrap());
     } else {
@@ -886,20 +826,12 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
                 println!("{}", format_barrel_analysis(ba));
             }
         }
-        if opts.limit.is_some() && returned_findings < page_total {
+        if returned_findings < page_total {
             println!(
-                "{} additional finding(s) omitted by --limit/--offset/--class",
-                page_total - returned_findings
+                "{} finding(s) outside this --limit/--offset page ({} total eligible)",
+                page_total - returned_findings,
+                page_total,
             );
-        }
-        if !opts.omit_dead_parrots && dead_count > dead_result.dead_parrots.len() {
-            println!(
-                "{} additional dead parrot(s) omitted by the dead-parrot cap ({DEAD_PARROTS_PAGE_CAP})",
-                dead_count - dead_result.dead_parrots.len()
-            );
-        }
-        if nested_findings_truncated {
-            println!("Nested finding locations were also capped by --limit");
         }
     }
 
@@ -909,7 +841,7 @@ pub fn handle_twins_command(opts: &TwinsOptions, global: &GlobalOptions) -> Disp
 /// Handle the sniff command - aggregate code smells
 pub fn handle_sniff_command(opts: &SniffOptions, global: &GlobalOptions) -> DispatchResult {
     use crate::analyzer::crowd::detect_all_crowds_with_edges;
-    use crate::analyzer::health_inputs::canonical_exact_twins;
+    use crate::analyzer::health_inputs::canonical_exact_twins_with_sources;
     use crate::analyzer::twins::find_dead_parrots;
     use std::path::Path;
 
@@ -960,7 +892,12 @@ pub fn handle_sniff_command(opts: &SniffOptions, global: &GlobalOptions) -> Disp
         // `detect_exact_twins` caller — every twins-reporting surface goes
         // through the canonical helper over the same files/include_tests
         // input, with the snapshot's semantic facts applied when present.
-        let t = canonical_exact_twins(&files, snapshot.semantic_facts.as_ref(), opts.include_tests);
+        let t = canonical_exact_twins_with_sources(
+            &files,
+            snapshot.semantic_facts.as_ref(),
+            opts.include_tests,
+            &mut crate::analyzer::twins::TwinSources::for_request(&snapshot, root),
+        );
         twins_count = t.len();
         Some(t)
     } else {
@@ -1306,6 +1243,7 @@ pub fn handle_suppress_command(opts: &SuppressOptions, _global: &GlobalOptions) 
 #[cfg(test)]
 mod tagmap_tests {
     use super::*;
+    use crate::tagmap::tagmap_symbol_usage_kind;
 
     #[test]
     fn g9_context_only_match_is_not_a_primary_hit() {

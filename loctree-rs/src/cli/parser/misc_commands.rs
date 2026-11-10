@@ -987,27 +987,10 @@ fn parse_cache_project_arg(raw: &str) -> Result<PathBuf, String> {
 /// Parse `loct prune-old-artifacts [PATH] [OPTIONS]` — local `.loctree/` housekeeping.
 pub(super) fn parse_prune_old_artifacts_command(args: &[String]) -> Result<Command, String> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "loct prune-old-artifacts - Prune old per-branch snapshot artifacts
-
-USAGE:
-    loct prune-old-artifacts [PATH] [OPTIONS]
-
-OPTIONS:
-    --root <PATH>      Project root to scan (default: current directory)
-    --keep <N>         Keep N newest per-branch snapshots per `.loctree/` (default: 3)
-    --include-sub      Also walk into sub-`.loctree/` dirs (e.g. `src-tauri/.loctree/`)
-    --apply            Actually delete files (default: dry-run preview)
-    --help, -h         Show this help message
-
-EXAMPLES:
-    loct prune-old-artifacts                       # Dry-run preview, root only
-    loct prune-old-artifacts --apply               # Actually delete in root .loctree/
-    loct prune-old-artifacts --include-sub         # Preview including sub-projects
-    loct prune-old-artifacts --include-sub --apply # Full sweep, hard apply
-    loct prune-old-artifacts --keep 5 --apply      # Keep 5 newest per dir"
-        );
-        std::process::exit(0);
+        return Ok(Command::Help(HelpOptions {
+            command: Some("prune-old-artifacts".to_string()),
+            ..Default::default()
+        }));
     }
 
     let mut opts = PruneOldArtifactsOptions::default();

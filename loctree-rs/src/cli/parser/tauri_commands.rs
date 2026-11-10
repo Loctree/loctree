@@ -177,20 +177,10 @@ EXAMPLES:
 pub(super) fn parse_routes_command(args: &[String]) -> Result<Command, String> {
     // Check for help flag first
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        return Err("loct routes - List backend/web routes (FastAPI/Flask)
-
-USAGE:
-    loct routes [OPTIONS] [PATHS...]
-
-OPTIONS:
-    --framework <NAME>   Filter by framework label (fastapi, flask)
-    --path <PATTERN>     Filter by route path substring
-    --help, -h           Show this help message
-
-EXAMPLES:
-    loct routes
-    loct routes --framework fastapi"
-            .to_string());
+        return Ok(Command::Help(super::super::command::HelpOptions {
+            command: Some("routes".to_string()),
+            ..Default::default()
+        }));
     }
 
     let mut opts = RoutesOptions::default();

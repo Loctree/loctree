@@ -84,6 +84,8 @@ pub struct ParsedArgs {
     pub slice_consumers: bool,
     /// Force rescan before slicing (for uncommitted files)
     pub slice_rescan: bool,
+    /// Shared snapshot policy carried through the legacy slice entrypoint.
+    pub slice_acquire_options: crate::snapshot::AcquireOptions,
     /// Slice/find: scan untracked files in-memory without mutating the snapshot.
     pub include_untracked: bool,
     pub trace_handler: Option<String>,
@@ -212,6 +214,7 @@ impl Default for ParsedArgs {
             slice_target: None,
             slice_consumers: true,
             slice_rescan: false,
+            slice_acquire_options: Default::default(),
             include_untracked: false,
             trace_handler: None,
             search_query: None,

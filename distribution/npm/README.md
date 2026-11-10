@@ -41,6 +41,14 @@ Total: **one wrapper source under 3 names + 4 platform packages = 7 npm identiti
 npm install -g @loctree/loctree
 ```
 
+The three maintained names are alternatives, not packages to install together:
+they claim identical command links. To change wrapper names, remove the exact
+previous global wrapper first, then install the canonical name above. Follow
+the [named migration steps](../../docs/installation.md#switching-npm-wrapper-names);
+do not force-overwrite unrelated command owners. Contributor builds can reuse
+`install-local.sh --legacy-names '<previous-wrapper-name>'` (`make npm-install`
+already selects `loctree` as its legacy name).
+
 Smoke-test:
 
 ```bash

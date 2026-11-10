@@ -1,11 +1,11 @@
 # Component Sync Manifest
 
 - Component: `engine`
-- Version: `0.15.0`
+- Version: `0.15.1`
 - Target repo: `Loctree/loctree`
-- Source commit: `abbb3d48a840`
-- Generated at: `2026-10-14T19:26:12Z`
-- Push mode: `enabled`
+- Source commit: `d69d50802e0a`
+- Generated at: `2026-10-16T16:12:47Z`
+- Push mode: `disabled`
 - Dependency mode: `local workspace snapshot`
 
 ## Included Payload
@@ -22,7 +22,6 @@
 
 ## Paths Removed From The Mirror
 
-- `.github/workflows/publish.yml`
 - `.github/workflows/release-bundles.yml`
 
 ## Dependency Note

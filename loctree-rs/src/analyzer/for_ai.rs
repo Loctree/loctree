@@ -14,14 +14,17 @@ use super::barrels::analyze_barrel_chaos;
 use super::classify::is_semantic_code_language;
 use super::dead_parrots::{DeadExport, DeadFilterConfig, find_dead_exports};
 use super::dist::DistResult;
-use super::health_inputs::structural_defects;
+use super::health_inputs::{canonical_exact_twins_with_sources, structural_defects};
 use super::health_score::{HealthIssue, HealthMetrics, HealthScore, calculate_health_score};
 use super::memory_lint::lint_memory_file;
 use super::occurrences::SuggestedNext;
 use super::report::{Confidence, DupSeverity, RankedDup, ReportSection};
 use super::root_scan::normalize_module_id;
 use super::ts_lint::lint_ts_file;
-use super::twins::{TwinCategory, categorize_twin, find_dead_parrots};
+use super::twins::{
+    TwinCategory, TwinClass, TwinClassification, TwinSources, categorize_twin, find_dead_parrots,
+    omit_from_duplicate_groups,
+};
 use crate::snapshot::Snapshot;
 use crate::types::{FileAnalysis, SignatureUse, SignatureUseKind};
 
@@ -137,7 +140,7 @@ pub struct ForAiSectionRef {
 #[derive(Serialize, Clone)]
 pub struct QuickWin {
     pub priority: u8, // 1=highest
-    /// Kind of issue: missing_handler, unregistered_handler, unused_handler, dead_export, circular_import, opaque_passthrough
+    /// Kind of issue: missing_handler, unregistered_handler, unused_handler, dead_export, duplicate_candidate, circular_import, opaque_passthrough
     pub kind: String,
     pub action: String,
     pub target: String,
@@ -385,7 +388,7 @@ pub fn generate_for_ai_report(
 
     let summary = compute_summary(sections, analyses, snapshot);
     let section_refs = build_section_refs(sections);
-    let quick_wins = extract_quick_wins(sections, analyses);
+    let quick_wins = extract_quick_wins(sections, analyses, snapshot);
     let priority_tasks = build_priority_tasks(&quick_wins);
     let hub_files = find_hub_files(analyses);
     let bundle = build_agent_bundle(project_root, sections, analyses);
@@ -409,7 +412,7 @@ pub(crate) fn build_priority_tasks(quick_wins: &[QuickWin]) -> Vec<PriorityTask>
         .map(|w| {
             let risk = match w.kind.as_str() {
                 "missing_handler" | "unregistered_handler" => "high",
-                "circular_import" | "opaque_passthrough" => "medium",
+                "circular_import" | "opaque_passthrough" | "duplicate_candidate" => "medium",
                 "unused_handler" | "dead_export" => "low",
                 _ => "medium",
             }
@@ -423,6 +426,7 @@ pub(crate) fn build_priority_tasks(quick_wins: &[QuickWin]) -> Vec<PriorityTask>
                     format!("loct query where-symbol {}", w.target)
                 }
                 "circular_import" => "loct cycles --explain".to_string(),
+                "duplicate_candidate" => "loct twins --json".to_string(),
                 _ => w
                     .trace_cmd
                     .clone()
@@ -494,7 +498,6 @@ fn compute_summary(
     let cascade_imports: usize = sections.iter().map(|s| s.cascades.len()).sum();
     let dynamic_imports: usize = sections.iter().map(|s| s.dynamic.len()).sum();
     let circular_imports: usize = sections.iter().map(|s| s.circular_imports.len()).sum();
-    let lazy_circular_imports: usize = sections.iter().map(|s| s.lazy_circular_imports.len()).sum();
 
     // Count barrel chaos issues (missing barrels + deep chains + inconsistent paths)
     // Use snapshot directly for accurate count (consistent with findings.rs)
@@ -562,7 +565,7 @@ fn compute_summary(
         )
     } else if twins_same_language > 0 {
         format!(
-            "TECH DEBT: {} same-language twins (consolidate duplicates). {} dead parrots (0 imports). {} cross-lang pairs (likely OK).",
+            "TECH DEBT: {} same-language twins (signature candidates; inspect bodies and ownership before consolidation). {} dead parrots (0 imports). {} cross-lang pairs (likely OK).",
             twins_same_language, twins_dead_parrots, twins_cross_language
         )
     } else if twins_dead_parrots > 0 {
@@ -577,12 +580,12 @@ fn compute_summary(
         )
     } else if duplicate_exports > 0 {
         format!(
-            "TECH DEBT: {} duplicate exports across files. Consider consolidating to reduce confusion.",
+            "TECH DEBT: {} repeated export names across files (raw observations). Inspect qualified twin evidence before proposing changes.",
             duplicate_exports
         )
     } else if circular_imports > 0 {
         format!(
-            "TECH DEBT: {} circular import cycles. Consider refactoring to break cycles.",
+            "REVIEW: {} dependency cycles. Compiler/runtime outcome unverified.",
             circular_imports
         )
     } else {
@@ -625,13 +628,21 @@ fn compute_summary(
             .metrics()
         }
         None => HealthMetrics {
-            breaking_cycles: circular_imports,
+            // No snapshot/edge evidence: never charge raw topology to CERTAIN.
+            breaking_cycles: 0,
             unused_high_confidence,
             dead_exports,
             twins_dead_parrots,
             twins_same_language,
             barrel_chaos_count,
-            structural_cycles: lazy_circular_imports,
+            structural_cycles: sections
+                .iter()
+                .flat_map(|section| &section.circular_imports)
+                .filter(|nodes| {
+                    super::cycles::ClassifiedCycle::new((*nodes).clone(), &[]).compilability
+                        == super::cycles::CycleCompilability::Structural
+                })
+                .count(),
             cascade_imports,
             duplicate_exports,
             files: files_analyzed,
@@ -1075,6 +1086,7 @@ pub(crate) fn has_tauri_stack(analyses: &[FileAnalysis]) -> bool {
 pub(crate) fn extract_quick_wins(
     sections: &[ReportSection],
     analyses: &[FileAnalysis],
+    snapshot: Option<&Snapshot>,
 ) -> Vec<QuickWin> {
     let mut wins = Vec::new();
     let mut priority = 1u8;
@@ -1207,64 +1219,83 @@ pub(crate) fn extract_quick_wins(
         }
     }
 
-    // Priority 4: Dead exports (duplicate exports across files)
-    for section in sections {
-        for dup in section
-            .ranked_dups
-            .iter()
-            .filter(|d| d.score > 10) // Only high-score duplicates
-            .take(10)
-        // Limit to top 10
-        {
-            if priority > 30 {
-                break;
-            }
-
-            // Get primary location from canonical file
-            let (location, open_url) = if let Some(canon_line) = dup.canonical_line {
-                let loc = format!("{}:{}", dup.canonical, canon_line);
-                let url = super::build_open_url(
-                    &dup.canonical,
-                    Some(canon_line),
-                    section.open_base.as_deref(),
-                );
-                (loc, Some(url))
-            } else {
-                (dup.canonical.clone(), None)
-            };
-
-            let refactor_hint = if !dup.refactors.is_empty() {
-                dup.refactors.join(", ")
-            } else {
-                format!(
-                    "Consolidate {} into canonical file {}",
-                    dup.name, dup.canonical
-                )
-            };
-
-            wins.push(QuickWin {
-                priority,
-                kind: "dead_export".to_string(),
-                action: "Consolidate duplicate exports".to_string(),
-                target: dup.name.clone(),
-                location: location.clone(),
-                impact: format!(
-                    "Duplicate export across {} files - causes confusion and maintenance burden",
-                    dup.files.len()
-                ),
-                why: format!(
-                    "Export '{}' is defined in {} files, creating ambiguity for importers",
-                    dup.name,
-                    dup.files.len()
-                ),
-                fix_hint: refactor_hint,
-                complexity: "easy".to_string(),
-                suggested_next: literal_truth_suggested_next(&dup.name, Some(&location)),
-                trace_cmd: Some(format!("loct query where-symbol {}", dup.name)),
-                open_url,
-            });
-            priority += 1;
+    // Priority 4: shape-backed duplicate candidates. Frequency is only a sensor;
+    // reuse the canonical class/idiom/receiver gates, never ranked_dups.score.
+    // This stage can run before a snapshot exists, so enrich the same analyses
+    // with the existing semantic producer rather than skipping its idiom gate.
+    let semantic_root = sections
+        .first()
+        .map_or(".", |section| section.root.as_str());
+    let facts =
+        crate::semantic::compute_semantic_facts(analyses, std::path::Path::new(semantic_root));
+    // Report sections are the explicit owners before a snapshot exists. Multiple
+    // roots retain unknown relative ownership instead of borrowing caller cwd.
+    let section_snapshot = Snapshot::new(sections.iter().map(|s| s.root.clone()).collect());
+    let mut sources = TwinSources::for_snapshot(snapshot.unwrap_or(&section_snapshot));
+    let mut twins = canonical_exact_twins_with_sources(analyses, Some(&facts), false, &mut sources);
+    // Stable first-page projection across independent JSON and HTML scans.
+    twins.sort_by(|a, b| {
+        b.locations
+            .len()
+            .cmp(&a.locations.len())
+            .then(a.name.cmp(&b.name))
+    });
+    for twin in &mut twins {
+        twin.locations
+            .sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.line.cmp(&b.line)));
+    }
+    for twin in twins
+        .iter()
+        .filter(|twin| {
+            matches!(twin.class, TwinClass::Exact | TwinClass::ShapeSimilar)
+                && twin.classification == TwinClassification::Duplicate
+                && !omit_from_duplicate_groups(twin)
+                && matches!(categorize_twin(twin), TwinCategory::SameLanguage(_))
+        })
+        .take(10)
+    {
+        if priority > 30 {
+            break;
         }
+        let Some(primary) = twin.locations.first() else {
+            continue;
+        };
+        let location = format!("{}:{}", primary.file_path, primary.line);
+        let sample = twin
+            .locations
+            .iter()
+            .take(3)
+            .map(|loc| format!("{}:{}", loc.file_path, loc.line))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = twin.locations.len().saturating_sub(3);
+        let hint = format!(
+            "Inspect bodies, receivers and module/crate boundaries before consolidating. \
+             Evidence: {} of {} locations ({} more in Twins or loct twins --json): {}.",
+            twin.locations.len().min(3),
+            twin.locations.len(),
+            remaining,
+            sample,
+        );
+        wins.push(QuickWin {
+            priority,
+            kind: "duplicate_candidate".to_string(),
+            action: "Review duplicate candidate".to_string(),
+            target: twin.name.clone(),
+            location: location.clone(),
+            impact: "Potential shared implementation; verify behavior and ownership before refactoring".to_string(),
+            why: format!(
+                "{} signature evidence across {} same-language locations; body equivalence is unverified",
+                twin.class.as_str(), twin.locations.len(),
+            ),
+            fix_hint: hint,
+            complexity: "medium".to_string(),
+            suggested_next: literal_truth_suggested_next(&twin.name, Some(&location)),
+            trace_cmd: Some("loct twins --json".to_string()),
+            open_url: Some(super::build_open_url(&primary.file_path, Some(primary.line),
+                sections.first().and_then(|section| section.open_base.as_deref()))),
+        });
+        priority += 1;
     }
 
     // Priority 5: Circular imports (import cycles)
@@ -1308,15 +1339,14 @@ pub(crate) fn extract_quick_wins(
             wins.push(QuickWin {
                 priority,
                 kind: "circular_import".to_string(),
-                action: "Break circular import".to_string(),
+                action: "Review dependency cycle".to_string(),
                 target: target.clone(),
                 location: location.clone(),
-                impact:
-                    "Circular imports can cause runtime errors and make code harder to understand"
-                        .to_string(),
+                impact: "Dependency coupling detected; compiler/runtime outcome is unverified"
+                    .to_string(),
                 why: format!("Dependency cycle detected: {}", why_path),
                 fix_hint:
-                    "Extract shared code into a third module, or make the dependency unidirectional"
+                    "Review coupling and initialization order before deciding whether to refactor"
                         .to_string(),
                 complexity: "medium".to_string(),
                 suggested_next: literal_truth_suggested_next(&target, Some(&location)),
@@ -1977,13 +2007,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_summary_structural_cycles_penalize_health() {
-        // Guard: lazy_circular_imports must flow into HealthMetrics::structural_cycles
-        // (SMELL bucket) instead of being silently dropped to 0.
-        //
-        // Before the fix at for_ai.rs, structural_cycles was hardcoded to 0 even
-        // when sections carried lazy cycles, so the SMELL bucket never saw them
-        // and projects with only lazy/structural cycles reported health_score=100.
+    fn test_compute_summary_lazy_cycles_remain_unscored() {
+        // Lazy topology remains visible but unscored, as on snapshot paths.
         let mut clean_section = mock_section("src", 10);
         clean_section.circular_imports = vec![];
         clean_section.lazy_circular_imports = vec![];
@@ -2000,19 +2025,15 @@ mod tests {
             Some(100),
             "no cycles means no SMELL penalty"
         );
-        assert!(
-            lazy.health_score < clean.health_score,
-            "lazy cycle must lower health (was {:?}, clean {:?})",
-            lazy.health_score,
-            clean.health_score
+        assert_eq!(
+            lazy.health_score, clean.health_score,
+            "lazy topology is not a scored defect"
         );
     }
 
     #[test]
-    fn test_compute_summary_breaking_vs_structural_cycles_weighted_differently() {
-        // Guard: breaking cycles (CERTAIN 50%) must penalize harder than the
-        // same number of structural/lazy cycles (SMELL 20%). If for_ai ever
-        // collapses both into the same bucket again, this catches it.
+    fn test_compute_summary_strict_coupling_is_a_smell() {
+        // Without edge evidence, strict coupling is a SMELL, never CERTAIN.
         let mut breaking_section = mock_section("src", 10);
         breaking_section.circular_imports =
             vec![vec!["src/a.ts".to_string(), "src/b.ts".to_string()]];
@@ -2026,7 +2047,7 @@ mod tests {
 
         assert!(
             breaking.health_score < structural.health_score,
-            "breaking cycle (CERTAIN 50%) must penalize more than structural (SMELL 20%); \
+            "strict coupling is a SMELL; lazy cycles remain unscored; \
              got breaking={:?}, structural={:?}",
             breaking.health_score,
             structural.health_score
@@ -2100,7 +2121,7 @@ mod tests {
         let sections = vec![section];
         // Tauri marker required after 2026-05-25 non-Tauri gate.
         let analyses = vec![tauri_stack_marker()];
-        let wins = extract_quick_wins(&sections, &analyses);
+        let wins = extract_quick_wins(&sections, &analyses, None);
 
         assert!(!wins.is_empty());
         assert_eq!(wins[0].priority, 1);
@@ -2135,7 +2156,7 @@ mod tests {
         let sections = vec![section];
         // Pure Python+JS analyses, no Tauri marker → handler wins skipped.
         let analyses = vec![mock_file("screenscribe/cli.py", 100)];
-        let wins = extract_quick_wins(&sections, &analyses);
+        let wins = extract_quick_wins(&sections, &analyses, None);
 
         let leaked_kinds: Vec<&str> = wins
             .iter()
@@ -2175,7 +2196,7 @@ mod tests {
 
         let sections = vec![section];
         let analyses = vec![tauri_stack_marker()];
-        let wins = extract_quick_wins(&sections, &analyses);
+        let wins = extract_quick_wins(&sections, &analyses, None);
 
         // Should have all 3 with priority order: missing < unregistered < unused
         assert!(wins.len() >= 3);
@@ -2306,7 +2327,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_quick_wins_dead_exports() {
+    fn raw_repeated_names_without_shape_are_not_dead_export_quick_wins() {
         let mut section = mock_section("src", 10);
         section.ranked_dups = vec![RankedDup {
             name: "UserType".to_string(),
@@ -2338,38 +2359,11 @@ mod tests {
         }];
 
         let sections = vec![section];
-        let wins = extract_quick_wins(&sections, &[]);
+        let wins = extract_quick_wins(&sections, &[], None);
 
-        // Should include dead export quick win
-        let dead_export_wins: Vec<_> = wins.iter().filter(|w| w.kind == "dead_export").collect();
-        assert!(!dead_export_wins.is_empty());
-
-        let win = dead_export_wins[0];
-        assert_eq!(win.target, "UserType");
-        assert_eq!(win.kind, "dead_export");
-        assert_eq!(win.complexity, "easy");
-        assert!(win.location.contains("src/types/user.ts:10"));
-        assert!(win.why.contains("defined in 3 files"));
         assert!(
-            win.fix_hint
-                .contains("Move all imports to src/types/user.ts")
-        );
-        let commands: Vec<&str> = win
-            .suggested_next
-            .iter()
-            .map(|s| s.command.as_str())
-            .collect();
-        assert!(
-            commands.contains(&"loct occurrences 'UserType' --json"),
-            "dead-export quick wins must point agents at literal occurrence truth: {commands:?}"
-        );
-        assert!(
-            commands.contains(&"loct body 'UserType' --json"),
-            "dead-export quick wins must point agents at body/source truth: {commands:?}"
-        );
-        assert!(
-            commands.contains(&"loct find --literal 'UserType' --json"),
-            "dead-export quick wins must cross-refer find --literal parity: {commands:?}"
+            wins.is_empty(),
+            "raw repeated names without shape evidence are observations, not tasks"
         );
     }
 
@@ -2387,7 +2381,7 @@ mod tests {
         ];
 
         let sections = vec![section];
-        let wins = extract_quick_wins(&sections, &[]);
+        let wins = extract_quick_wins(&sections, &[], None);
 
         // Should include circular import quick wins
         let cycle_wins: Vec<_> = wins
@@ -2409,7 +2403,7 @@ mod tests {
         assert!(win.why.contains("Dependency cycle"));
         assert!(
             win.fix_hint
-                .contains("Extract shared code into a third module")
+                .contains("Review coupling and initialization order")
         );
     }
 
@@ -2444,7 +2438,7 @@ mod tests {
             string_literal_matches: vec![],
         }];
 
-        // Priority 4: Dead export
+        // Priority 4: Raw duplicate observation (not an action without shape evidence)
         section.ranked_dups = vec![RankedDup {
             name: "DupType".to_string(),
             files: vec!["a.ts".to_string(), "b.ts".to_string()],
@@ -2469,16 +2463,20 @@ mod tests {
         // the 2026-05-25 non-Tauri gate; without it priorities 1-2 would
         // be filtered out as Screenscribe-class false positives.
         let analyses = vec![tauri_stack_marker()];
-        let wins = extract_quick_wins(&sections, &analyses);
+        let wins = extract_quick_wins(&sections, &analyses, None);
 
-        // Should have all 5 priorities represented
-        assert!(wins.len() >= 5);
+        // Four actionable kinds; the raw duplicate remains inspection-only.
+        assert!(wins.len() >= 4);
 
         // Verify we have each kind
         assert!(wins.iter().any(|w| w.kind == "missing_handler"));
         assert!(wins.iter().any(|w| w.kind == "unregistered_handler"));
         assert!(wins.iter().any(|w| w.kind == "unused_handler"));
-        assert!(wins.iter().any(|w| w.kind == "dead_export"));
+        assert!(
+            !wins
+                .iter()
+                .any(|w| matches!(w.kind.as_str(), "dead_export" | "duplicate_candidate"))
+        );
         assert!(wins.iter().any(|w| w.kind == "circular_import"));
 
         // Verify priority ordering
@@ -2538,7 +2536,7 @@ mod tests {
         assert_eq!(findings[0].symbol, "LoadedIcon");
 
         // Quick win emitted when analyses are provided
-        let wins = extract_quick_wins(&[mock_section("root", 2)], &[producer, consumer]);
+        let wins = extract_quick_wins(&[mock_section("root", 2)], &[producer, consumer], None);
         assert!(
             wins.iter().any(|w| w.kind == "opaque_passthrough"),
             "Opaque passthrough quick win should be emitted"
